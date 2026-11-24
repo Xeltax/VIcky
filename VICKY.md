@@ -40,16 +40,20 @@ Tests: `victory-gpu` 129 passed (117 on the base), `victory-shader` 206 passed (
 | fork `578d459` | 17 | 5,272 | none in 23 min |
 | fork `7b0f736` | 9 | 6,728 | none in 6 min |
 | `7b0f736` + heap map | 9 | 6,454 | none in 5 min |
-| `7b0f736` + heap map, no loop limit, the 22 programs out of the deep-skips form | 12 | 7,182 | none in 7 min |
+| `7b0f736` + heap map, no loop limit, all 22 programs out of the deep-skips form | 12 | 7,182 | none in 7 min |
+| `7b0f736` + heap map, no loop limit, **the 14 cascade-shadow programs** out of the deep-skips form | 12 | ~6,900 | none |
 
-**Best settings so far (RTX 4080):** no `VICTORY_SHADER_LOOP_LIMIT`, and `VICTORY_WAVE_DEEP_SKIPS_NOT=` the 22 programs below. The cell scene then has its ceiling, walls, the uniform's colour and clean hair, at about 2.5 fps.
-- `VICTORY_SHADER_LOOP_LIMIT=32` (which some testers use against hangs) **breaks the hair** (smeared strands) here; without it the hair is right (also reported for an RTX 2080 on the base's tracker).
-- With the 22 programs in the deep-skips form (the base's default) the cell's ceiling is missing (sky shows through) and much of the scene is dark.
-- Which of the 22 is responsible is being bisected.
+**Best settings so far (RTX 4080): no `VICTORY_SHADER_LOOP_LIMIT`, and only the 14 cascade-shadow programs kept out of the deep-skips form.** The prison cell then renders almost normally: painted brick walls, ceiling and lights, floor, posters, the uniform's colour and print, clean hair, the yard through the window. About 2–2.5 fps. Some artifacts remain (dark bands and rectangles on some frames), and areas lit only by ray-traced light stay dark (the base's ray tracing is off).
 
 ```
-VICTORY_WAVE_DEEP_SKIPS_NOT=922e1d0ee1e19a85,d7db57731ada919b,ab5455fc6abb804f,be6ce5d849d51127,191ecaed66eea3b1,31d703207b51549a,56f3bf2d9388e5a7,804b342cb4b9d1e9,abd7a22106898c66,1d44a723bdebbf27,b4b0427232707598,240cb516c1af0bc3,466ec41d3f9d24c0,65de113e23fa4fdd,90fe2f65e9e589b5,c1eee35dbc50a9ef,41aa4d3d51094531,ff8fe948b132510f,da903250b26c2b55,d2b169b82f67ec5b,578751e8c1661b17,1f1fbd86759b3da2
+VICTORY_WAVE_DEEP_SKIPS_NOT=922e1d0ee1e19a85,d7db57731ada919b,ab5455fc6abb804f,be6ce5d849d51127,191ecaed66eea3b1,31d703207b51549a,56f3bf2d9388e5a7,804b342cb4b9d1e9,abd7a22106898c66,1d44a723bdebbf27,b4b0427232707598,240cb516c1af0bc3,466ec41d3f9d24c0,65de113e23fa4fdd
 ```
+
+What each piece does (one run each, same scene):
+- `VICTORY_SHADER_LOOP_LIMIT=32` (which some testers use against hangs) **smears the hair**; without it the hair is right (also reported for an RTX 2080 on the base's tracker).
+- **The 14 cascade-shadow tiled renderers are wrong in the deep-skips form:** with them in it (the base's default) the cell's ceiling is missing (sky shows through) and the room is dark.
+- **The other 8 are better in it:** keeping all 22 out brings the ceiling back but leaves the room much darker than keeping only the 14 out.
+- Which of the 14 is responsible is being bisected (5 `CS_ShadowRenderTiledCascades*` vs 9 `CS_ShadowRenderTiledMisc*`).
 
 The heap map: in this base few views past the window are actually read (its pool stays under 65,536 slots), so its effect here is small and not yet shown by a matched A/B.
 
