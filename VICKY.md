@@ -22,7 +22,16 @@ Switches:
 - `VICTORY_HEAP_MAP=0`: exactly the base's behaviour.
 - `VICTORY_HEAP_WINDOW=<n>`: the identity window (default 131,072).
 
-Tests: `victory-gpu` 128 passed (117 on the base), `victory-shader` 200 passed (198 on the base).
+## A per-program switch for one wave64 form
+
+The base's exact wave64 form "without skips, scalars followed" (`6a2d9f9`) is on for every program or, with `VICTORY_WAVE_DEEP_SKIPS=0`, off for every program. On an RTX 4080, on: ~5,000 draws per frame, many walls, roofs and floors missing; off: ~6,900 draws, those present, motion wrong. So it is now chosen per program, by the hash the log names a shader by (`#hash` in `victory translate --list`):
+- `VICTORY_WAVE_DEEP_SKIPS_NOT=<hash>,<hash>,...`: off for the listed programs;
+- `VICTORY_WAVE_DEEP_SKIPS_ONLY=<hash>,...`: off for every program not listed;
+- `VICTORY_WAVE_DEEP_SKIPS=0`: off for all, as before.
+
+A program's decision is in its own shader cache key, so a new list translates again only the programs whose decision it changes. To find the programs offline: `VICTORY_HOST_WAVE=32 VICTORY_WAVE_WHY=1 victory translate --list`; a program in that form prints `WAVE64-RETRY #<hash> without skips, scalars followed: wave Some(32)` last.
+
+Tests: `victory-gpu` 129 passed (117 on the base), `victory-shader` 206 passed (198 on the base).
 
 ## Measured on an RTX 4080 (driver 621.01, Windows 11, Series X profile)
 
