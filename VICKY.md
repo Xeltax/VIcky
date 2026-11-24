@@ -57,7 +57,7 @@ More switches (diagnostics builds):
 - `VICTORY_RT_MISS=1`: ray-traced passes run with every ray missing (an unresolvable address reads zeros; `image_bvh*_intersect_ray` hits no node) instead of being dropped. Offline, on the compute programs kept from refused translations, 41 → 64 emit and validate.
 - `VICTORY_DEBUG_PS_PROBE=<hash>:<pc hex>:<vgpr>[:class]`: that pixel shader writes to render target 0 what the instruction at `pc` wrote to VGPRs `vgpr`.. (with `class`: red NaN, green zero, blue positive). Look at it with `VICTORY_SHOW_GBUFFER=0`. A probed translation is not cached.
 - The shader cache key includes `VICTORY_COMBO_GUESS_STRIDE`, `VICTORY_SHADER_LOOP_LIMIT` and `VICTORY_MESH_CONSOLE_LANES` (issue #6).
-- **Pitfall:** after runs on another GPU (`VICTORY_ADAPTER`), move `%LOCALAPPDATA%ictory\cache\pipelines` aside. Here the shared pipeline library (123 MB, plus a 548 MB temporary file left by a killed run) left about 1,960 pipelines "being made" for minutes on the next RTX run.
+- **Pitfall:** after runs on another GPU (`VICTORY_ADAPTER`), move `%LOCALAPPDATA%\victory\cache\pipelines` aside. Here the shared pipeline library (123 MB, plus a 548 MB temporary file left by a killed run) left about 1,960 pipelines "being made" for minutes on the next RTX run.
 
 ## What we know so far
 
