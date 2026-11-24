@@ -28,6 +28,8 @@ pub(crate) struct HostHeap {
     /// [`SAMPLER_DYNAMIC`] in a capped sampler heap, none in another.
     spare: u32,
     sampler: bool,
+    /// VIcky (diagnostics): the title's own slot count (`count` may be capped).
+    pub(crate) title_count: u32,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
@@ -156,6 +158,18 @@ fn is_title_texture_srv(view: &View) -> bool {
 /// streaming pops in; making all of them at once stalled frames for
 /// seconds.
 const SLOT_BUDGET_US: u64 = 8_000;
+
+/// [`SLOT_BUDGET_US`], or `VICTORY_BINDLESS_BUDGET_US` (VIcky diagnostics: a bigger
+/// budget fills a streaming heap sooner at the title's ~1 fps).
+fn slot_budget_us() -> u64 {
+    static B: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("VICTORY_BINDLESS_BUDGET_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(SLOT_BUDGET_US)
+    })
+}
 /// Slots taken to make at once (the rest wait without being looked at).
 const SLOT_CHUNK: usize = 256;
 
@@ -163,12 +177,12 @@ impl Bindless {
     /// The slot-making budget, refilled for the time passed since.
     fn budget(&mut self) -> &mut [u64; 2] {
         let now = std::time::Instant::now();
-        let (at, left) = self.budget.get_or_insert((now, [SLOT_BUDGET_US; 2]));
+        let (at, left) = self.budget.get_or_insert((now, [slot_budget_us(); 2]));
         let add = now.duration_since(*at).as_micros() as u64 / 8;
         if add > 0 {
             *at = now;
             for l in left.iter_mut() {
-                *l = (*l + add).min(SLOT_BUDGET_US);
+                *l = (*l + add).min(slot_budget_us());
             }
         }
         left
@@ -493,6 +507,7 @@ impl HostHeap {
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         let h = HostHeap {
+            title_count: count,
             heap,
             cpu,
             step,
@@ -935,6 +950,37 @@ impl HostHeap {
     /// Scans title descriptor memory for slots written or overwritten as raw
     /// bytes (bypassing `mirror()`), using write-watch when the heap's memory
     /// supports it and scanning all slots otherwise.
+    /// VIcky (diagnostics): over the title's whole heap (past a host cap too), how many
+    /// slots hold one of our views, the highest, and how many lie past the host heap;
+    /// and the bindless bookkeeping.
+    pub(crate) fn bindless_report(&self) -> Option<String> {
+        if self.sampler {
+            return None;
+        }
+        let (start, slots, pending, dirty) = {
+            let b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            (b.title_start, b.slots.len(), b.record_pending.len(), b.dirty.len())
+        };
+        if start == 0 {
+            return None;
+        }
+        let (mut tagged, mut past, mut highest) = (0usize, 0usize, None);
+        for index in 0..self.title_count {
+            let handle = start + u64::from(index) * 32;
+            // SAFETY: `index < title_count` lies in the title's live heap.
+            let [tag, _, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            if tag == VIEW_TAG && generation != 0 {
+                tagged += 1;
+                highest = Some(index);
+                past += usize::from(index >= self.count);
+            }
+        }
+        Some(format!(
+            "title slots {} (host {}): {tagged} hold views, highest {highest:?}, {past} past the host heap; bindless buffer slots {slots}, texture slots pending {pending}, dirty {dirty}",
+            self.title_count, self.count
+        ))
+    }
+
     fn sync_title_slots(&self) {
         if self.sampler || self.count == 0 {
             return;

@@ -307,6 +307,7 @@ extern "system" fn present(
     if listed {
         crate::capture::dump_targets(frame);
         crate::capture::dump_buffers(frame);
+        crate::descriptor::bindless_report_all(frame);
     }
     #[cfg(windows)]
     if planes > 0

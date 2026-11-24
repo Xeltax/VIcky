@@ -103,11 +103,10 @@ impl Heap {
         self.host
             .get_or_init(|| {
                 let step = u64::from(increment(self.desc.kind)?);
-                let h = std::sync::Arc::new(host::HostHeap::new(
-                    self.samplers(),
-                    self.desc.count,
-                    self.start,
-                )?);
+                let mut made = host::HostHeap::new(self.samplers(), self.desc.count, self.start)?;
+                // VIcky (diagnostics): the title's own count, for `bindless_report`.
+                made.title_count = self.desc.count;
+                let h = std::sync::Arc::new(made);
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
@@ -133,6 +132,25 @@ const SHADER_VISIBLE: u32 = 1;
 /// start, end, heap.
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// VIcky (diagnostics): logs [`host::HostHeap::bindless_report`] for every shader-visible
+/// view heap (at a frame listed for capture).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn bindless_report_all(frame: u64) {
+    let heaps: Vec<usize> = SHADER_HEAPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|h| h.2)
+        .collect();
+    for at in heaps {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(report) = heap.host().and_then(|h| h.bindless_report()) {
+            tracing::info!(frame, "VIcky: view heap {report}");
+        }
+    }
+}
 
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
