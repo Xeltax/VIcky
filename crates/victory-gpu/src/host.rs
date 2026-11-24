@@ -5606,6 +5606,53 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+#[cfg(all(test, feature = "diagnostics"))]
+#[test]
+#[ignore = "requires a D3D12 adapter and a desktop window"]
+fn present_probe_includes_the_second_plane() {
+    let host = host().expect("D3D12 adapter");
+    let list = host.new_list().unwrap();
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: 64,
+        Height: 64,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        ..Default::default()
+    };
+    let state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    // SAFETY: distinct RTV slots, both heaps and both textures live through execution.
+    let plane = |rgba: [f32; 4]| unsafe {
+        let mut texture: Option<ID3D12Resource> = None;
+        host.device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut texture,
+        ).unwrap();
+        let texture = texture.unwrap();
+        let heap: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(
+            &D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                NumDescriptors: 1,
+                ..Default::default()
+            },
+        ).unwrap();
+        let slot = heap.GetCPUDescriptorHandleForHeapStart();
+        host.device.CreateRenderTargetView(&texture, None, slot);
+        list.list.ClearRenderTargetView(slot, &rgba, None);
+        (texture, heap)
+    };
+    let (base, _base_rtv) = plane([0.0, 0.0, 0.0, 1.0]);
+    let (overlay, _overlay_rtv) = plane([0.0, 1.0, 0.0, 1.0]);
+    list.close();
+    host.execute(&[&list]);
+    let state = state.0 as u32;
+    assert_eq!(host.present(&base, state, 1, None), Some(true));
+    assert_eq!(host.present(&base, state, 2, Some((&overlay, state))), Some(false));
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
@@ -5959,11 +6006,14 @@ impl Host {
             ]);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
+            let (mut capture, mut probe) = (None, None);
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let mut read_frame = |source: &ID3D12Resource| {
+                if crate::capture::wanted(frame) {
+                    capture = crate::capture::read_back(&self.device, list, source);
+                }
+                probe = crate::capture::probe(&self.device, list, source);
+            };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             // The present's second plane, if it has one, goes over the copy
@@ -5974,7 +6024,6 @@ impl Host {
                 let format = swap_format(plane.GetDesc().Format)?;
                 Some((plane, D3D12_RESOURCE_STATES(was as i32), format))
             });
-            let mut drawn = false;
             if let Some((plane, was, plane_format)) = over {
                 let mut barriers = vec![
                     transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
@@ -5989,7 +6038,7 @@ impl Host {
                     barriers.push(transition(plane, was, readable));
                 }
                 list.ResourceBarrier(&barriers);
-                drawn = crate::over::record(
+                crate::over::record(
                     &self.device,
                     list,
                     &back,
@@ -5998,16 +6047,26 @@ impl Host {
                     plane,
                     plane_format,
                 );
-                let mut barriers = vec![transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_RENDER_TARGET,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                )];
+                let back_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                #[cfg(feature = "diagnostics")]
+                let back_state = if slot.is_none() {
+                    // The Series S interface is visible only after the second plane is drawn.
+                    list.ResourceBarrier(&[transition(&back, back_state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    read_frame(&back);
+                    D3D12_RESOURCE_STATE_COPY_SOURCE
+                } else {
+                    back_state
+                };
+                let mut barriers = vec![transition(&back, back_state, D3D12_RESOURCE_STATE_PRESENT)];
                 if moved {
                     barriers.push(transition(plane, readable, was));
                 }
                 list.ResourceBarrier(&barriers);
             } else {
+                #[cfg(feature = "diagnostics")]
+                if slot.is_none() {
+                    read_frame(texture);
+                }
                 list.ResourceBarrier(&[
                     transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
                     transition(
@@ -6017,7 +6076,6 @@ impl Host {
                     ),
                 ]);
             }
-            let _ = drawn;
             copy.close();
             match slot {
                 Some(i) => {
