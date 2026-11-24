@@ -98,6 +98,14 @@ pub(crate) struct ResourceDesc {
     flags: u32,
 }
 
+/// combo: width and height, and flags (diagnostics).
+#[cfg(feature = "diagnostics")]
+impl ResourceDesc {
+    pub(crate) fn extent(&self) -> ((u64, u32), u32) {
+        ((self.width, self.height), self.flags)
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AllocationInfo {
