@@ -231,7 +231,6 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
 /// VIcky: `VICTORY_SHOW_GBUFFER=<n>` presents render target `n` (default 1) of the
 /// draws that write four or more targets at once (the G-buffer) instead of the
 /// title's picture: the world in flat, unlit colours while its lighting is
@@ -252,6 +251,7 @@ pub(crate) fn note_gbuffer(resource: usize) {
     GBUFFER.store(resource, Ordering::Relaxed);
 }
 
+#[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }

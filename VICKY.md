@@ -54,11 +54,22 @@ More switches (diagnostics builds):
 - `VICTORY_DUMP_SHADERS=<folder>` (and `VICTORY_DUMP_SHADERS_ONLY=<hash>,…`): keep translated containers. They are title data: keep them local.
 - `VICTORY_TIME_CS=<file of record names>` with `victory translate --pipelines --jobs 1`: time the direct-DXIL path and the first driver compile, with the driver's cache off (needs Windows developer mode).
 
+- `VICTORY_RT_MISS=1`: ray-traced passes run with every ray missing (an unresolvable address reads zeros; `image_bvh*_intersect_ray` hits no node) instead of being dropped. Offline, on the compute programs kept from refused translations, 41 → 64 emit and validate.
+- `VICTORY_DEBUG_PS_PROBE=<hash>:<pc hex>:<vgpr>[:class]`: that pixel shader writes to render target 0 what the instruction at `pc` wrote to VGPRs `vgpr`.. (with `class`: red NaN, green zero, blue positive). Look at it with `VICTORY_SHOW_GBUFFER=0`. A probed translation is not cached.
+- The shader cache key includes `VICTORY_COMBO_GUESS_STRIDE`, `VICTORY_SHADER_LOOP_LIMIT` and `VICTORY_MESH_CONSOLE_LANES` (issue #6).
+- **Pitfall:** after runs on another GPU (`VICTORY_ADAPTER`), move `%LOCALAPPDATA%\victory\cache\pipelines` aside. Here the shared pipeline library (123 MB, plus a 548 MB temporary file left by a killed run) left about 1,960 pipelines "being made" for minutes on the next RTX run.
+
 ## What we know so far
 
 Measured on an RTX 4080 (Windows 11), in diagnostics builds of this tree, unless a line says otherwise.
 
 - **The world loads and runs at about 1 frame per second.** About 930–980 draws and dispatches per frame are dropped, of about 2,150; about 250 of those are only waiting for their pipelines to compile. The UI, subtitles and the loading art all render.
+- **Lighting, newest leads (2026-11-24, late):**
+  - **The HDR target is black on an AMD RX 7800 XT too** (0.11 % non-zero, UNYTIX in #7). So wave64 emulation is not why lighting is black.
+  - In the traced frame, **the lighting draws read a 160x90 `f24` UAV texture that nothing writes** (2560x1440 in 16x16 tiles, likely a tile classification). Its likely writers, judged by their 160x90 grids, are computes refused on 32-lane hosts ("console wave64 lanes in a group of more than 64 threads": `5c6224a6bc3a4066`, `0c028454b58543f0`) or others (`23d507cbb6a22e86`, `2da4beb386509b77`). This is inferred: dispatch bindings are not traced yet.
+  - A 16-byte buffer read by every HDR writer and by post-processing looks like the exposure.
+  - **Bindless textures are never uploaded in this tree.** Only textures reached through descriptor tables are brought up to date, and the G-buffer's pixel shaders sample through `ResourceDescriptorHeap`. VIctory #413 (wbkepler) fixes this. It is merged locally (branch `combo3-413`, all victory-gpu tests pass) and waits for a title run. It is the first suspect for the zero albedo.
+  - With `VICTORY_SHADER_LOOP_LIMIT=32`, a pixel lane that reaches the limit is killed (discard), which can also leave a lighting target at its clear value.
 - **Latest (2026-11-24 evening):**
   - **Spilled root arguments (VIctory #302/#489).** The first cause of missing compute programs on NVIDIA here was "an address in an SGPR that is no root parameter": 12 of the 15 most-dispatched missing computes in a traced world frame, at code offsets 0x2c–0x40. They read their root arguments through the spill table `s[0:1]` points to. With #302/#489, that class drops from 34 programs to 1, untranslated programs drop from 129 to 115, and dropped draws fall to about 200–650 per frame.
   - **The G-buffer view shows real objects:** tables, lamps, a basketball hoop, plates, a phone, whole characters. Much of the scene is still missing, and a web of long thin lines remains on some views.
