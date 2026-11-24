@@ -300,6 +300,7 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     if listed {
         crate::capture::dump_targets(frame);
+        crate::capture::dump_buffers(frame);
     }
     #[cfg(windows)]
     if planes > 0

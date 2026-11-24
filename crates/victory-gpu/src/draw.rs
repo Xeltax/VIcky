@@ -1292,6 +1292,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_buffer(&shadow, address, len);
             list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
         } else {
             list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
