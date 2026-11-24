@@ -1,8 +1,8 @@
-# VIcky: branch `fx-heapmap`
+# VIcky: branch `fx-heapmap-4e`
 
-This branch is the base that renders the world **lit and textured** on NVIDIA: [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) at `7b0f736`, plus VIcky's **heap map** on top.
+This branch is the base that renders the world **lit and textured** on NVIDIA: [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (formerly `victory-gta6`) at `4e17478`, plus VIcky's commits on top: a **heap map** for NVIDIA's view-heap cap and a **per-program switch** for one wave64 form. (Branch `fx-heapmap` is the same work on the fork's older `7b0f736`. This rebase builds and passes the unit tests; it has not been run in the title yet.)
 
-**All of the rendering work below the three `VIcky:` commits is fxceless's, under GPL-3.0.** Their README is kept unchanged and describes it. Please report rendering issues of the base to them.
+**All of the rendering work below the `VIcky:` commits is fxceless's, under GPL-3.0.** Their README is kept unchanged and describes it. Please report rendering issues of the base to them (our findings so far: [fxceless/victory-fork#62](https://github.com/fxceless/victory-fork/issues/62)).
 
 ## What this branch adds: a heap map for NVIDIA's view-heap cap
 
@@ -39,6 +39,11 @@ Tests: `victory-gpu` 129 passed (117 on the base), `victory-shader` 206 passed (
 |---|---|---|---|
 | fork `578d459` | 17 | 5,272 | none in 23 min |
 | fork `7b0f736` | 9 | 6,728 | none in 6 min |
+
+(The rows below were measured on `7b0f736`; this branch's `4e17478` keeps the same 22 programs in the deep-skips form, checked offline.)
+
+| tree | untranslated programs | draws per frame (max) | device removal |
+|---|---|---|---|
 | `7b0f736` + heap map | 9 | 6,454 | none in 5 min |
 | `7b0f736` + heap map, no loop limit, all 22 programs out of the deep-skips form | 12 | 7,182 | none in 7 min |
 | `7b0f736` + heap map, no loop limit, **the 14 cascade-shadow programs** out of the deep-skips form | 12 | ~6,900 | none |
