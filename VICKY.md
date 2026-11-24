@@ -1,6 +1,6 @@
 # VIcky: branch `fx-heapmap-4e`
 
-This branch is the base that renders the world **lit and textured** on NVIDIA: [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (formerly `victory-gta6`) at `4e17478`, plus VIcky's commits on top: a **heap map** for NVIDIA's view-heap cap and a **per-program switch** for one wave64 form. (Branch `fx-heapmap` is the same work on the fork's older `7b0f736`. This rebase builds and passes the unit tests; it has not been run in the title yet.)
+This branch is the base that renders the world **lit and textured** on NVIDIA: [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (formerly `victory-gta6`) at `4e17478`, plus VIcky's commits on top: a **heap map** for NVIDIA's view-heap cap and a **per-program switch** for one wave64 form. (Branch `fx-heapmap` is the same work on the fork's older `7b0f736`. It has been run in the title: see the measurements below.)
 
 **All of the rendering work below the `VIcky:` commits is fxceless's, under GPL-3.0.** Their README is kept unchanged and describes it. Please report rendering issues of the base to them (our findings so far: [fxceless/victory-fork#62](https://github.com/fxceless/victory-fork/issues/62)).
 
@@ -48,7 +48,11 @@ Tests: `victory-gpu` 129 passed (117 on the base), `victory-shader` 206 passed (
 | `7b0f736` + heap map, no loop limit, all 22 programs out of the deep-skips form | 12 | 7,182 | none in 7 min |
 | `7b0f736` + heap map, no loop limit, **the 14 cascade-shadow programs** out of the deep-skips form | 12 | ~6,900 | none |
 
-**Best settings so far (RTX 4080): no `VICTORY_SHADER_LOOP_LIMIT`, and only the 14 cascade-shadow programs kept out of the deep-skips form.** The prison cell then renders almost normally: painted brick walls, ceiling and lights, floor, posters, the uniform's colour and print, clean hair, the yard through the window. About 2–2.5 fps. Some artifacts remain (dark bands and rectangles on some frames), and areas lit only by ray-traced light stay dark (the base's ray tracing is off).
+**On this branch (`4e17478`): also set `VICTORY_SHADER_OPT=0`.** The base's new shader clean-up passes (`1684989`, on by default) leave the room's walls, roof and floor out of the picture on an RTX 4080 (A/B on the same save: with them, sky shows where the walls are; with `VICTORY_SHADER_OPT=0` the walls are there), and on an AMD RX 7800 XT the same happens with them on (UNYTIX's run).
+
+**UNYTIX's fix (VIcky PR #9) is in:** D3D12 refused the mesh pipeline `[mesh f5e50eb2108c425b, pixel ce3f0432a08f1d35]` because the title enables blending on an `R8_UINT` target; blending is now turned off on integer targets. Measured on the RTX 4080 (same save, `VICTORY_SHADER_OPT=0`, the 14 programs out, no loop limit): at the window the walls are present and lit, where the same tree without the fix showed sky; mean brightness of the world frames 61–65 (0–255) against 20–22 without it.
+
+**Best settings so far (RTX 4080): no `VICTORY_SHADER_LOOP_LIMIT`, `VICTORY_SHADER_OPT=0` on this branch, and only the 14 cascade-shadow programs kept out of the deep-skips form.** The prison cell then renders almost normally: painted brick walls, ceiling and lights, floor, posters, the uniform's colour and print, clean hair, the yard through the window. About 2–2.5 fps. Some artifacts remain (dark bands and rectangles on some frames), and areas lit only by ray-traced light stay dark (the base's ray tracing is off).
 
 ```
 VICTORY_WAVE_DEEP_SKIPS_NOT=922e1d0ee1e19a85,d7db57731ada919b,ab5455fc6abb804f,be6ce5d849d51127,191ecaed66eea3b1,31d703207b51549a,56f3bf2d9388e5a7,804b342cb4b9d1e9,abd7a22106898c66,1d44a723bdebbf27,b4b0427232707598,240cb516c1af0bc3,466ec41d3f9d24c0,65de113e23fa4fdd
