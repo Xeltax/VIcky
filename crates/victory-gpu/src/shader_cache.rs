@@ -97,6 +97,8 @@ fn key(build: &[u8; 32], target: Target) -> [u8; 32] {
         h.update(std::env::var_os(name).unwrap_or_default().as_encoded_bytes());
         h.update(&[0]);
     }
+    // RT miss changes translation too (UNYTIX, VIcky #6): its effective setting.
+    h.update(&[u8::from(victory_shader::resource::rt_miss())]);
     *h.finalize().as_bytes()
 }
 
