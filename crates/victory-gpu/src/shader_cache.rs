@@ -73,6 +73,8 @@ pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader
     let translate =
         |c: &[u8]| victory_shader::emit::translate_for(c, target).map_err(|e| e.to_string());
     match CACHE.get() {
+        // VIcky: a probed translation (diagnostics) is neither read from nor written to the cache.
+        Some(_) if victory_shader::emit::ps_probe().is_some() => translate(container),
         Some(cache) => cached(cache, &key(build(), target), container, translate),
         None => translate(container),
     }
@@ -84,6 +86,17 @@ fn key(build: &[u8; 32], target: Target) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(build);
     h.update(&target.key());
+    // VIcky #6: the switches the translator reads change its output, so they are part of the
+    // key (a warm cache reused translations made under other settings).
+    for name in [
+        "VICTORY_COMBO_GUESS_STRIDE",
+        "VICTORY_SHADER_LOOP_LIMIT",
+        "VICTORY_MESH_CONSOLE_LANES",
+    ] {
+        h.update(name.as_bytes());
+        h.update(std::env::var_os(name).unwrap_or_default().as_encoded_bytes());
+        h.update(&[0]);
+    }
     *h.finalize().as_bytes()
 }
 

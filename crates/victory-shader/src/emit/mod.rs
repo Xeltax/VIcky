@@ -252,6 +252,31 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 }
 
 /// [`translate`] for a host that runs the wave sizes of `target`.
+/// VIcky (diagnostics): a pixel shader probe. While set on this thread, a translated pixel
+/// shader writes to render target 0, instead of its own value, what the instruction at byte
+/// `pc` wrote to VGPRs `vgpr`..`vgpr + 2` (alpha 1). With `classify`, each channel is 1 or 0:
+/// red = NaN, green = exactly zero, blue = greater than zero (of VGPR `vgpr` only).
+#[derive(Debug, Clone, Copy)]
+pub struct PsProbe {
+    pub pc: usize,
+    pub vgpr: u8,
+    pub classify: bool,
+}
+
+thread_local! {
+    pub(crate) static PS_PROBE: std::cell::Cell<Option<PsProbe>> = const { std::cell::Cell::new(None) };
+}
+
+/// Sets (or clears) the probe for translations on this thread.
+pub fn set_ps_probe(probe: Option<PsProbe>) {
+    PS_PROBE.with(|p| p.set(probe));
+}
+
+/// The probe set on this thread, if any (a probed translation is not cached).
+pub fn ps_probe() -> Option<PsProbe> {
+    PS_PROBE.with(|p| p.get())
+}
+
 pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c

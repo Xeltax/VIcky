@@ -8226,8 +8226,17 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // VIcky (diagnostics): the pixel shader probe (`emit::set_ps_probe`) on target 0.
+        let probe = if self.s.pixel && e.target == Target::Color(0) {
+            super::PS_PROBE.with(|p| p.get())
+        } else {
+            None
+        };
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
+            if let Some(pr) = probe {
+                x = self.probe_channel(pr, col)?;
+            }
             if let Some(high) = half {
                 // An f16 half, declared a 32-bit float on the host.
                 let c = self.cur;
@@ -8275,6 +8284,39 @@ impl<'a> Lower<'a> {
         }
         self.end_guarded(at, &[]);
         Ok(())
+    }
+
+    /// VIcky (diagnostics): channel `col` of the pixel shader probe, as i32 bits.
+    fn probe_channel(&mut self, pr: super::PsProbe, col: u8) -> Result<V, Why> {
+        let one = self.s.m.i32(1.0f32.to_bits());
+        if col == 3 {
+            return Ok(one);
+        }
+        let reg = if pr.classify { pr.vgpr } else { pr.vgpr + col };
+        let found = self.x.p.blocks.iter().flat_map(|b| &b.insts).find_map(|i| {
+            (i.machine.offset == pr.pc).then(|| i.write(crate::ir::Reg::V(reg))).flatten()
+        });
+        let zero = self.s.m.i32(0);
+        let Some(value) = found else {
+            // Not written there: magenta, so a wrong address shows.
+            return Ok(if col == 1 { zero } else { one });
+        };
+        let x = match self.vals.get(&value).copied() {
+            Some(Val::I32(x)) => x,
+            _ => return Ok(if col == 1 { zero } else { one }),
+        };
+        if !pr.classify {
+            return Ok(x);
+        }
+        let c = self.cur;
+        let f = self.as_float(x);
+        let fz = self.s.m.f32(0);
+        let hit = match col {
+            0 => self.s.m.cmp(c, pred::UNO, f, f),
+            1 => self.s.m.cmp(c, pred::OEQ, f, fz),
+            _ => self.s.m.cmp(c, pred::OGT, f, fz),
+        };
+        Ok(self.s.m.select(c, hit, one, zero))
     }
 
     /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it (all

@@ -113,7 +113,24 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                // VIcky (diagnostics): `VICTORY_DEBUG_PS_PROBE=<hash>:<pc hex>:<vgpr>[:class]`
+                // makes that pixel shader write what the instruction at `pc` wrote to
+                // VGPRs `vgpr`.. into render target 0 (`victory_shader::emit::PsProbe`).
+                let probe = std::env::var("VICTORY_DEBUG_PS_PROBE").ok().and_then(|v| {
+                    let mut it = v.split(':');
+                    let hash = it.next()?;
+                    if hash.trim() != self.hash.to_string() {
+                        return None;
+                    }
+                    let pc = usize::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
+                    let vgpr = it.next()?.trim_start_matches('v').parse().ok()?;
+                    let classify = it.next() == Some("class");
+                    tracing::warn!(hash, pc, vgpr, classify, "VIcky: pixel shader probe on target 0");
+                    Some(victory_shader::emit::PsProbe { pc, vgpr, classify })
+                });
+                victory_shader::emit::set_ps_probe(probe);
                 let done = translate(&self.container);
+                victory_shader::emit::set_ps_probe(None);
                 // VIcky (local): `VICTORY_DUMP_SHADERS=<folder>` keeps the containers
                 // of translated shaders too (only those listed in
                 // `VICTORY_DUMP_SHADERS_ONLY=<hash>,<hash>` when it is set), for
