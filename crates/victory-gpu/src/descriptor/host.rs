@@ -965,6 +965,9 @@ impl HostHeap {
             return None;
         }
         let (mut tagged, mut past, mut highest) = (0usize, 0usize, None);
+        // Views per 65,536-slot bucket, and the runs of empty slots of 16,384 or more.
+        let mut buckets = vec![0u32; (self.title_count as usize).div_ceil(1 << 16)];
+        let (mut gap_start, mut gaps) = (None::<u32>, Vec::new());
         for index in 0..self.title_count {
             let handle = start + u64::from(index) * 32;
             // SAFETY: `index < title_count` lies in the title's live heap.
@@ -973,10 +976,23 @@ impl HostHeap {
                 tagged += 1;
                 highest = Some(index);
                 past += usize::from(index >= self.count);
+                buckets[(index >> 16) as usize] += 1;
+                if let Some(g) = gap_start.take()
+                    && index - g >= 1 << 14
+                {
+                    gaps.push((g, index));
+                }
+            } else if gap_start.is_none() {
+                gap_start = Some(index);
             }
         }
+        if let Some(g) = gap_start
+            && self.title_count - g >= 1 << 14
+        {
+            gaps.push((g, self.title_count));
+        }
         Some(format!(
-            "title slots {} (host {}): {tagged} hold views, highest {highest:?}, {past} past the host heap; bindless buffer slots {slots}, texture slots pending {pending}, dirty {dirty}",
+            "title slots {} (host {}): {tagged} hold views, highest {highest:?}, {past} past the host heap; bindless buffer slots {slots}, texture slots pending {pending}, dirty {dirty}; views per 64Ki slots {buckets:?}; empty runs >= 16Ki {gaps:?}",
             self.title_count, self.count
         ))
     }
