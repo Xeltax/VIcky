@@ -38,6 +38,26 @@ pub struct Address {
 /// offset is then the byte offset in the code.
 pub const CODE: usize = usize::MAX;
 
+/// VIcky (diagnostics, `VICTORY_RT_MISS=1`): an address the tracker cannot
+/// tie to a root parameter (the acceleration structures' metadata the
+/// ray-traced passes read, among others). Loads from it read zeros, so a
+/// traversal finds no nodes and every ray misses.
+pub const RT_NULL: usize = usize::MAX - 1;
+
+/// Whether `VICTORY_RT_MISS=1` is set: unresolvable addresses read zeros and
+/// BVH intersections miss, so ray-traced passes run (no ray-traced shadows or
+/// bounces) instead of being dropped.
+pub fn rt_miss() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_RT_MISS").is_ok_and(|v| v == "1"))
+}
+
+const NULL_ADDRESS: Address = Address {
+    param: RT_NULL,
+    offset: 0,
+    dynamic: None,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// Dwords `first..` of what the scalar load at `load` reads (see
@@ -177,6 +197,8 @@ pub fn track(
                 Ok(())
             };
             match &inst.fields {
+                // RT miss: BVH intersections read no descriptor (they miss).
+                Fields::Image { .. } if rt_miss() && inst.name().starts_with("image_bvh") => {}
                 Fields::Image { rsrc, sampler, .. } => {
                     descriptor(rsrc, Role::Resource)?;
                     if let Some(s) = sampler {
@@ -193,7 +215,11 @@ pub fn track(
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
-                    let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
+                    let address = match t.smem_address(inst, base, *offset, soffset) {
+                        Ok(a) => a,
+                        Err(_) if rt_miss() => NULL_ADDRESS,
+                        Err(e) => return Err(fail(e)),
+                    };
                     out.scalar.push((site, address));
                 }
                 Fields::Flat {
@@ -202,9 +228,11 @@ pub fn track(
                     offset,
                     ..
                 } if inst.name().starts_with("global_") => {
-                    let address = t
-                        .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
-                        .map_err(fail)?;
+                    let address = match t.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset) {
+                        Ok(a) => a,
+                        Err(_) if rt_miss() => NULL_ADDRESS,
+                        Err(e) => return Err(fail(e)),
+                    };
                     out.scalar.push((site, address));
                 }
                 _ => {}

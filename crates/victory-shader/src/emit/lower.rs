@@ -17,7 +17,7 @@ use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
-use crate::resource::{Address, CODE, Resources, Role, Site, Source};
+use crate::resource::{Address, CODE, RT_NULL, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
@@ -986,6 +986,14 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = *dst else {
             return Err("a global load result");
         };
+        // RT miss (`resource::rt_miss`): an unresolvable address reads zeros.
+        if a.param == RT_NULL {
+            let zero = self.s.m.i32(0);
+            for k in 0..n as u8 {
+                self.write(inst, Reg::V(reg + k), zero, guard);
+            }
+            return Ok(());
+        }
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
         if let Some(d) = a.dynamic {
@@ -3600,6 +3608,24 @@ impl<'a> Lower<'a> {
         let name = inst.name();
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
+        }
+        // RT miss (`resource::rt_miss`): an unresolvable address reads zeros.
+        if self.scalar.get(&site).is_some_and(|a| a.param == RT_NULL) {
+            let count = match name.rsplit("dword").next() {
+                Some("x2") => 2,
+                Some("x4") => 4,
+                Some("x8") => 8,
+                Some("x16") => 16,
+                _ => 1,
+            };
+            let Some(Operand::Scalar { code, .. }) = *data else {
+                return Err("a scalar load result");
+            };
+            let zero = self.s.m.i32(0);
+            for k in 0..count {
+                self.write(inst, Reg::S(code + k), zero, None);
+            }
+            return Ok(());
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
@@ -6823,6 +6849,21 @@ impl<'a> Lower<'a> {
             return Err("an image access with tfe or lwe");
         }
         let name = inst.name();
+        // RT miss (`resource::rt_miss`): a BVH intersection finds no node.
+        if name.starts_with("image_bvh") {
+            if !crate::resource::rt_miss() {
+                return Err("a BVH intersection");
+            }
+            let Operand::Vector { reg, .. } = *data else {
+                return Err("a BVH intersection result");
+            };
+            let guard = self.guard(b, i)?;
+            let none = self.s.m.i32(u32::MAX);
+            for k in 0..4 {
+                self.write(inst, Reg::V(reg + k), none, guard);
+            }
+            return Ok(());
+        }
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
