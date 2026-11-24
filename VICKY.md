@@ -24,7 +24,7 @@ Switches:
 
 ## A per-program switch for one wave64 form
 
-The base's exact wave64 form "without skips, scalars followed" (`6a2d9f9`) is on for every program or, with `VICTORY_WAVE_DEEP_SKIPS=0`, off for every program. On an RTX 4080, on: ~5,000 draws per frame, many walls, roofs and floors missing; off: ~6,900 draws, those present, motion wrong. So it is now chosen per program, by the hash the log names a shader by (`#hash` in `victory translate --list`):
+The base's exact wave64 form "without skips, scalars followed" (`6a2d9f9`) is on for every program or, with `VICTORY_WAVE_DEEP_SKIPS=0`, off for every program. On a 32-lane host, 22 programs end in it (14 cascade-shadow tiled renderers, including the hair ones; 4 visibility-buffer classification/resolve; 2 skinned-attach particle updates; a ray pre-pass; a lightning point selection). On an RTX 4080 keeping those 22 out of the form brings back the cell's ceiling, the walls' and the prison uniform's colours (see below). So it is now chosen per program, by the hash the log names a shader by (`#hash` in `victory translate --list`):
 - `VICTORY_WAVE_DEEP_SKIPS_NOT=<hash>,<hash>,...`: off for the listed programs;
 - `VICTORY_WAVE_DEEP_SKIPS_ONLY=<hash>,...`: off for every program not listed;
 - `VICTORY_WAVE_DEEP_SKIPS=0`: off for all, as before.
@@ -40,20 +40,30 @@ Tests: `victory-gpu` 129 passed (117 on the base), `victory-shader` 206 passed (
 | fork `578d459` | 17 | 5,272 | none in 23 min |
 | fork `7b0f736` | 9 | 6,728 | none in 6 min |
 | `7b0f736` + heap map | 9 | 6,454 | none in 5 min |
+| `7b0f736` + heap map, no loop limit, the 22 programs out of the deep-skips form | 12 | 7,182 | none in 7 min |
 
-With the heap map, more textures appear in the world (seen on screen, one run so far). A matched A/B (`VICTORY_HEAP_MAP=0`) is in progress.
+**Best settings so far (RTX 4080):** no `VICTORY_SHADER_LOOP_LIMIT`, and `VICTORY_WAVE_DEEP_SKIPS_NOT=` the 22 programs below. The cell scene then has its ceiling, walls, the uniform's colour and clean hair, at about 2.5 fps.
+- `VICTORY_SHADER_LOOP_LIMIT=32` (which some testers use against hangs) **breaks the hair** (smeared strands) here; without it the hair is right (also reported for an RTX 2080 on the base's tracker).
+- With the 22 programs in the deep-skips form (the base's default) the cell's ceiling is missing (sky shows through) and much of the scene is dark.
+- Which of the 22 is responsible is being bisected.
+
+```
+VICTORY_WAVE_DEEP_SKIPS_NOT=922e1d0ee1e19a85,d7db57731ada919b,ab5455fc6abb804f,be6ce5d849d51127,191ecaed66eea3b1,31d703207b51549a,56f3bf2d9388e5a7,804b342cb4b9d1e9,abd7a22106898c66,1d44a723bdebbf27,b4b0427232707598,240cb516c1af0bc3,466ec41d3f9d24c0,65de113e23fa4fdd,90fe2f65e9e589b5,c1eee35dbc50a9ef,41aa4d3d51094531,ff8fe948b132510f,da903250b26c2b55,d2b169b82f67ec5b,578751e8c1661b17,1f1fbd86759b3da2
+```
+
+The heap map: in this base few views past the window are actually read (its pool stays under 65,536 slots), so its effect here is small and not yet shown by a matched A/B.
 
 ## Known problems (seen here, one machine)
 
-- **Many walls are invisible.** The heap map does not fix it, so the cause is elsewhere: GPU culling, vertex data, or one mesh pipeline the driver refuses (`f5e50eb2108c425b`). Next on our list.
-- **Hair regression:** hair is clean with `578d459` and smeared with `7b0f736`, with or without the heap map. It probably comes from the base's wave64 changes after `578d459` (`6a2d9f9`, `e9765a7`). Not bisected yet.
+- With the base's defaults, missing ceilings/walls and dark surfaces: see the best settings above.
+- One mesh pipeline is refused by the driver (`f5e50eb2108c425b` + pixel `ce3f0432a08f1d35`, E_INVALIDARG).
 - 2–3 fps; ~360 draws per frame are dropped because the base's ray-tracing structure builder is off by default.
 
 ## Build and run
 
 ```powershell
 cargo build --profile diag -p victory --features diagnostics
-$env:VICTORY_SHADER_LOOP_LIMIT = '32'   # what the base's testers use on NVIDIA
+$env:VICTORY_WAVE_DEEP_SKIPS_NOT = '<the 22 hashes above>'   # no loop limit
 target\diag\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
