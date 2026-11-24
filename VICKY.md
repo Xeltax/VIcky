@@ -1,5 +1,11 @@
 # VIcky: a research fork of VIctory
 
+> **New (2026-11-24): the world renders lit and textured on NVIDIA. Use branch [`fx-heapmap`](https://github.com/Xeltax/VIcky/tree/fx-heapmap).**
+> It is [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) at `7b0f736` (all of its rendering work is fxceless's, GPL-3.0), plus VIcky's heap map for NVIDIA's 1,000,000-view cap. On an RTX 4080: a lit, textured prologue at 2–3 fps, no device removal. See that branch's [VICKY.md](https://github.com/Xeltax/VIcky/blob/fx-heapmap/VICKY.md) for measurements and known problems (invisible walls, a hair regression).
+> **FR —** le monde s'affiche éclairé et texturé sur NVIDIA : branche `fx-heapmap` (base : le fork de fxceless, crédité, + notre table de correspondance du heap).
+>
+> What follows is the older research tree on `main`, based on VIctory's integration branch.
+
 VIcky is a **research fork of [VIctory](https://github.com/Marvisak/VIctory)**. Its goal is to find out why the retail title's world renders black or flat grey on PC, and to fix it, in the open. It is not an official release. It is not affiliated with VIctory's maintainers, with XCL, or with the title's publisher.
 
 > **FR —** VIcky est un fork de recherche de VIctory. Le jeu se lance, charge le monde et répond aux commandes, mais la scène 3D s'affiche noire ou grise. Ce dépôt rassemble les meilleures branches de la communauté et des outils de diagnostic, pour trouver ensemble quelle passe de rendu casse et pourquoi. Toute aide est la bienvenue (issues, mesures, correctifs).
