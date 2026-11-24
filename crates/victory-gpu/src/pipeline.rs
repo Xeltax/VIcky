@@ -67,6 +67,19 @@ pub(crate) struct Shader {
     /// (diagnostics: `VICTORY_SKIP_WAVE64`).
     #[cfg(all(windows, feature = "diagnostics"))]
     wave64: OnceLock<bool>,
+    /// combo: its native program's root layout, parsed on first trace
+    /// (diagnostics).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    native: OnceLock<Option<NativeLayout>>,
+}
+
+/// combo: where a console program's root parameters arrive and the
+/// descriptors it reads, as its native program states them: known even for
+/// a shader that does not translate (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) struct NativeLayout {
+    pub(crate) layout: Vec<victory_shader::RootParam>,
+    pub(crate) used: Vec<victory_shader::UsedResource>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -94,6 +107,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(all(windows, feature = "diagnostics"))]
                 wave64: OnceLock::new(),
+                #[cfg(all(windows, feature = "diagnostics"))]
+                native: OnceLock::new(),
             })
         })
         .clone()
@@ -367,6 +382,40 @@ impl Shader {
                 .is_some_and(|ps| ps.iter().any(|p| p.wave64))
         })
     }
+
+    /// combo: the native program's root layout and used descriptors, parsed
+    /// once; the program [`translate`] takes the used list from.
+    pub(crate) fn native(&self) -> Option<&NativeLayout> {
+        self.native
+            .get_or_init(|| {
+                use victory_shader::{Container, FourCC, HwStage};
+                let c = Container::parse(&self.container).ok()?;
+                let part = c.part(FourCC::DXIL)?;
+                victory_shader::native_programs(part.data)
+                    .ok()?
+                    .into_iter()
+                    .find(|p| {
+                        matches!(
+                            p.stage,
+                            HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+                        )
+                    })
+                    .map(|p| NativeLayout {
+                        layout: p.layout,
+                        used: p.used,
+                    })
+            })
+            .as_ref()
+    }
+}
+
+/// combo: a pipeline's shaders, for traces (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn shaders(this: This) -> Vec<Arc<Shader>> {
+    if this.is_null() {
+        return Vec::new();
+    }
+    pipeline(this).shaders.clone()
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]

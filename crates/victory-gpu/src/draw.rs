@@ -674,6 +674,8 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if tracing::enabled!(tracing::Level::DEBUG) && crate::capture::listed(crate::queue::presented() + 1) {
             tracing::debug!("dispatch {x}x{y}x{z} {}", crate::pipeline::trace_name(self.pipeline as This));
+            // combo: what it had bound, translated or not
+            tracing::debug!("dispatch-bindings{}", self.native_bindings(true));
         }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -740,6 +742,86 @@ impl State {
             }
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
+        text
+    }
+
+    /// combo: what a draw or dispatch had bound, from its programs' native
+    /// root layouts, so also for a program that does not translate: per
+    /// root parameter `p<slot>` (its first user-data dword `u<n>`) the value
+    /// the title set, and for a table its heap slot and the views the
+    /// program reads through it, as the title recorded them (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    fn native_bindings(&self, compute: bool) -> String {
+        use std::fmt::Write;
+        let mut text = String::new();
+        let roots = self.roots_ref(compute);
+        for shader in crate::pipeline::shaders(self.pipeline as This) {
+            let _ = write!(text, " | {} {}:", shader.stage, shader.hash);
+            let Some(native) = shader.native() else {
+                text.push_str(" no native layout");
+                continue;
+            };
+            let reads = table_reads(&native.layout, &native.used);
+            for (p, used) in native.layout.iter().zip(&reads) {
+                let _ = write!(text, " p{} {:?} u{}", p.slot, p.root, p.user_data);
+                match (p.root, roots.get(usize::from(p.slot))) {
+                    (RootType::Table, Some(&Root::Table(table))) => {
+                        let Some((heap, index)) =
+                            self.heap_of(table).and_then(|h| Some((h, h.index(table)?)))
+                        else {
+                            let _ = write!(text, "={table:#x} outside the bound heaps");
+                            continue;
+                        };
+                        let kind = if heap.samplers() {
+                            "sampler heap"
+                        } else {
+                            "heap"
+                        };
+                        let _ = write!(text, "={:#x} {kind} {index}", table - heap.start);
+                        for u in used {
+                            let handle = table + u64::from(u.table_offset_dwords) * 4;
+                            let _ = write!(text, " [{:?} +{}", u.kind, u.table_offset_dwords);
+                            let _ = match heap.index(handle) {
+                                Some(i) => write!(
+                                    text,
+                                    " {kind} {i}: {}]",
+                                    describe_bound(crate::descriptor::view(handle).as_ref())
+                                ),
+                                None => write!(text, " past the heap]"),
+                            };
+                        }
+                    }
+                    (RootType::Constants, Some(Root::Constants(c))) => {
+                        let n = (p.sgprs as usize).max(1);
+                        let values: Vec<String> = (0..n)
+                            .map(|k| format!("{:#x}", c.get(k).copied().unwrap_or(0)))
+                            .collect();
+                        let _ = write!(text, "=[{}]", values.join(", "));
+                    }
+                    (RootType::Descriptor, Some(Root::View(address))) => {
+                        let _ = write!(text, "={address:#x}");
+                    }
+                    (RootType::Table | RootType::Constants | RootType::Descriptor, _) => {
+                        text.push_str(" unset");
+                    }
+                    _ => {}
+                }
+            }
+            // Tables the program reads that its layout does not place.
+            for u in native.used.iter().filter(|u| {
+                u.root == RootType::Table
+                    && !native
+                        .layout
+                        .iter()
+                        .any(|p| p.root == RootType::Table && p.slot == u.slot)
+            }) {
+                let _ = write!(
+                    text,
+                    " [{:?} p{}+{}: not in the layout]",
+                    u.kind, u.slot, u.table_offset_dwords
+                );
+            }
+        }
         text
     }
 
@@ -1378,6 +1460,67 @@ fn describe(view: Option<&View>) -> String {
     }
 }
 
+/// combo: the used entries read through each layout entry's table: a
+/// table's entries all under the first layout entry of its root parameter
+/// (a table's ranges share it), none under the others nor under other
+/// kinds of parameter (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn table_reads<'a>(
+    layout: &[victory_shader::RootParam],
+    used: &'a [UsedResource],
+) -> Vec<Vec<&'a UsedResource>> {
+    let table = |p: &victory_shader::RootParam| p.root == RootType::Table;
+    layout
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            if !table(p) || layout[..i].iter().any(|q| table(q) && q.slot == p.slot) {
+                return Vec::new();
+            }
+            used.iter()
+                .filter(|u| u.root == RootType::Table && u.slot == p.slot)
+                .collect()
+        })
+        .collect()
+}
+
+/// combo: a view as the title recorded it, for the dispatch bindings: UAV
+/// or SRV, the resource, its host size, format and flags (or the buffer
+/// range), and the view's own format (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn describe_bound(view: Option<&View>) -> String {
+    let (kind, resource, desc) = match view {
+        Some(View::Shader(r, d)) => ("SRV", *r, d),
+        Some(View::Unordered(r, _, d)) => ("UAV", *r, d),
+        other => return describe(other),
+    };
+    let what = match crate::resource::host_resource(resource as This) {
+        Some(t) => {
+            // SAFETY: a live resource.
+            let d = unsafe { t.GetDesc() };
+            format!(
+                "{}x{} f{} flags {:#x}",
+                d.Width, d.Height, d.Format.0, d.Flags.0
+            )
+        }
+        None => match view.and_then(crate::descriptor::host::buffer_range) {
+            Some((address, len)) => format!("buffer {address:#x}+{len:#x}"),
+            None => "no host resource".into(),
+        },
+    };
+    bound_text(kind, resource, &what, desc.as_ref().map(|d| d[0]))
+}
+
+/// combo: [`describe_bound`]'s words, the view's format if it names one
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn bound_text(kind: &str, resource: usize, what: &str, view_format: Option<u32>) -> String {
+    let format = view_format
+        .map(|f| format!(" view f{f}"))
+        .unwrap_or_default();
+    format!("{kind} {resource:#x} {what}{format}")
+}
+
 /// The console's own primitive topologies.
 const TRIANGLE_FAN: u32 = 6;
 const RECTANGLES: u32 = 17;
@@ -1507,5 +1650,64 @@ mod tests {
         assert_eq!(state.dynamic.len(), 2);
 
         list.close();
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn dispatch_bindings_group_table_reads_by_parameter() {
+        use victory_shader::RootParam;
+        let param = |root, slot, user_data| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let read = |kind, root, slot, table_offset_dwords| UsedResource {
+            kind,
+            root,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot,
+        };
+        let layout = [
+            param(RootType::Constants, 0, 0),
+            param(RootType::Table, 1, 1),
+            // A second range of the same table.
+            param(RootType::Table, 1, 2),
+            param(RootType::Table, 2, 3),
+        ];
+        let used = [
+            read(ResourceType::Uav, RootType::Table, 1, 0),
+            read(ResourceType::Srv, RootType::Table, 2, 8),
+            read(ResourceType::Srv, RootType::Table, 1, 16),
+            read(ResourceType::Cbv, RootType::Descriptor, 0, 0),
+        ];
+        let reads = table_reads(&layout, &used);
+        let offsets: Vec<Vec<(ResourceType, u32)>> = reads
+            .iter()
+            .map(|r| r.iter().map(|u| (u.kind, u.table_offset_dwords)).collect())
+            .collect();
+        assert_eq!(
+            offsets,
+            [
+                vec![],
+                vec![(ResourceType::Uav, 0), (ResourceType::Srv, 16)],
+                vec![],
+                vec![(ResourceType::Srv, 8)],
+            ]
+        );
+        assert_eq!(
+            bound_text("UAV", 0x1d2c_4a80, "160x90 f24 flags 0x4", Some(0)),
+            "UAV 0x1d2c4a80 160x90 f24 flags 0x4 view f0"
+        );
+        assert_eq!(
+            bound_text("SRV", 0x10, "buffer 0x7000+0x100", None),
+            "SRV 0x10 buffer 0x7000+0x100"
+        );
     }
 }

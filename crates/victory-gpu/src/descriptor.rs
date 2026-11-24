@@ -540,7 +540,79 @@ pub(crate) extern "system" fn create_uav(
     handle: u64,
 ) {
     let view = View::Unordered(resource as usize, counter as usize, words(desc));
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some((w, h)) = traced_uav_size()
+        && let Some((_, d)) = crate::resource::texture_memory(resource)
+        && d.extent().0 == (w, h)
+    {
+        let host = crate::resource::host_resource(resource)
+            // SAFETY: a live resource.
+            .map(|t| unsafe { t.GetDesc() }.Format.0 as u32);
+        tracing::info!(
+            "{}",
+            uav_text(
+                w,
+                h,
+                shader_slot(handle).map(|(_, i)| i),
+                handle,
+                &format!("resource {resource:?}"),
+                d.format,
+                host,
+                words(desc).map(|d| d[0]),
+                d.extent().1,
+                crate::queue::presented() + 1,
+            )
+        );
+    }
     record(handle, view);
+}
+
+/// combo: `VICTORY_TRACE_UAV_SIZE=<W>x<H>`: unordered access views of
+/// textures that size are logged as they are made (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn traced_uav_size() -> Option<(u64, u32)> {
+    static SIZE: std::sync::OnceLock<Option<(u64, u32)>> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let value = std::env::var("VICTORY_TRACE_UAV_SIZE").ok()?;
+        let size = parse_size(&value);
+        if size.is_none() {
+            tracing::warn!(value, "VICTORY_TRACE_UAV_SIZE expects <width>x<height>");
+        }
+        size
+    })
+}
+
+/// `<width>x<height>`, as `2560x1440`.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn parse_size(value: &str) -> Option<(u64, u32)> {
+    let (w, h) = value.trim().split_once(['x', 'X'])?;
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+}
+
+/// combo: the line logged for a traced unordered access view: its size,
+/// heap slot (if in a shader-visible heap) and handle, what it views, the
+/// title's, host's and view's formats, the texture's flags and the frame
+/// being built (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+#[allow(clippy::too_many_arguments)]
+fn uav_text(
+    w: u64,
+    h: u32,
+    slot: Option<u32>,
+    handle: u64,
+    what: &str,
+    format: u32,
+    host_format: Option<u32>,
+    view_format: Option<u32>,
+    flags: u32,
+    frame: u64,
+) -> String {
+    let slot = slot.map_or_else(|| "not shader-visible".to_owned(), |i| format!("heap {i}"));
+    let host = host_format.map_or_else(|| "none".to_owned(), |f| format!("f{f}"));
+    let view = view_format.map_or_else(|| "none".to_owned(), |f| format!("f{f}"));
+    format!(
+        "uav-create {w}x{h} {slot} handle {handle:#x} {what} format f{format} host {host} view {view} flags {flags:#x} frame {frame}"
+    )
 }
 
 /// Device methods 0x230 and 0x238: shader resource and unordered access
@@ -564,6 +636,35 @@ pub(crate) extern "system" fn create_placed_uav(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+        // combo: as `create_uav`, for a view of memory (its address)
+        #[cfg(all(windows, feature = "diagnostics"))]
+        if let Some((w, h)) = traced_uav_size() {
+            // SAFETY: 56 bytes in the description's layout.
+            let d = unsafe {
+                resource
+                    .as_ptr()
+                    .cast::<crate::resource::ResourceDesc>()
+                    .read_unaligned()
+            };
+            if d.extent().0 == (w, h) {
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                tracing::info!(
+                    "{}",
+                    uav_text(
+                        w,
+                        h,
+                        shader_slot(handle).map(|(_, i)| i),
+                        handle,
+                        &format!("placed at {address:#x}"),
+                        d.format,
+                        None,
+                        Some(desc[0]),
+                        d.extent().1,
+                        crate::queue::presented() + 1,
+                    )
+                );
+            }
+        }
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -873,5 +974,47 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn traced_uav_sizes_parse_and_lines_read_back() {
+        assert_eq!(parse_size("2560x1440"), Some((2560, 1440)));
+        assert_eq!(parse_size(" 160 X 90 "), Some((160, 90)));
+        assert_eq!(parse_size("160"), None);
+        assert_eq!(parse_size("160x"), None);
+        assert_eq!(parse_size("ax90"), None);
+        assert_eq!(
+            uav_text(
+                160,
+                90,
+                Some(4711),
+                0x2_0000_93c0,
+                "resource 0x1d2c4a80",
+                24,
+                Some(24),
+                Some(0),
+                0x4,
+                1801
+            ),
+            "uav-create 160x90 heap 4711 handle 0x2000093c0 resource 0x1d2c4a80 \
+             format f24 host f24 view f0 flags 0x4 frame 1801"
+        );
+        assert_eq!(
+            uav_text(
+                160,
+                90,
+                None,
+                0x40,
+                "placed at 0x7000",
+                24,
+                None,
+                Some(24),
+                0x4,
+                3
+            ),
+            "uav-create 160x90 not shader-visible handle 0x40 placed at 0x7000 \
+             format f24 host none view f24 flags 0x4 frame 3"
+        );
     }
 }
