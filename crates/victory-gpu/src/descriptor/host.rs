@@ -953,6 +953,7 @@ impl HostHeap {
     /// VIcky (diagnostics): over the title's whole heap (past a host cap too), how many
     /// slots hold one of our views, the highest, and how many lie past the host heap;
     /// and the bindless bookkeeping.
+    #[cfg(feature = "diagnostics")]
     pub(crate) fn bindless_report(&self) -> Option<String> {
         if self.sampler {
             return None;

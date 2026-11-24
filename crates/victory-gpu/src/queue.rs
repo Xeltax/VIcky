@@ -251,7 +251,6 @@ pub(crate) fn note_gbuffer(resource: usize) {
     GBUFFER.store(resource, Ordering::Relaxed);
 }
 
-#[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }

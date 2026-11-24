@@ -23,6 +23,10 @@ VIcky is a **research fork of [VIctory](https://github.com/Marvisak/VIctory)**. 
 | Mask dwords at data joins, and `s_bcnt1`'s SCC of a mask | VIctory #878 (permadiego `7ab94ab`), ported by hand |
 | Wave64 mesh code numbers its lanes the host's way on 32-lane hosts | Peppacodes `ed9afc0` (VIctory #940), adapted to this tree's wave64 stack (`VICTORY_MESH_CONSOLE_LANES=1` turns it off) |
 | `VICTORY_SHOW_GBUFFER=<n>` presents G-buffer target `n` (default 1, the packed normals) instead of the title's black picture | this fork |
+| **Bindless slots made and kept up to date** (`ResourceDescriptorHeap[]`: buffers, constant buffers, placed and streamed textures). This is what brought the first real albedo colours. | VIctory #413 (wbkepler), merged here with all of this tree's changes |
+| A descriptor only read by `s_buffer_load` is a raw buffer (+291 programs offline, `a scalar memory read as data` 291 → 0) | VIctory #953 (MartinIndra02), brought in by UNYTIX (#8) |
+| Dispatch bindings decoded from the console layout, for refused programs too (`dispatch-bindings` lines), and `VICTORY_TRACE_UAV_SIZE=<W>x<H>` (`uav-create` lines) | this fork |
+| `VIcky: view heap …` at each captured frame: views over the whole title heap, how many lie past the host heap, their distribution; `VICTORY_BINDLESS_BUDGET_US` | this fork |
 
 ## Build and run
 
@@ -64,6 +68,13 @@ More switches (diagnostics builds):
 Measured on an RTX 4080 (Windows 11), in diagnostics builds of this tree, unless a line says otherwise.
 
 - **The world loads and runs at about 1 frame per second.** About 930–980 draws and dispatches per frame are dropped, of about 2,150; about 250 of those are only waiting for their pipelines to compile. The UI, subtitles and the loading art all render.
+- **The heap cap is the blocker on NVIDIA (2026-11-24, night). It explains the black parts of the albedo and the black lighting.**
+  - **The first real albedo colours:** with #413, G-buffer RT0 holds textured characters (skin, hair, clothes) under `VICTORY_SHOW_GBUFFER=0`. At frame 2066 it was 6.8 % covered, and it fills as slots are made.
+  - **Many triangles stay black:** the view heap report at frame 2066 counted 502,197 title slots holding views, the highest at 1,245,182, and **217,439 past the host heap** (RTX 4080: 737,855 title slots mirrored under its 1,000,000 cap). A bindless read of such a slot reads the null guard slot.
+  - **The used slots:** views per 64Ki slots are `[56k, 39k, 0, 0, 0, 24k, 40k, …, 25k]`; the empty runs are 110,940–327,680 and 341,414–360,448. Removing the gaps still needs ~1,009,410 slots, so only a slot map can fit the ~500k live views.
+  - **Lighting:** the 160x90 `f24` texture the lighting reads **is written** by translated computes (`914e86141fa3b37f`, `08055d95e9ee79c0`, 40x23x17), but **through a UAV at heap slot ~904,335**, past the cap. The writes are lost, and every HDR target stays exactly 0.
+  - **Next:** map title slots past the cap onto free host slots (a map buffer read in `heap_guard`; mirroring and the bindless sync write the mapped slot).
+  - `VICTORY_RT_MISS=1` in the title: 104 → 88 untranslated programs, no device removal, HDR still 0 (expected while the lighting inputs are lost).
 - **Lighting, newest leads (2026-11-24, late):**
   - **The HDR target is black on an AMD RX 7800 XT too** (0.11 % non-zero, UNYTIX in #7). So wave64 emulation is not why lighting is black.
   - In the traced frame, **the lighting draws read a 160x90 `f24` UAV texture that nothing writes** (2560x1440 in 16x16 tiles, likely a tile classification). Its likely writers, judged by their 160x90 grids, are computes refused on 32-lane hosts ("console wave64 lanes in a group of more than 64 threads": `5c6224a6bc3a4066`, `0c028454b58543f0`) or others (`23d507cbb6a22e86`, `2da4beb386509b77`). This is inferred: dispatch bindings are not traced yet.
