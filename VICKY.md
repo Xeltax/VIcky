@@ -1,8 +1,7 @@
 # VIcky: a research fork of VIctory
 
-> **New (2026-11-24): the world renders lit and textured on NVIDIA. Use branch [`fx-heapmap`](https://github.com/Xeltax/VIcky/tree/fx-heapmap).**
-> It is [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) at `7b0f736` (all of its rendering work is fxceless's, GPL-3.0), plus VIcky's heap map for NVIDIA's 1,000,000-view cap. On an RTX 4080: a lit, textured prologue at 2–3 fps, no device removal. See that branch's [VICKY.md](https://github.com/Xeltax/VIcky/blob/fx-heapmap/VICKY.md) for measurements and known problems (invisible walls, a hair regression).
-> **FR —** le monde s'affiche éclairé et texturé sur NVIDIA : branche `fx-heapmap` (base : le fork de fxceless, crédité, + notre table de correspondance du heap).
+> **Latest (2026-11-25): use branch [`fx-heapmap-8d`](https://github.com/Xeltax/VIcky/tree/fx-heapmap-8d).** It is [fxceless/victory-fork](https://github.com/fxceless/victory-fork) at `8dd30ab` (all of its rendering work is fxceless's, GPL-3.0) plus VIcky's commits (heap map for NVIDIA's 1,000,000-view cap, per-program wave64 switch, contributors' fixes). On an RTX 4080: a lit, textured prologue with the cell's walls in 2 of 2 runs, 3.5–4.5 fps, no device removal. Settings and measurements are in that branch's [VICKY.md](https://github.com/Xeltax/VIcky/blob/fx-heapmap-8d/VICKY.md). (`fx-heapmap` and `fx-heapmap-4e` are older bases.)
+> **FR —** dernière branche : `fx-heapmap-8d` (fork de fxceless à `8dd30ab`, crédité, + nos commits) : prologue éclairé et texturé, murs de la cellule présents 2 runs sur 2, 3,5–4,5 i/s sur RTX 4080.
 >
 > What follows is the older research tree on `main`, based on VIctory's integration branch.
 
