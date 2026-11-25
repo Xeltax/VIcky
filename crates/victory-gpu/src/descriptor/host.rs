@@ -153,7 +153,7 @@ struct HeapMap {
 /// the map's raw view at `slot`; then the fork's [`DYNAMIC`] dynamic slots
 /// and its null guard slot last, where they were without a map.
 ///
-/// On NVIDIA a shader-visible view heap holds at most 1,000,000 views
+/// On a capped host this layout uses 1,000,000 shader-visible views
 /// ([`PORTABLE_VIEWS`]); the title's has 1,245,184 slots, some
 /// 650,000-700,000 of them holding views, about 335,000 of those past the
 /// 737,855 title slots a capped heap kept in place (their bindless reads
