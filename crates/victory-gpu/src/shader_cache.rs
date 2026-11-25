@@ -95,7 +95,8 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
         emit::for_program(&hash, || emit::translate(c)).map_err(|e| e.to_string())
     };
     let off = !emit::deep_skips_allowed(Some(&hash)) && emit::wave64_retried(container);
-    cached(cache, &program_key(&build(), off), container, translate).map(|_| ran.load(Ordering::Relaxed))
+    let key = program_key(&build(), off, opt_off(&hash));
+    cached(cache, &key, container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
 
 /// The translation of a console shader container, from the cache when
@@ -112,28 +113,46 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
             // program a list names, or with `VICTORY_WAVE_DEEP_SKIPS=0`
             // any, gets there)
             let off = !emit::deep_skips_allowed(Some(&hash)) && emit::wave64_retried(container);
-            cached(cache, &program_key(&build(), off), container, translate)
+            let key = program_key(&build(), off, opt_off(&hash));
+            cached(cache, &key, container, translate)
         }
         None => translate(container),
     }
 }
 
 /// The key of one program's entries: the build's, mixed with the
-/// per-program decision when the program is kept out of the wave64 form
-/// "without skips, scalars followed" (`VICTORY_WAVE_DEEP_SKIPS_NOT`,
-/// `_ONLY`: `victory_shader::emit::deep_skips_allowed`). Only for a wave64
-/// compute program on a host of 32-lane waves, the only ones it can change.
+/// per-program decisions that differ from the build's own.
+/// - The program is kept out of the wave64 form "without skips, scalars
+///   followed" (`VICTORY_WAVE_DEEP_SKIPS_NOT`, `_ONLY`:
+///   `victory_shader::emit::deep_skips_allowed`). Only for a wave64 compute
+///   program on a host of 32-lane waves, the only ones it can change.
+/// - The program is kept out of the clean-up passes while the build runs
+///   some (`VICTORY_SHADER_OPT_NOT`, `_ONLY`:
+///   `victory_shader::emit::shader_opt_allowed`).
+///
 /// So the lists are in no key: changing one translates again only the
-/// programs whose decision it changes, and a program allowed the form keeps
-/// the key it had without any list.
-fn program_key(build: &[u8; 32], deep_skips_off: bool) -> [u8; 32] {
-    if !deep_skips_off {
+/// programs whose decision it changes, and a program the lists leave alone
+/// keeps the key it had without any list.
+fn program_key(build: &[u8; 32], deep_skips_off: bool, opt_off: bool) -> [u8; 32] {
+    if !deep_skips_off && !opt_off {
         return *build;
     }
     let mut h = blake3::Hasher::new();
     h.update(build);
-    h.update(b"VICTORY_WAVE_DEEP_SKIPS off for this program");
+    if deep_skips_off {
+        h.update(b"VICTORY_WAVE_DEEP_SKIPS off for this program");
+    }
+    if opt_off {
+        h.update(b"VICTORY_SHADER_OPT off for this program");
+    }
     *h.finalize().as_bytes()
+}
+
+/// Whether the program `hash` is kept out of clean-up passes the build
+/// runs (with none, the lists change nothing and are in no key).
+fn opt_off(hash: &str) -> bool {
+    use victory_shader::emit;
+    emit::shader_opt() != 0 && !emit::shader_opt_allowed(Some(hash))
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -444,11 +463,11 @@ mod tests {
     #[test]
     fn a_program_kept_out_of_the_deep_skips_form_has_a_key_of_its_own() {
         let build = [7u8; 32];
-        assert_eq!(program_key(&build, false), build, "allowed: the build's key, as without lists");
-        let off = program_key(&build, true);
+        assert_eq!(program_key(&build, false, false), build, "allowed: the build's key, as without lists");
+        let off = program_key(&build, true, false);
         assert_ne!(off, build);
-        assert_eq!(program_key(&build, true), off, "the same decision, the same key");
-        assert_ne!(program_key(&[8; 32], true), off, "and still the build's");
+        assert_eq!(program_key(&build, true, false), off, "the same decision, the same key");
+        assert_ne!(program_key(&[8; 32], true, false), off, "and still the build's");
 
         // So only the program whose decision changed is translated again.
         let dir = tempfile::tempdir().unwrap();
@@ -460,18 +479,39 @@ mod tests {
         };
         let [a, b] = [b"program a".as_slice(), b"program b"];
         for c in [a, b] {
-            cached(&cache, &program_key(&build, false), c, translate).unwrap();
+            cached(&cache, &program_key(&build, false, false), c, translate).unwrap();
         }
         assert_eq!(runs.load(Ordering::Relaxed), 2);
         // a listed: a translated again, b from the cache
-        cached(&cache, &program_key(&build, true), a, translate).unwrap();
-        cached(&cache, &program_key(&build, false), b, translate).unwrap();
+        cached(&cache, &program_key(&build, true, false), a, translate).unwrap();
+        cached(&cache, &program_key(&build, false, false), b, translate).unwrap();
         assert_eq!(runs.load(Ordering::Relaxed), 3);
         // the list emptied again: both from the cache
         for c in [a, b] {
-            cached(&cache, &program_key(&build, false), c, translate).unwrap();
+            cached(&cache, &program_key(&build, false, false), c, translate).unwrap();
         }
         assert_eq!(runs.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn a_program_kept_out_of_the_clean_up_has_a_key_of_its_own() {
+        let build = [7u8; 32];
+        assert_eq!(program_key(&build, false, false), build);
+        let opt = program_key(&build, false, true);
+        let deep = program_key(&build, true, false);
+        let both = program_key(&build, true, true);
+        assert_ne!(opt, build);
+        // Each decision a key of its own, the deep-skips one as before.
+        assert!(opt != deep && opt != both && deep != both);
+        let mut h = blake3::Hasher::new();
+        h.update(&build);
+        h.update(b"VICTORY_WAVE_DEEP_SKIPS off for this program");
+        let unchanged = *h.finalize().as_bytes();
+        assert_eq!(deep, unchanged, "the deep-skips key is unchanged");
+        let again = program_key(&build, false, true);
+        assert_eq!(again, opt, "the same decision, the same key");
+        let other = program_key(&[8; 32], false, true);
+        assert_ne!(other, opt, "and still the build's");
     }
 
     #[test]

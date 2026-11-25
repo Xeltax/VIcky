@@ -16,6 +16,17 @@
 //! - `VICTORY_WAVE_DEEP_SKIPS_ONLY=<hash>,...`: off for every program not
 //!   listed.
 //!
+//! The other is for the clean-up passes over the finished module
+//! (`VICTORY_SHADER_OPT`, [`super::shader_opt`]): on an RTX 4080 and an
+//! AMD RX 7800 XT (2026-11-24) runs with them lost walls and body parts
+//! that runs without them had, and the offline check (`bitcode::check`)
+//! found no program they change. So a run can keep chosen programs out of
+//! them, to find one:
+//! - `VICTORY_SHADER_OPT_NOT=<hash>,...`: no clean-up for the listed
+//!   programs;
+//! - `VICTORY_SHADER_OPT_ONLY=<hash>,...`: no clean-up for every program not
+//!   listed.
+//!
 //! A program's decision is part of its shader cache key (`victory-gpu`'s
 //! `shader_cache`), not the lists: changing a list translates again only
 //! the programs whose decision it changes.
@@ -54,7 +65,12 @@ pub(super) fn current() -> Option<String> {
 /// decision into its own key) and so left out of the translator's
 /// fingerprint ([`super::translation_fingerprint`]): a new list translates
 /// again only the programs whose decision it changes.
-pub(super) const PER_PROGRAM_SWITCHES: [&str; 2] = ["VICTORY_WAVE_DEEP_SKIPS_NOT", "VICTORY_WAVE_DEEP_SKIPS_ONLY"];
+pub(super) const PER_PROGRAM_SWITCHES: [&str; 4] = [
+    "VICTORY_WAVE_DEEP_SKIPS_NOT",
+    "VICTORY_WAVE_DEEP_SKIPS_ONLY",
+    "VICTORY_SHADER_OPT_NOT",
+    "VICTORY_SHADER_OPT_ONLY",
+];
 
 /// Whether the deep-skips form may be tried for the program whose hash is
 /// `hash` (`None`: not known, as for a translation outside
@@ -75,6 +91,27 @@ pub fn deep_skips_allowed(hash: Option<&str>) -> bool {
         }
     });
     decide(s.on, s.not.as_deref(), s.only.as_deref(), hash)
+}
+
+/// Whether the clean-up passes (`VICTORY_SHADER_OPT`) run over the program
+/// whose hash is `hash` (`None`: not known, as for a translation outside
+/// [`for_program`]), by `VICTORY_SHADER_OPT_NOT` and `_ONLY` (module notes).
+/// Which passes run is [`super::shader_opt`]; with none, the lists do not
+/// matter.
+pub fn shader_opt_allowed(hash: Option<&str>) -> bool {
+    struct Lists {
+        not: Option<Vec<String>>,
+        only: Option<Vec<String>>,
+    }
+    static LISTS: OnceLock<Lists> = OnceLock::new();
+    let l = LISTS.get_or_init(|| {
+        let list = |name| std::env::var(name).ok().map(|v| parse_hash_list(&v));
+        Lists {
+            not: list(PER_PROGRAM_SWITCHES[2]),
+            only: list(PER_PROGRAM_SWITCHES[3]),
+        }
+    });
+    decide(true, l.not.as_deref(), l.only.as_deref(), hash)
 }
 
 /// Whether the wave64 forms, and so the deep-skips switches, can matter for

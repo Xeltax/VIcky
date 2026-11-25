@@ -7873,7 +7873,7 @@ impl<'a> Lower<'a> {
                         return Err("a first-lane read where not every lane runs");
                     }
                     let c = self.cur;
-                    if guard.is_none() && super::shader_opt() & super::bitcode::opt::FIRST != 0 {
+                    if guard.is_none() && super::program_shader_opt() & super::bitcode::opt::FIRST != 0 {
                         // Every lane is in EXEC: the console's first lane is
                         // lane 0, which the lower half of every console wave
                         // has. No half needs to ask the other whether it has

@@ -519,9 +519,24 @@ impl Shader {
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
-        let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        let passes = super::program_shader_opt() & super::bitcode::opt::MODULE;
         if passes != 0 {
+            // `VICTORY_SHADER_OPT_CHECK` (`bitcode::check`): the module
+            // before and after, run side by side.
+            let seeds = super::bitcode::check::seeds();
+            let before = (seeds > 0).then(|| self.m.clone());
             self.m.optimise(passes);
+            if let Some(before) = before {
+                let hash = super::per_program::current().unwrap_or_else(|| "?".into());
+                match super::bitcode::check::compare(&before, &self.m, seeds) {
+                    (Some(how), _) => {
+                        eprintln!("SHADER-OPT-CHECK #{hash} passes={passes} differs: {how}")
+                    }
+                    (None, runs) => {
+                        eprintln!("SHADER-OPT-CHECK #{hash} passes={passes} same: {runs}")
+                    }
+                }
+            }
             let used = self.m.usage();
             for (flag, used) in [
                 (flags::WAVE_OPS, used.wave_ops),
