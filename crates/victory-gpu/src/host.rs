@@ -1216,20 +1216,25 @@ impl HostList {
         let copies = crate::twin::at_submission(twins.values());
         drop(twins);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
-            .values()
-            .filter_map(|(first, last, copy)| {
-                let real = copy.state.swap(*last, Ordering::Relaxed);
-                (real != *first).then(|| {
-                    transition(
-                        &copy.texture,
-                        D3D12_RESOURCE_STATES(real as i32),
-                        D3D12_RESOURCE_STATES(*first as i32),
-                    )
+        // This also publishes the list's final states. If its prelude copies a
+        // depth plane, record the copy and restore its entry state first.
+        let entry_barriers = || -> Vec<D3D12_RESOURCE_BARRIER> {
+            states
+                .values()
+                .filter_map(|(first, last, copy)| {
+                    let real = copy.state.swap(*last, Ordering::Relaxed);
+                    (real != *first).then(|| {
+                        transition(
+                            &copy.texture,
+                            D3D12_RESOURCE_STATES(real as i32),
+                            D3D12_RESOURCE_STATES(*first as i32),
+                        )
+                    })
                 })
-            })
-            .collect();
-        if barriers.is_empty() && copies.is_empty() {
+                .collect()
+        };
+        let barriers = copies.is_empty().then(entry_barriers);
+        if barriers.as_ref().is_some_and(Vec::is_empty) {
             return None;
         }
         let (allocator, list) = &self.prelude;
@@ -1258,6 +1263,7 @@ impl HostList {
                         list.ResourceBarrier(&back);
                     }
                 }
+                let barriers = barriers.unwrap_or_else(entry_barriers);
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }

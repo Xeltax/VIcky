@@ -2284,6 +2284,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         unsafe {
             list.list.ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.5, 0x11, None)
         };
+        // The next list's prelude must copy from the cleared depth texture
+        // before publishing the final COPY_SOURCE states of the two planes.
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
         readable(&list, &used(ResourceType::Uav), &planes[0]);
         let twin = copy.twin.get().and_then(Option::as_ref).expect("a twin");
         let mut g = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
