@@ -49,6 +49,23 @@ Build and run as for `fx-heapmap-8d` (see `VICKY.md`). The builder is off by def
 
 **Read this before comparing numbers.** `VICTORY_GPU_TIMING=1` turns off late wait and the relay (`host.rs` `late_stage`). Every submission is then waited for, so the CPU and GPU strictly alternate. RT0–RT9 above ran with it, to get per-pipeline GPU times, so their frame times are pessimistic. RT10 is the same build and switches as RT8 with timing off: about 1.8× faster.
 
+### RTX 5090 (driver 32.0.16.1742, Ryzen 7 9800X3D, 32 lanes), Series X, `493cc0d`
+
+Task 1 below. Two runs of 600 s per setting after one cache fill per mode, alternating off, on, off, on, each from the same save, no input once the world is up. No `VICTORY_GPU_TIMING`, so compare with RT10, not RT0–RT8. Other settings as "Run" above; builder on uses the recommended four switches. The ranges are the last 12 `fps` lines of each run.
+
+| run | builder | fps | ms/frame | GPU | preparing | copying back | dropped draws | shader writes looked for on the CPU, per frame |
+|---|---|---|---|---|---|---|---|---|
+| 5090-off-1 | off | 4.9–5.0 | 199–204 | 105–112 | 65–72 | 156–172 | 336–350 | 0 MB in windows; 24.4–24.6 MB in 259–263 ranges of buffers' copies |
+| 5090-off-2 | off | 5.0–5.1 | 198–202 | 104–109 | 65–70 | 157–165 | 339–350 | 0 MB in windows; 23.3–23.6 MB in 257–260 ranges |
+| 5090-on-1 | on | 4.6–4.9 | 206–219 | 73–89 | 99–122 | 165–179 | 4 | 236–258 MB in 63–69 ranges of windows (175–184 MB snapshotted); 25.3–25.6 MB in buffers' copies |
+| 5090-on-2 | on | 4.2–4.7 | 213–238 | 65–92 | 130–145 | 150–175 | 4 | 313–346 MB in 81–90 ranges of windows (215–247 MB snapshotted); 27.4–31.0 MB in buffers' copies |
+
+- The builder adds about 6% (run 1) and 13% (run 2) to the frame here (198–204 ms off, 206–238 ms on). The extra time is in preparing (65–72 ms off, 99–145 ms on); the GPU part is lower with the builder on.
+- With the builder on, draws dropped without a host pipeline fall from about 345 a frame to 4.
+- The second builder-on run compared about 40% more window memory than the first, from the same save and cache, and spent about 25% longer preparing.
+- All six runs (two fills of 900 s included) closed cleanly with exit code 0: no device removal, no panic. The same 10 warnings each run: 6 compute pipelines the host refuses (`0x80070057`) and 4 shaders that do not translate.
+- Not looked at: the picture (no captures were taken), so nothing here on the dark corner.
+
 - Without #346, the CPU found 85 MB of shader writes a frame by comparing about 16 GB, roughly 0.5%.
 - With RT8's settings, copying back costs less than with the builder off. The GPU is now the biggest part.
 - These are single runs, and the spread between runs is large.
