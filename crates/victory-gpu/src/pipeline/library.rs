@@ -832,7 +832,7 @@ pub(crate) fn keep_early_list() {
     drop(used());
 }
 
-/// Whether the title pipeline with `key` was drawn with in an earlier run.
+/// Whether a draw or dispatch requested this key in this run or an earlier one.
 pub(crate) fn wanted_early(key: &str) -> bool {
     used().as_ref().is_some_and(|u| u.before.contains(key) || u.now.contains(key))
 }
