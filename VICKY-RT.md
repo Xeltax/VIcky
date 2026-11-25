@@ -103,6 +103,30 @@ So the answer to "denoiser or reflections" is both and more: the tiled sun shado
 - These are single runs, and the spread between runs is large.
 - The picture with the builder on: the dark corner of the cell is no brighter yet.
 
+### What we tried after RT10 (RTX 4080; most worth knowing so nobody repeats them)
+
+GPU profiles come from `VICTORY_GPU_TIMING=1 VICTORY_D3D12_DRED=1`.
+- **Per-command times include the next command's bind work:** there is now a `bind (work recorded while binding the next command)` line, worth 14–24 ms a frame.
+- **The biggest builder stage is index 8, `CopyForBVHUpdate`:** a grid-stride copy of each BVH before its refit, about 57 a frame. Skipping it (`VICTORY_BVH_SKIP=8`, diagnostics only) took the frame's GPU time from 157–209 ms to 112 ms. It is bandwidth-bound.
+  - The builder's bitonic sort runs only in full builds, about 8 a frame, and costs a few ms.
+  - All 52 builder programs were named from the PDB path each container embeds.
+
+| tried | result |
+|---|---|
+| Spreading the notes, marks and touches over 32 dwords instead of one | no change |
+| Windows in VRAM (`VICTORY_CARD_WINDOWS_MB=4096`) | the BVH copy halved (23–27 ms); fps unchanged, because every window, CPU-written or not, went up |
+| Widening `CopyForBVHUpdate` to 2,048 groups (exact) | 3× slower: it is bandwidth, not thread count |
+| `VICTORY_ROOT_UAV_MB=8` + `VICTORY_NAMED_WRITE_MB=8` + page marks (RT18) | 4.5–5.0 fps in the gameplay scene, **but wrong colours** on a character: caps lose writes |
+| Page marks for raw pointers and root views, no caps (RT23) | slower (2.0–2.9 fps): more settles |
+| Never copying back what shaders write to windows in VRAM (an incorrect upper bound, RT22) | no gain: the card is now about 75% busy, so the GPU is the limit |
+
+**Where that leaves us:** RT10's setup stays the best: 3–3.5 fps with the builder on, correct picture. The GPU is the limit. Next on our side:
+- RT windows (builder and memory by address) in VRAM, with a budget of their own;
+- the "descriptor read as data" translation gap. It keeps 5 of the 6 `CS_TraceShadowRays_*` programs from running (task 4);
+- stage 0 of hardware ray tracing (an inventory of the traversal programs).
+
+The page-mark switches (`VICTORY_MEMORY_PAGE_MARKS`, `VICTORY_NAMED_WRITE_MB`) are on this branch for experiments; don't turn them on for normal runs.
+
 ## Roadmap: from about 3.5 fps toward 15–20
 
 **Why it is possible.** The console runs this title at 30 fps on a 12-TFLOPS RDNA2 GPU. An RTX 4080 has about 49 TFLOPS, and the title's CPU code is x86-64 that runs natively. RT10's frame is about 280 ms against the console's 33 ms: the gap is our translation, not the hardware. shadPS4 (AMD GPU, unified memory, raw command buffers) shows that this class of runtime can reach playable speeds.
