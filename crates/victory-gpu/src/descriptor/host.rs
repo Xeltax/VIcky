@@ -2278,6 +2278,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
+        View::NullConstant => {
+            null_for(view, at);
+            Some(None)
+        }
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
@@ -2507,10 +2511,9 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, _, desc) => {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
-        View::Constant(..) => {
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-            // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+        View::NullConstant | View::Constant(..) => {
+            // SAFETY: a live host heap slot; a null description creates an unbound CBV.
+            return unsafe { host.device.CreateConstantBufferView(None::<*const D3D12_CONSTANT_BUFFER_VIEW_DESC>, at) };
         }
         _ => return null_view(at),
     };
@@ -2920,6 +2923,21 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    #[test]
+    fn a_null_cbv_drops_the_slots_previous_resource() {
+        let Some(host) = host() else { return };
+        let heap = HostHeap::new(false, 4).expect("view heap");
+        let (buffer, _) = host.shared_buffer(256).expect("buffer");
+        heap.keep(0, Some(buffer));
+        let mut slot = [0u64; 4];
+        let handle = slot.as_mut_ptr() as u64;
+        crate::descriptor::create_cbv(std::ptr::null(), std::ptr::null(), handle);
+        assert_eq!(heap.mirror(0, handle, false), Some(View::NullConstant));
+        assert!(heap.kept.lock().unwrap()[0].is_none());
+        // SAFETY: the device is live.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     #[test]
