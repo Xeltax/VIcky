@@ -76,6 +76,12 @@ pub fn run(
     println!("console        {}", victory_hle::console::current().name());
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
+        if matches!(console, Console::SeriesS)
+            && name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
+            && let Some(real) = dll.export("ffxDispatch")
+        {
+            victory_hle::modules::ffx::set_real_dispatch(real);
+        }
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
     }
@@ -104,7 +110,32 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    // Series S needs the stretch for its lower-resolution scene. Series X
+    // continues to bind all FidelityFX imports through the title's DLL.
+    struct TakeDispatch<'a>(&'a dyn victory_loader::ImportResolver);
+    impl victory_loader::ImportResolver for TakeDispatch<'_> {
+        fn resolve(
+            &self,
+            dll: &str,
+            symbol: &victory_pe::ImportSymbol,
+        ) -> victory_loader::Resolution {
+            let ours = dll.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
+                && matches!(symbol, victory_pe::ImportSymbol::Name { name, .. } if name == "ffxDispatch");
+            if ours {
+                return victory_loader::Resolution::Found {
+                    address: victory_hle::modules::ffx::dispatch_address(),
+                    provenance: victory_loader::Provenance::Hle,
+                };
+            }
+            self.0.resolve(dll, symbol)
+        }
+    }
+    let series_s_dispatch = TakeDispatch(&with_dlls);
+    let exe_resolver: &dyn victory_loader::ImportResolver = match console {
+        Console::SeriesS => &series_s_dispatch,
+        Console::SeriesX => &with_dlls,
+    };
+    show(&exe_name, image.bind_imports(exe_resolver, policy)?);
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());

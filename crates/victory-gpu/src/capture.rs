@@ -182,7 +182,7 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     );
     chunk(&mut png, b"IEND", &[]);
     let path = folder.join(format!("{name}.png"));
-    match std::fs::write(&path, png) {
+    match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, png)) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
     }
@@ -393,6 +393,22 @@ pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object:
             return;
         }
     }
+    keep_target(resource, by);
+}
+
+/// Capture just the two upscale resources at present, without reading back
+/// every render target. The operation trace identifies each resource's role.
+pub(crate) fn note_upscale(colour: crate::object::This, output: crate::object::This) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_UPSCALE").is_some_and(|v| v == "1"))
+        && listed(crate::queue::presented() + 1)
+    {
+        keep_target(colour, "upscale input".to_owned());
+        keep_target(output, "upscale output".to_owned());
+    }
+}
+
+fn keep_target(resource: crate::object::This, by: String) {
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
     if !targets.iter().any(|(r, _, _)| *r == resource as usize)
         && let Some(copy) = crate::resource::host_copy(resource)

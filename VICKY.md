@@ -63,6 +63,20 @@ The heap map: in this base few views past the window are actually read (its pool
 - One mesh pipeline is refused by the driver (`f5e50eb2108c425b` + pixel `ce3f0432a08f1d35`, E_INVALIDARG).
 - 2–3 fps; ~360 draws per frame are dropped because the base's ray-tracing structure builder is off by default.
 
+## Series S scene presentation
+
+If menus draw but the world goes black, launch with `--console series-s` and set
+`VICTORY_SERIES_S_SCENE=1`. For frames with a submitted upscale, VIcky meters
+the linear scene color, maps it to the display, then draws the title's UI.
+This bypasses the title's final game-plane post-processing. Frames without a
+submitted upscale use the regular presentation path. The switch defaults to off.
+
+To trace this path locally, set `VICTORY_DUMP_UPSCALE=1` in a diagnostics build
+with a capture folder and selected capture frames. Each selected frame that
+stretches a scene records the input and output textures as they stand at present.
+The floating-point images are normalized separately. The log gives their
+original ranges.
+
 ## Build and run
 
 ```powershell
