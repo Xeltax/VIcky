@@ -207,7 +207,16 @@ pub(crate) fn sync_heaps() {
         // a heap map the title slots past the identity window have: pool
         // slots, `host::HostHeap::mirrored`.)
         let mirrored_count = heap.desc.count.min(host.mirrored());
-        for (range_from, range_end) in written.take(start as usize, end as usize) {
+        let ranges = written.take(start as usize, end as usize);
+        let threads = sync_threads();
+        if threads > 0 {
+            let [read, seen, made] = sync_wide(host, &ranges, (start, step), mirrored_count, threads);
+            pages += read;
+            looked += seen;
+            mirrored += made;
+            continue;
+        }
+        for (range_from, range_end) in ranges {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 let from = page.max(range_from);
@@ -264,22 +273,184 @@ pub(crate) fn sync_heaps() {
 #[cfg(windows)]
 pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// VIcky: `VICTORY_HEAP_SYNC_THREADS=<n>` walks the changed pages of
+/// [`sync_heaps`] in two parts ([`sync_wide`]); 0 or unset: as before.
+#[cfg(windows)]
+fn sync_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_SYNC_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(16)
+    })
+}
+
+/// Since the last frame line, of [`sync_wide`]: the microseconds of its
+/// first part (pages read and their records' prints compared, on `n`
+/// threads) and of its second (the slots mirrored), and the threads.
+#[cfg(windows)]
+static WIDE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`sync_heaps`]' walk over one heap's changed `ranges` with
+/// `VICTORY_HEAP_SYNC_THREADS=<threads>`, in two parts:
+/// 1. each page read and its records' prints compared with the ones last
+///    seen (`HostHeap::copied_due`), the pages shared among `threads`
+///    threads (the wide workers of `crate::shadow` and this one);
+/// 2. on this thread, page by page and in slot order as before, each slot
+///    whose record changed mirrored (`HostHeap::mirror_due`, under one lock
+///    for several slots).
+///
+/// The same slots are mirrored, in the same order, as by the walk page by
+/// page: nothing in the second part changes what the first looks at (the
+/// prints are this walk's alone; whether a slot was a table's lately is
+/// the draws' to change). Only the moments differ: every page is read
+/// before the first slot is mirrored, and each slot's record is read
+/// again when it is mirrored, as before. Returns the pages read, the
+/// records looked at, and the slots mirrored.
+#[cfg(windows)]
+fn sync_wide(
+    host: &host::HostHeap,
+    ranges: &[(usize, usize)],
+    (start, step): (u64, u64),
+    mirrored_count: u32,
+    threads: usize,
+) -> [u64; 3] {
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::{Arc, Mutex};
+    let mut pages: Vec<(usize, usize)> = Vec::new();
+    for &(range_from, range_end) in ranges {
+        let mut page = range_from & !(crate::watch::PAGE - 1);
+        while page < range_end {
+            pages.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end)));
+            page += crate::watch::PAGE;
+        }
+    }
+    if pages.is_empty() {
+        return [0; 3];
+    }
+    let started = std::time::Instant::now();
+    type Found = Option<(u64, Vec<(u32, u64)>)>;
+    let pages = Arc::new(pages);
+    let found: Arc<Vec<Mutex<Found>>> = Arc::new((0..pages.len()).map(|_| Mutex::new(None)).collect());
+    let groups = threads.clamp(1, pages.len());
+    let per = pages.len().div_ceil(groups);
+    let heap_at = std::ptr::from_ref(host) as usize;
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = (0..groups)
+        .map(|g| {
+            let (pages, found) = (pages.clone(), found.clone());
+            Box::new(move || {
+                // SAFETY: the heap outlives the walk: `sync_heaps` holds the
+                // list of heaps (a heap leaves it before it is dropped)
+                // until this returns, which is after every job is done.
+                let host = unsafe { &*(heap_at as *const host::HostHeap) };
+                let mut bytes: Vec<u8> = Vec::new();
+                for i in g * per..((g + 1) * per).min(pages.len()) {
+                    let (from, to) = pages[i];
+                    // Read through the kernel, as one by one.
+                    bytes.resize(to - from, 0);
+                    if crate::host::read_into(from as *const u8, &mut bytes) {
+                        let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                        let due = host.copied_due(slots, (start, step), from, &bytes);
+                        *found[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(due);
+                    }
+                }
+            }) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    if jobs.len() == 1 {
+        for job in jobs {
+            job();
+        }
+    } else {
+        crate::shadow::wide_run(jobs);
+    }
+    let read = started.elapsed();
+    let (mut pages_read, mut looked, mut mirrored) = (0, 0, 0);
+    for page in found.iter() {
+        let Some((seen, due)) = page.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            continue;
+        };
+        pages_read += 1;
+        looked += seen;
+        mirrored += due.len() as u64;
+        host.mirror_due(&due);
+    }
+    WIDE[0].fetch_add(read.as_micros() as u64, Relaxed);
+    WIDE[1].fetch_add((started.elapsed() - read).as_micros() as u64, Relaxed);
+    WIDE[2].store(groups as u64, Relaxed);
+    [pages_read, looked, mirrored]
+}
+
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
     let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    fast_line(frames);
     if pages == 0 {
         return;
     }
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
-         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms",
+         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms{}",
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
-        micros as f64 / 1000.0 / frames
+        micros as f64 / 1000.0 / frames,
+        wide_part(frames),
+    );
+}
+
+/// The sync line's part for `VICTORY_HEAP_SYNC_THREADS` (empty without it).
+#[cfg(windows)]
+fn wide_part(frames: f64) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    if sync_threads() == 0 {
+        return String::new();
+    }
+    let [read, mirror] = [0, 1].map(|i| WIDE[i].swap(0, Relaxed) as f64 / 1000.0 / frames);
+    format!(
+        " (VICTORY_HEAP_SYNC_THREADS: {} threads; of it {read:.2} ms reading pages and comparing prints, {mirror:.2} ms mirroring)",
+        WIDE[2].load(Relaxed)
+    )
+}
+
+/// VIcky: per frame over `frames`, what the switches of the passes over the
+/// heap's records did (`VICTORY_HEAP_SYNC_CACHE`,
+/// `VICTORY_HEAP_BUFFERS_SKIP_SAME`, `VICTORY_HEAP_SYNC_CHECK`): one line,
+/// with the sync line, while any is set.
+#[cfg(windows)]
+fn fast_line(frames: f64) {
+    use host::{CHECKS, FAST, Fast};
+    use std::sync::atomic::Ordering::Relaxed;
+    if host::cache_size() == 0 && !host::skip_same() && !host::sync_check() {
+        return;
+    }
+    let per = |f: Fast| FAST[f as usize].swap(0, Relaxed) as f64 / frames;
+    let [hits, misses, stale, unmade, other, skipped] =
+        [Fast::Hits, Fast::Misses, Fast::Stale, Fast::Unmade, Fast::NotCacheable, Fast::NotesSkipped].map(per);
+    let checks = [host::Check::Cache, host::Check::Lookups, host::Check::Notes]
+        .map(|c| [0, 1].map(|i| CHECKS[c as usize][i].swap(0, Relaxed)));
+    let pass = crate::draw::HEAP_PASS_FAST.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames);
+    tracing::info!(
+        "heap records, fast ways per frame: VICTORY_HEAP_SYNC_CACHE: {hits:.0} buffer views copied from the cache, \
+         {misses:.0} made and kept, {stale:.0} kept ones whose copies had changed, {unmade:.0} the slow way made nothing of, \
+         {other:.0} views of other kinds made as before; the pass over buffer views {:.0} slots with lookups shared, \
+         {:.0} copies looked up there; VICTORY_HEAP_BUFFERS_SKIP_SAME: {skipped:.0} notes of buffer slots skipped; \
+         VICTORY_HEAP_SYNC_CHECK (one in {}, since the last line): cache {}/{} differed, lookups {}/{} differed, \
+         notes {}/{} differed",
+        pass[0],
+        pass[1],
+        host::CHECK_EVERY,
+        checks[0][1],
+        checks[0][0],
+        checks[1][1],
+        checks[1][0],
+        checks[2][1],
+        checks[2][0],
     );
 }
 

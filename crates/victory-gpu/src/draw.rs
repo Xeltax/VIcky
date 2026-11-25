@@ -546,6 +546,42 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// picked by index that runs inside it (`heap_textures`), and the buffer
 /// slots the pass over buffer views looked at; since the last frame line.
 pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// VIcky (`VICTORY_HEAP_SYNC_CACHE`): slots of the pass over buffer views
+/// whose making and copy shared their lookups, and the lookups of host
+/// copies they made (`descriptor::host::Lookups`); since the last sync
+/// line.
+pub(crate) static HEAP_PASS_FAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// `found`, the copy and range the pass over buffer views brings up to date
+/// for `view` with lookups shared, as it is; with `VICTORY_HEAP_SYNC_CHECK`
+/// one in so many is also looked up anew (`buffer_copy`), and where the two
+/// differ the one looked up anew is taken.
+fn shared_copy_checked(
+    view: &crate::descriptor::View,
+    found: (std::sync::Arc<crate::shadow::Shadow>, u64, u64),
+) -> (std::sync::Arc<crate::shadow::Shadow>, u64, u64) {
+    use crate::descriptor::host::{Check, buffer_copy, check_now, checked};
+    if !check_now() {
+        return found;
+    }
+    let anew = buffer_copy(view);
+    let same = anew
+        .as_ref()
+        .is_some_and(|(s, a, l)| s.id() == found.0.id() && (*a, *l) == (found.1, found.2));
+    checked(Check::Lookups, same, || {
+        format!(
+            "copy {} {:#x}+{:#x} with lookups shared, {:?} looked up anew",
+            found.0.id(),
+            found.1,
+            found.2,
+            anew.as_ref().map(|(s, a, l)| (s.id(), *a, *l))
+        )
+    });
+    match anew {
+        Some(anew) if !same => anew,
+        _ => found,
+    }
+}
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1634,24 +1670,62 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        let mut slots = if *passes % 16 == 0 {
             ranges.clear();
             host.buffer_slots()
         } else {
             changed
         };
         *passes += 1;
+        // VIcky (`VICTORY_HEAP_SYNC_CACHE`): in slot order (the set of
+        // changed slots gives them in no order). Each slot is made by itself,
+        // so the order changes nothing of what is made; in order, the slots'
+        // state and the heaps written are walked forward, not jumped about
+        // (the bench in `descriptor::host::fast_tests`: the pass 20-30%
+        // shorter).
+        if crate::descriptor::host::cache_size() > 0 {
+            slots.sort_unstable();
+        }
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
+        // VIcky (`VICTORY_HEAP_SYNC_CACHE`): the copies a slot's making
+        // looks up are the ones `buffer_copy` asks for again: each looked
+        // up once (`descriptor::host::Lookups`). And the slots are made a
+        // chunk at a time, under one lock of the heap's slot state
+        // (`HostHeap::mirror_chunk`), ahead of the rest of their work here.
+        let shared = crate::descriptor::host::cache_size() > 0;
+        let mut made_ahead: std::collections::VecDeque<(Option<crate::descriptor::View>, crate::descriptor::host::Lookups)> =
+            std::collections::VecDeque::new();
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            let (view, mut lookups) = if shared {
+                if made_ahead.is_empty() {
+                    // This slot and the next ones that have a handle.
+                    let ahead: Vec<(u32, u64)> = slots[n..]
+                        .iter()
+                        .filter_map(|&i| Some((i, heap.handle(i)?)))
+                        .take(crate::descriptor::host::PASS_CHUNK)
+                        .collect();
+                    let mut lookups: Vec<crate::descriptor::host::Lookups> =
+                        ahead.iter().map(|_| crate::descriptor::host::Lookups::kept()).collect();
+                    let views = host.mirror_chunk(&ahead, &mut lookups);
+                    made_ahead.extend(views.into_iter().zip(lookups));
+                }
+                let Some(made) = made_ahead.pop_front() else {
+                    continue;
+                };
+                made
+            } else {
+                let mut lookups = crate::descriptor::host::Lookups::each();
+                (host.mirror_with(index, handle, &mut lookups), lookups)
+            };
+            let Some(view) = view else {
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1671,8 +1745,15 @@ impl State {
             }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy_with(&view, &mut lookups) else {
                 continue;
+            };
+            let (shadow, address, len) = if shared {
+                HEAP_PASS_FAST[0].fetch_add(1, Ordering::Relaxed);
+                HEAP_PASS_FAST[1].fetch_add(lookups.asked(), Ordering::Relaxed);
+                shared_copy_checked(&view, (shadow, address, len))
+            } else {
+                (shadow, address, len)
             };
             #[cfg(feature = "diagnostics")]
             if host.shows(index, &shadow.buffer) == Some(false) {
