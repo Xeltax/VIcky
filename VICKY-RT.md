@@ -148,6 +148,17 @@ So the answer to "denoiser or reflections" is both and more: the tiled sun shado
 - Instance nodes are not followed, so a bottom-level structure is only checked when a dispatch names it.
 - With the builder off no dispatch names an address in a form the check reads (0 named in 15 checks), so there is no builder-off row.
 
+### Task 3 on the RTX 5090: no crash without quarantine (`493cc0d` to `3fbc9cb`)
+
+**It does not crash here.** 27 runs with `VICTORY_BVH_BUILDER=1` and `VICTORY_BVH_QUARANTINE` unset, 3.6 hours in all, on `493cc0d`, `1a7eb50` and `3fbc9cb`: no panic, no device removal, no access violation, and the title never died. Every run was closed by the script and gave exit code 0.
+
+- The longest is 30 minutes on `3fbc9cb` (5,317 frames, the builder whole to the end); the others are 5 to 15 minutes.
+- In 25 of them the builder ran whole to the end (`the ray-tracing structure builder runs`, never turned off).
+- In the other two it turned itself off mid-run (`one of its dispatches could not be bound`, once forced by a local test, once after input in the window), both within the first minute of the world. The title went on to the end of the run in both: a builder that stops between frames did not take the title down.
+- So there was nothing to bisect with `VICTORY_BVH_SKIP`.
+
+**What this does not cover.** All 27 runs are the same scene, the cell cutscene, with no input after the menus. Nothing here says the open world is safe, and task 2 above counts pointers in the builder's structures that lead out of them: the stores that crashed run 98 may still happen where they hit nothing the title reads in this scene.
+
 ### What we tried after RT10 (RTX 4080; most worth knowing so nobody repeats them)
 
 GPU profiles come from `VICTORY_GPU_TIMING=1 VICTORY_D3D12_DRED=1`.
