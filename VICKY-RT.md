@@ -64,7 +64,39 @@ Task 1 below. Two runs of 600 s per setting after one cache fill per mode, alter
 - With the builder on, draws dropped without a host pipeline fall from about 345 a frame to 4.
 - The second builder-on run compared about 40% more window memory than the first, from the same save and cache, and spent about 25% longer preparing.
 - All six runs (two fills of 900 s included) closed cleanly with exit code 0: no device removal, no panic. The same 10 warnings each run: 6 compute pipelines the host refuses (`0x80070057`) and 4 shaders that do not translate.
-- Not looked at: the picture (no captures were taken), so nothing here on the dark corner.
+- The picture is in the next section.
+
+### Task 4 on the RTX 5090: is the dark area lit, and which pass reads the traversal result (`493cc0d`)
+
+**Is it lit?** In 4 of 5 runs with the builder on, in 0 of 5 with it off. Ten runs of 480–600 s from the same save, alternating, settings as above. Measured in the last picture of each run (the shot at the cell window) over the left wall, the left fifth of the frame: mean of the 8-bit R / G / B, and the share of pixels whose blue is not zero.
+
+| | runs | left wall, mean R / G / B | pixels with blue |
+|---|---|---|---|
+| builder off | 5 of 5 | 19–29 / 3.6–7.9 / 1.0–2.3 | 46–53% |
+| builder on, lit | 4 of 5 | 25–30 / 13.6–16.3 / 10.0–10.6 | 97–98% |
+| builder on, not lit | 1 of 5 | 21 / 3.9 / 1.3 | 50% |
+
+- Lit means the wall's block pattern and the poster on the right wall show; not lit is the red-only near-black wall of the builder-off runs.
+- A run is one or the other from the first frame of the shot to the last (two builder-on runs sampled every 112 frames), so it is decided before the shot, not frame by frame.
+- In the run that stayed dark the builder ran too (`the ray-tracing structure builder runs`, never turned off), and what the trace programs wrote looks much like the lit run's: the same 12 programs, and the same share of non-zero pixels in their targets except one target of the second reflection trace (48–78% non-zero in the dark run, 99.6% in the lit one; two frames each). What decides it is not found yet.
+
+**Which passes read it.** From the ops lists of whole frames (`VICTORY_CAPTURE_WORLD_ALSO`), following what the programs with a node test write. 64 programs of the title hold `image_bvh*_intersect_ray`; 12 or 13 of them run in a frame of this scene, with the builder on or off. Five chains:
+
+| what | traced by | read by |
+|---|---|---|
+| sun shadows | `CS_RTDistantShadowTrace32_Tiled` (+ LeakPlug, TemporalUpsample4X) | the 17 `CS_ShadowRenderTiled*` programs |
+| irradiance cache | `CS_IrradianceCache_GatherVBuffer_WithFar`, `CS_IrradianceCache_ShadowTrace_WithFar` | `CS_IrradianceCache_Shade`, `_ShadeVerify`, `_IntegrateIrradianceSH`, `_SpatialFilter_Separable`, `CS_LightMixer_SampleIrradianceCache` |
+| diffuse GI | `CS_Primary_GatherVBuffer_WithFar`, `CS_ScreenProbes_TraceRays_*`, `CS_GatherAlphaVBuffer_WithFar` | `CS_Primary_Shade`, `CS_Primary_SpatialFilter`, `CS_ScreenProbes_Inject`, `CS_ShadeAlpha` |
+| reflections | `CS_RaytraceVBuffer_RayBinning_ShaderBinning_Mixed_WithFar` (2 dispatches), `CS_RaytraceShadows_Mixed` | `CS_GenerateShaderBins_Tiled`, `CS_RaytracingResolve` (146 material variants), `CS_RayMiss`, then `sr_denoising` (`CS_TemporalResolve*`, `CS_SpatialFilter*`) |
+| local lights' shadow mask | `CS_TraceShadowRays_Checkerboard` | `CS_ShadowMaskPrunePrescalarizedLightMask`, then the `TL_PS_*` tiled lighting pixel programs |
+
+So the answer to "denoiser or reflections" is both and more: the tiled sun shadows, the irradiance cache and the diffuse GI read it as well.
+
+**Seen on the way.**
+- The first of the two `CS_RaytraceVBuffer_*` dispatches of a frame writes four 1280×720 targets that are all zero, in all 7 frames looked at whose list holds the trace programs, builder on and off. The second one's targets hold values. The irradiance cache's gather target is 0.1–0.2% non-zero in all of them.
+- 5 of the 6 `CS_TraceShadowRays_*` variants do not translate (`Full`, `FullAdaptive`, `Half`, `Quarter`, `Eighth`: "a descriptor read only as data"). Only `Checkerboard` ran in this scene; a scene that picks another variant gets no shadow mask.
+- `frame-<n>-ops.txt` is cut short on some frames: 4–9 MB with a handful of draws and no trace program in it, where a whole frame is 14–22 MB. In the two builder-off runs every frame asked for from the 300th world frame on was (10 of 10). Check the size before comparing two frames.
+- The 64 programs were listed with a local change to `translate --list` that prints each container's count of node tests; it can go into a pull request if wanted.
 
 - Without #346, the CPU found 85 MB of shader writes a frame by comparing about 16 GB, roughly 0.5%.
 - With RT8's settings, copying back costs less than with the builder off. The GPU is now the biggest part.
