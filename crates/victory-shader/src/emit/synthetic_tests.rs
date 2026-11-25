@@ -112,6 +112,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        root_indexed_views: Vec::new(),
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
         view_addresses: lowered.view_addresses,
@@ -273,12 +274,12 @@ fn gathers_at_a_level_match_the_hardware() {
     assert!(ran > 0, "no device");
 }
 
+/// A level that may be a fraction is not placed as the hardware places it
+/// (which level a fraction picks is not known): it goes the approximate
+/// way, the level rounded and the coordinates clamped, and translates.
 #[test]
-fn gathers_at_a_level_that_may_be_a_fraction_stop() {
-    let Err(crate::ShaderError::Unsupported { what, .. }) = build(&program(false)) else {
-        panic!("translated a gather at a level read from memory");
-    };
-    assert_eq!(what, "a gather at a level that may not be whole");
+fn gathers_at_a_level_that_may_be_a_fraction_go_the_approximate_way() {
+    build(&program(false)).expect("a gather at a level read from memory");
 }
 
 #[test]

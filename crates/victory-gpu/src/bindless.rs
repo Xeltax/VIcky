@@ -158,13 +158,7 @@ fn seen(view: &View) -> Option<Seen> {
         return crate::texture::title_written(texture).then_some(Seen::Texture(*resource));
     }
     // The copy the host view reads.
-    let (shadow, address, len) = match *view {
-        View::Constant(address, size) => {
-            let len = u64::from(size);
-            ((len > 0).then(|| crate::shadow::find(address, len)).flatten()?, address, len)
-        }
-        _ => crate::descriptor::host::view_copy(view)?,
-    };
+    let (shadow, address, len) = crate::descriptor::host::view_copy(view)?;
     let uav = matches!(view, View::Unordered(..) | View::Placed(true, ..));
     if len == 0 {
         return None;

@@ -8,7 +8,7 @@
 use windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC;
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::{HostShader, StaticSampler, VIEW_STRIDES, lower, validator};
+use super::{HostShader, SLOT_STRIDES, StaticSampler, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -73,30 +73,6 @@ const CHOSEN_SAMPLER_WAVE32: &[u32] = &[
     0x7E06_0280, // v_mov_b32 v3, 0
     0xE070_1000,
     0x8004_0203, // buffer_store_dword v2, v3, s[16:19], 0 offen
-    0xBF81_0000, // s_endpgm
-];
-
-/// User data: s0 the heap index of a constant buffer (a root constant), s1
-/// the resource heap, s2 a table with a raw UAV. Each lane stores dword 2
-/// of the constant buffer (a scalar buffer load) to dword `lane` of the UAV.
-const HEAP_CONSTANT_WAVE32: &[u32] = &[
-    0x8F04_8500, // s_lshl_b32 s4, s0, 5
-    0xBE86_0301, // s_mov_b32 s6, s1
-    0xBE87_0380, // s_mov_b32 s7, 0
-    0xF408_0203,
-    0x0800_0000, // s_load_dwordx4 s[8:11], s[6:7], s4
-    0xBE8C_0302, // s_mov_b32 s12, s2
-    0xBE8D_0380, // s_mov_b32 s13, 0
-    0xF408_0406,
-    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
-    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-    0xF420_0504,
-    0xFA00_0008, // s_buffer_load_dword s20, s[8:11], 0x8
-    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
-    0x7E02_0214, // v_mov_b32 v1, s20
-    0x3404_0082, // v_lshlrev_b32 v2, 2, v0
-    0xE070_1000,
-    0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
     0xBF81_0000, // s_endpgm
 ];
 
@@ -208,6 +184,7 @@ fn build(
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        root_indexed_views: Vec::new(),
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
         view_addresses: lowered.view_addresses,
@@ -235,7 +212,7 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
         vec![entry(ResourceType::Uav, 4, 2)],
         32,
     );
-    assert_eq!(shader.root_srvs, [VIEW_STRIDES]);
+    assert_eq!(shader.root_srvs, [SLOT_STRIDES]);
     // 32 elements of 12 bytes: (100 + e, 200 + e, 300 + e).
     let data: Vec<u32> = (0..32).flat_map(|e| [100 + e, 200 + e, 300 + e]).collect();
     let views = [
@@ -291,122 +268,6 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         let want: Vec<u32> = (0..32).map(|l| 200 + l).collect();
         assert_eq!(words[0], want, "{label}");
-        ran += 1;
-    }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
-}
-
-/// A buffer read at a heap index from data whose slot holds no buffer view
-/// (the view-stride table holds 0 there; a texture here) reads the host's
-/// null buffer view instead (`emit`, "Buffer views at computed heap
-/// indices"): a texture descriptor read as a buffer one is a wild address.
-#[test]
-fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
-    let shader = build(
-        HEAP_ELEMENT_WAVE32,
-        vec![
-            param(RootType::Constants, 0),
-            param(RootType::ResourceHeap, 1),
-            param(RootType::Table, 2),
-        ],
-        vec![entry(ResourceType::Uav, 4, 2)],
-        32,
-    );
-    let texel = [[1.0f32, 2.0, 3.0, 4.0]];
-    let views = [View::RawUav(32), View::Texture(1, 1, &texel), View::NullBuffers];
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
-        };
-        let (root, pso) = host
-            .compute_pipeline(&shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-        for u in &shader.user_data {
-            // The texture at heap index 1, the UAV's table at 0.
-            ud[u.index as usize] = u32::from(u.root == RootType::Constants);
-        }
-        let dispatch = Dispatch {
-            // Heap index 1 holds no buffer view: stride 0.
-            roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 0] })],
-            views: &views,
-            samplers: &[],
-            groups: [1, 1, 1],
-        };
-        let words = host
-            .dispatch(&root, &pso, &dispatch)
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        assert_eq!(words[0], [0; 32], "{label}");
-        ran += 1;
-    }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
-}
-
-/// Constant data through the resource heap itself is read from a raw view
-/// (the host's constant buffer views need an alignment the title's lack).
-#[test]
-fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
-    let shader = build(
-        HEAP_CONSTANT_WAVE32,
-        vec![
-            param(RootType::Constants, 0),
-            param(RootType::ResourceHeap, 1),
-            param(RootType::Table, 2),
-        ],
-        vec![entry(ResourceType::Uav, 4, 2)],
-        32,
-    );
-    assert!(shader.heap && !shader.heap_writes, "reads the heap itself, writes through a table");
-    assert_eq!(shader.root_srvs, [VIEW_STRIDES], "the guard's stride table");
-    let data: Vec<u32> = vec![7, 8, 9, 10];
-    let views = [
-        View::RawUav(32),
-        View::Buffer {
-            data: &data,
-            stride: Stride::Raw,
-        },
-    ];
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
-        };
-        let (root, pso) = host
-            .compute_pipeline(&shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-        for u in &shader.user_data {
-            ud[u.index as usize] = match u.root {
-                // The constants are at heap index 1, the UAV's table at 0.
-                RootType::Constants => 1,
-                RootType::Table => 0,
-                other => panic!("unexpected user data {other:?}"),
-            };
-        }
-        let words = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    // User data, then the stride table: heap index 1 holds a
-                    // buffer view.
-                    roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 4] })],
-                    views: &views,
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        assert_eq!(words[0], vec![9; 32], "{label}");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

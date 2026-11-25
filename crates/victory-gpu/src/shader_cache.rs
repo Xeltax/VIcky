@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -76,17 +77,74 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    h.update(&[victory_shader::emit::group_sync()]);
+    for name in [
+        "VICTORY_WAVE_WIDE", "VICTORY_WAVE_LOCAL", "VICTORY_WAVE_OWN_BITS",
+        "VICTORY_F16_NEAREST", "VICTORY_STRICT_JOINS", "VICTORY_MESH_OUTPUT_STRICT",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            h.update(name.as_bytes());
+            h.update(b"=");
+            h.update(value.as_encoded_bytes());
+            h.update(&[0]);
+        }
+    }
+    *h.finalize().as_bytes()
+}
+
+/// Include the effective adapter settings after probing the host. The cache
+/// directory can be opened earlier, before the host or its heap exists.
+pub(crate) fn target_key() -> [u8; 32] {
+    use victory_shader::emit;
+    crate::descriptor::host::probe_view_limit();
+    target(build(), emit::host_max_wave(), emit::view_heap_limit(), emit::view_heap_map())
+}
+
+fn target(build: &[u8; 32], wave: u32, limit: u32, map: Option<(u32, u32)>) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(build);
+    h.update(&wave.to_le_bytes());
+    h.update(&limit.to_le_bytes());
+    if let Some((window, slot)) = map {
+        h.update(&window.to_le_bytes());
+        h.update(&slot.to_le_bytes());
+    }
     *h.finalize().as_bytes()
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    use victory_shader::emit;
+    crate::descriptor::host::probe_view_limit();
+    let hash = blake3::hash(container).to_hex();
+    let program = &hash[..16];
+    let translate = |c: &[u8]| emit::for_program(program, || emit::translate(c)).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => {
+            let off = !emit::deep_skips_allowed(Some(program)) && emit::wave64_retried(container);
+            cached(cache, &program_key(&target_key(), off), container, translate)
+        }
         None => (translate(container), false),
     }
+}
+
+/// The key of one program's entries: the build's, mixed with the
+/// per-program decision when the program is kept out of the wave64 form
+/// "without skips, scalars followed" (`VICTORY_WAVE_DEEP_SKIPS_NOT`,
+/// `_ONLY`: `victory_shader::emit::deep_skips_allowed`). Only for a wave64
+/// compute program on a host of 32-lane waves, the only ones it can change.
+/// So the lists are in no key: changing one translates again only the
+/// programs whose decision it changes, and a program allowed the form keeps
+/// the key it had without any list.
+fn program_key(build: &[u8; 32], deep_skips_off: bool) -> [u8; 32] {
+    if !deep_skips_off {
+        return *build;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(build);
+    h.update(b"VICTORY_WAVE_DEEP_SKIPS off for this program");
+    *h.finalize().as_bytes()
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -203,6 +261,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        root_indexed_views,
         memory,
         memory_writes,
         view_addresses,
@@ -258,6 +317,18 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*heap) << 3
             | u32::from(*heap_writes) << 4,
     );
+    word(&mut out, root_indexed_views.len() as u32);
+    for view in root_indexed_views {
+        for value in [
+            u32::from(view.table_slot),
+            u32::from(view.constant_slot),
+            view.constant_dword,
+            view.byte_offset,
+            u32::from(view.shift),
+        ] {
+            word(&mut out, value);
+        }
+    }
     out
 }
 
@@ -319,6 +390,17 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
     let memory = r.word()?;
+    let n = r.word()? as usize;
+    let mut root_indexed_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        root_indexed_views.push(RootIndexedView {
+            table_slot: u8::try_from(r.word()?).ok()?,
+            constant_slot: u8::try_from(r.word()?).ok()?,
+            constant_dword: r.word()?,
+            byte_offset: r.word()?,
+            shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
+        });
+    }
     r.0.is_empty().then_some(Ok(HostShader {
         stage,
         dxil,
@@ -328,6 +410,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        root_indexed_views,
         memory: memory & 1 != 0,
         memory_writes: memory & 2 != 0,
         view_addresses: memory & 4 != 0,
@@ -365,6 +448,13 @@ mod tests {
             view_addresses: true,
             heap: true,
             heap_writes: true,
+            root_indexed_views: vec![RootIndexedView {
+                table_slot: 1,
+                constant_slot: 2,
+                constant_dword: 3,
+                byte_offset: 32,
+                shift: 5,
+            }],
         }
     }
 
@@ -459,6 +549,50 @@ mod tests {
             }
         }
         files
+    }
+
+    #[test]
+    fn a_program_kept_out_of_the_deep_skips_form_has_a_key_of_its_own() {
+        let build = [7u8; 32];
+        assert_eq!(program_key(&build, false), build, "allowed: the build's key, as without lists");
+        let off = program_key(&build, true);
+        assert_ne!(off, build);
+        assert_eq!(program_key(&build, true), off, "the same decision, the same key");
+        assert_ne!(program_key(&[8; 32], true), off, "and still the build's");
+
+        // So only the program whose decision changed is translated again.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let [a, b] = [b"program a".as_slice(), b"program b"];
+        for c in [a, b] {
+            cached(&cache, &program_key(&build, false), c, translate).0.unwrap();
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        // a listed: a translated again, b from the cache
+        cached(&cache, &program_key(&build, true), a, translate).0.unwrap();
+        cached(&cache, &program_key(&build, false), b, translate).0.unwrap();
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
+        // the list emptied again: both from the cache
+        for c in [a, b] {
+            cached(&cache, &program_key(&build, false), c, translate).0.unwrap();
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn adapter_limits_and_heap_mapping_partition_cached_code() {
+        let build = [7; 32];
+        let mapped = target(&build, 32, 999_999, Some((65_536, 737_854)));
+        assert_ne!(mapped, target(&build, 64, 999_999, Some((65_536, 737_854))));
+        assert_ne!(mapped, target(&build, 32, 999_998, Some((65_536, 737_854))));
+        assert_ne!(mapped, target(&build, 32, 999_999, Some((32_768, 737_854))));
+        assert_ne!(mapped, target(&build, 32, 999_999, Some((65_536, 737_853))));
+        assert_ne!(mapped, target(&build, 32, 999_999, None));
     }
 
     #[test]

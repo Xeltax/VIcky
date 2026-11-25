@@ -91,6 +91,10 @@ pub(crate) struct Use {
 /// The twin's plane formats for a console depth format (resource or
 /// view format): 16- or 32-bit depth, then 8-bit stencil if it has one.
 /// `None` for 24-bit depth, whose host plane takes no unordered view.
+pub(crate) fn supports(console: u32) -> bool {
+    plane_formats(console).is_some()
+}
+
 fn plane_formats(console: u32) -> Option<&'static [u32]> {
     const R16: u32 = 53;
     const R32: u32 = 39;
@@ -294,7 +298,7 @@ fn integer(format: u32) -> bool {
 pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, wanted: u32) -> bool {
     let side = if wanted & UNORDERED_ACCESS != 0 { TWIN } else { DEPTH };
     let writes = side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
-    if let Some(to_depth) = list.twin_use(depth, side, writes)
+    if let Some(to_depth) = list.plane_twin_use(depth, side, writes)
         && twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w))
     {
         list.need_rebind();
