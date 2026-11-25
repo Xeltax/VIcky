@@ -205,20 +205,11 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
-    check: impl FnMut(&str, usize, [u32; 4], u32),
-) {
-    run_cases_on(shader, cases, &[("hardware", false), ("warp", true)], check);
-}
-
-fn run_cases_on(
-    shader: &HostShader,
-    cases: &[[u32; 4]],
-    devices: &[(&str, bool)],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
-    for &(label, warp) in devices {
+    for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -251,7 +242,7 @@ fn run_cases_on(
         }
         ran += 1;
     }
-    assert!(ran > 0, "no SM 6.6 device available ({devices:?})");
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
 fn is_f16_nan(bits: u16) -> bool {
@@ -1123,14 +1114,10 @@ fn ds_min_max_f32_order_floats_and_return_the_old_value() {
         returns_new.extend(ds(plain, 0, 5, 2));
         returns_new.extend(ds(DS_READ_B32, 0, 5, 0));
         for (body, old_result) in [(returns_old, true), (returns_new, false)] {
-            // One thread with LDS declares WaveSize(32), which WARP's
-            // pipeline creation refuses: hardware only (the 64-thread test
-            // below runs on WARP too).
             let shader = build_cs(&body, 1, 512);
-            run_cases_on(
+            run_cases(
                 &shader,
                 &cases,
-                &[("hardware", false)],
                 |backend, _, inp, got| {
                     let (old, data) = (f32::from_bits(inp[0]), f32::from_bits(inp[1]));
                     let want = if old_result {

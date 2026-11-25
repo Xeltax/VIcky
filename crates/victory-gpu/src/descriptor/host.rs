@@ -2278,6 +2278,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
+        View::NullConstant => {
+            null_for(view, at);
+            Some(None)
+        }
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
@@ -2507,10 +2511,9 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, _, desc) => {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
-        View::Constant(..) => {
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-            // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+        View::NullConstant | View::Constant(..) => {
+            // SAFETY: a live host heap slot; a null description creates an unbound CBV.
+            return unsafe { host.device.CreateConstantBufferView(None::<*const D3D12_CONSTANT_BUFFER_VIEW_DESC>, at) };
         }
         _ => return null_view(at),
     };
@@ -2923,6 +2926,21 @@ mod tests {
     }
 
     #[test]
+    fn a_null_cbv_drops_the_slots_previous_resource() {
+        let Some(host) = host() else { return };
+        let heap = HostHeap::new(false, 4).expect("view heap");
+        let (buffer, _) = host.shared_buffer(256).expect("buffer");
+        heap.keep(0, Some(buffer));
+        let mut slot = [0u64; 4];
+        let handle = slot.as_mut_ptr() as u64;
+        crate::descriptor::create_cbv(std::ptr::null(), std::ptr::null(), handle);
+        assert_eq!(heap.mirror(0, handle, false), Some(View::NullConstant));
+        assert!(heap.kept.lock().unwrap()[0].is_none());
+        // SAFETY: the device is live.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
     fn dynamic_slots_are_held_until_released() {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
@@ -3099,7 +3117,7 @@ mod tests {
         unsafe { ((start + 17 * TITLE_SLOT_BYTES) as *mut u8).write_bytes(0, 32) };
         title_cbv(start, 30, 0x9_0000);
         assert_eq!(entry(heap, 17), (0, None), "given back");
-        assert_eq!(entry(heap, 16).1.is_some() && entry(heap, 19).1.is_some(), true);
+        assert!(entry(heap, 16).1.is_some() && entry(heap, 19).1.is_some());
         // Handed out once the submissions running when it was given back
         // have finished (other tests' may be).
         let (running, _) = crate::host::submissions();
