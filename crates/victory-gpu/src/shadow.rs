@@ -3710,6 +3710,7 @@ pub(crate) fn copied_range(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 /// The current title buffers and loose windows, for heap diagnostics.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
     let mut all: Vec<_> = buffers()
         .values()

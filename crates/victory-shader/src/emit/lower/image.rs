@@ -510,8 +510,21 @@ impl<'a> Lower<'a> {
                             61,
                             &args,
                         )
+                    } else if self.x.native.stage == HwStage::Cs
+                        && kind == 2
+                        && matches!(self.s.threads, Some([x, 1, 1]) if x.is_multiple_of(4))
+                    {
+                        // A linear SM 6.6 group puts each four consecutive
+                        // lanes in a 2x2 quad. Scale its coordinate gradients
+                        // by 2^bias before sampling. This includes the
+                        // implicit level without requesting compute derivatives
+                        // from a validator that only accepts them in pixels.
+                        let gradients = self.biased_quad_gradients(&cs[..2], bias);
+                        args.extend(gradients);
+                        args.push(clamp);
+                        self.s.op(c, "sampleGrad.f32", Attr::ReadOnly, self.s.t.res_ret, 63, &args)
                     } else {
-                        // As above: the bias is the level.
+                        // No known linear quad layout: approximate the level with the bias.
                         args.push(bias);
                         self.s.op(
                             c,
@@ -826,6 +839,32 @@ impl<'a> Lower<'a> {
             }
             r
         })
+    }
+
+    /// The X and Y gradients of a 2D sample in a linear compute quad.
+    fn biased_quad_gradients(&mut self, coords: &[V], bias: V) -> [V; 6] {
+        self.s.flags |= flags::WAVE_OPS;
+        let c = self.cur;
+        let lane = self.lane_index();
+        let scale = self.unary(21, bias); // exp2
+        let mut gradients = [self.s.m.undef(self.s.t.f32); 6];
+        for (axis, bit) in [1, 2].into_iter().enumerate() {
+            let bit = self.s.m.i32(bit);
+            let neighbor = self.s.m.bin(c, Bin::Xor, lane, bit);
+            let side = self.s.m.bin(c, Bin::And, lane, bit);
+            let zero = self.s.m.i32(0);
+            let first = self.s.m.cmp(c, pred::EQ, side, zero);
+            for (k, &here) in coords.iter().enumerate() {
+                let bits = self.as_int(here);
+                let other = self.read_lane(bits, neighbor);
+                let there = self.as_float(other);
+                let lo = self.s.m.select(c, first, here, there);
+                let hi = self.s.m.select(c, first, there, here);
+                let delta = self.s.m.bin(c, Bin::Sub, hi, lo);
+                gradients[3 * axis + k] = self.s.m.bin(c, Bin::Mul, delta, scale);
+            }
+        }
+        gradients
     }
 
     /// Whether `image_gather4_l(_o)` at `inst` is of the form

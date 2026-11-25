@@ -219,7 +219,8 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
         View::RawUav(32),
         View::Buffer {
             data: &data,
-            stride: Stride::Structured(12),
+            // The GPU host exposes structured buffer bytes through a raw SRV.
+            stride: Stride::Raw,
         },
     ];
     let _one = super::valu_tests::ONE_AT_A_TIME

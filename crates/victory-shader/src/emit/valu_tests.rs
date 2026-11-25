@@ -1369,9 +1369,7 @@ fn image_addresses_of_16_bits_and_clamps() {
     biased.extend([0xF094_0F08, 1 | 5 << 8 | 2 << 16 | 4 << 21 | 1 << 30]);
     biased.extend(buffer_store_dword(5, 20, 0));
     biased.push(S_ENDPGM);
-    // The 1.6 validator refuses implicit derivatives in compute (1.8 takes
-    // them); the host runs them.
-    let biased = lower_cs32(&biased, &used, false);
+    let biased = lower_cs32(&biased, &used, true);
 
     let mut gathers = prefix;
     // Offset (1, 0); coordinates (0.375, 0.625) as f16 in v2 and as f32 in
