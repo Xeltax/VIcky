@@ -23,11 +23,14 @@ This branch is for making the title's compute ray tracing (the BVH structure bui
 - `VICTORY_SNAPSHOT_POOL_MB=<n>` keeps snapshot buffers by size for reuse.
 - `VICTORY_REFRESH_STAMP=1`: measured 0 skips; useless, will go.
 - `VICTORY_NOTES_ON_CARD=1`: the notes of programs reading title memory by address stay in the card's memory and are copied back once a frame (not measured in a run yet).
+- `VICTORY_HEAP_SYNC_CACHE=1 VICTORY_HEAP_BUFFERS_SKIP_SAME=1 VICTORY_HEAP_SYNC_THREADS=4`: a cheaper sync of the descriptor records the title copies into its heaps (buffer views kept by record and copied with `CopyDescriptorsSimple`, notes that cannot change skipped, pages read on 4 threads). `VICTORY_HEAP_SYNC_CHECK=1` also does one in 64 the slow way and counts differences (0 in RT40). RT40/RT40b below.
 - `VICTORY_BVH_COPY=skip`: the builder's copies of a structure onto itself are not recorded (RT32, below). `native` also runs a pass of ours for any other copy, and `check` compares that pass with the program (diagnostics).
 
-**VIcky PRs merged:** #23 (g0shtj0sh): main's opt-in `VICTORY_NO_WATCHDOG=1` hook (upstream #454, fork #364), for slower PCs whose runs the title's watchdog kills at the world's entry. Nothing changes when it is unset.
+**VIcky PRs merged:**
+- #23 (g0shtj0sh): main's opt-in `VICTORY_NO_WATCHDOG=1` hook (upstream #454, fork #364), for slower PCs whose runs the title's watchdog kills at the world's entry. Nothing changes when it is unset.
+- #24 (wololo-wololo): `VICTORY_BVH_CHECK=<frames>` (diagnostics) walks the ray-tracing structures that raw-pointer dispatches name and logs counts of what is wrong (task 2, section below).
 
-**Recommended with the builder on:** `VICTORY_BVH_COPY=skip VICTORY_BACK_JOIN=256 VICTORY_MEMORY_REFRESH=touched VICTORY_MEMORY_NAMED_WRITES=0 VICTORY_SNAPSHOT_POOL_MB=2048`, plus the fork's: `VICTORY_ASYNC_SUBMIT=1 VICTORY_QUEUE2=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_TEXTURE_NO_WAIT=1 VICTORY_COPY_PLAIN=1 VICTORY_JOIN_PARTS=1 VICTORY_BACK_OWN_VIEW=1 VICTORY_INDIRECT_GATHER=1 VICTORY_CARD_REHASH_RUNS=1`. Keep the capture harness rare (`VICTORY_CAPTURE_WORLD_EVERY=64`): a saved frame costs about 235 ms.
+**Recommended with the builder on:** `VICTORY_BVH_COPY=skip VICTORY_HEAP_SYNC_CACHE=1 VICTORY_HEAP_BUFFERS_SKIP_SAME=1 VICTORY_HEAP_SYNC_THREADS=4 VICTORY_BACK_JOIN=256 VICTORY_MEMORY_REFRESH=touched VICTORY_MEMORY_NAMED_WRITES=0 VICTORY_SNAPSHOT_POOL_MB=2048`, plus the fork's: `VICTORY_ASYNC_SUBMIT=1 VICTORY_QUEUE2=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_TEXTURE_NO_WAIT=1 VICTORY_COPY_PLAIN=1 VICTORY_JOIN_PARTS=1 VICTORY_BACK_OWN_VIEW=1 VICTORY_INDIRECT_GATHER=1 VICTORY_CARD_REHASH_RUNS=1`. Keep the capture harness rare (`VICTORY_CAPTURE_WORLD_EVERY=64`): a saved frame costs about 235 ms.
 
 ## Run
 
@@ -196,7 +199,19 @@ Same window shot, builder on, `VICTORY_BVH_COPY=skip` and the recommended switch
 
 - The card is idle more than half the frame: the submit thread is the limit.
 - Its biggest item is `sync_heaps`: 96 ms a frame mirroring about 100,000 descriptor records the title copies into its heaps as bytes, and the heap-buffer passes after it (about 200 ms on their thread). Turning the sync off is 30% faster but loses textures, so it must get cheaper, not go.
-- Next: cheaper heap sync (a cache of made descriptors, pages in parallel), skipping refreshes of memory nothing wrote, and fewer settles (`VICTORY_MERGE_RUNS`).
+
+**RT36–RT41, what came next** (same scene and switches as RT35):
+
+| run | change | ms/frame | verdict |
+|---|---|---|---|
+| RT36 / RT36b | `VICTORY_MERGE_RUNS=65536`; `VICTORY_MERGE_GAP=64 VICTORY_MERGE_RUNS=4096` | 256–269 / 230–242 | settles go to 0 ms, but copies and copy-back grow as much: no gain |
+| RT37 | per-4 MiB-cell skip of refreshes that find nothing (branch `fx-rt-cells`) | (check on) | correct (0 stale), but at most ~2.5 ms: a refresh that finds nothing costs only 6 µs |
+| RT38 | `VICTORY_NOTES_ON_CARD=1` | 260–278 | no gain while the card is idle half the frame |
+| RT39 | small fills copied in place (not kept) | 269–284 | 9× more page faults; copies doubled |
+| **RT40 / RT40b** | **cheaper heap sync** (check on / off) | **211–215 / 199–203** | **kept**: about 5 fps; sync 96 → 45 ms a frame; 0 differences; picture as before |
+| RT41 | RT40b + `VICTORY_MERGE_GAP=64 VICTORY_MERGE_RUNS=4096` | 240–254 | worse: copies 136–172 ms |
+
+- Next: copy numbers. Every builder-on run uses all 1,023 numbers of title memory by address by the second world frame, and later pages read zeros; that fits #24's count of structures with nodes of zeros and pointers far out. Recycling idle numbers is being written.
 
 ## Roadmap: from about 3.5 fps toward 15–20
 
