@@ -1009,6 +1009,9 @@ static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// for the big heap's, which then got another, until eight of them were
 /// reserved (1.4 GB in run 24).
 fn pooled(n: usize) -> Vec<u8> {
+    if sized_most().is_some() {
+        return sized_take(n);
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let most = n.saturating_mul(4).max(1 << 20);
     let fit = pool
@@ -1028,6 +1031,10 @@ fn pooled(n: usize) -> Vec<u8> {
 /// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
 /// of those the largest one and the next ones up to `KEPT` bytes in all.
 fn give_back(v: Vec<u8>) {
+    if let Some(most) = sized_most() {
+        sized_give(v, most);
+        return;
+    }
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
@@ -1039,6 +1046,130 @@ fn give_back(v: Vec<u8>) {
         total = total.saturating_add(v.capacity());
         seen == 1 || total <= KEPT
     });
+}
+
+/// `VICTORY_SNAPSHOT_POOL_MB`: snapshot buffers kept for reuse by their
+/// size, up to that many megabytes in all; unset, the pool above (eight
+/// buffers, 512 MB).
+///
+/// Why: with shaders that store through title memory by address, a list
+/// takes snapshots of hundreds of 4 MiB windows. The pool above keeps the
+/// eight largest buffers, so those are made anew each time and every page
+/// of them faults in and is zeroed (4.17 million page faults a frame,
+/// 16 GB of snapshots, 2.7 s of kernel time on the submitting thread with
+/// the structure builder on, RTX 4080).
+fn sized_most() -> Option<usize> {
+    static MOST: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_SNAPSHOT_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|mb| mb.saturating_mul(1 << 20))
+    })
+}
+
+/// Snapshot buffers kept by capacity ([`sized_most`]), and their bytes.
+static SIZED: Mutex<(BTreeMap<usize, Vec<Vec<u8>>>, usize)> = Mutex::new((BTreeMap::new(), 0));
+
+/// Of the sized pool: reuses, buffers made anew, buffers let go for want
+/// of room (since the start).
+static SIZED_COUNTS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+/// An empty buffer with room for `n` bytes: the smallest kept one that
+/// holds `n` and is at most four times as large, else a new one.
+fn sized_take(n: usize) -> Vec<u8> {
+    let most = n.saturating_mul(4).max(1 << 20);
+    let mut v = {
+        let mut sized = SIZED.lock().unwrap_or_else(|e| e.into_inner());
+        let (map, bytes) = &mut *sized;
+        let found = map.range_mut(n..=most).find(|(_, list)| !list.is_empty()).map(|(&cap, list)| (cap, list.pop()));
+        match found {
+            Some((cap, Some(v))) => {
+                *bytes -= v.capacity();
+                if map.get(&cap).is_some_and(Vec::is_empty) {
+                    map.remove(&cap);
+                }
+                SIZED_COUNTS[0].fetch_add(1, Ordering::Relaxed);
+                v
+            }
+            _ => {
+                SIZED_COUNTS[1].fetch_add(1, Ordering::Relaxed);
+                Vec::with_capacity(n)
+            }
+        }
+    };
+    v.clear();
+    v
+}
+
+/// Keeps `v` for reuse if the pool has room under `most` bytes.
+fn sized_give(v: Vec<u8>, most: usize) {
+    let cap = v.capacity();
+    if cap == 0 {
+        return;
+    }
+    let mut sized = SIZED.lock().unwrap_or_else(|e| e.into_inner());
+    let (map, bytes) = &mut *sized;
+    if *bytes + cap > most {
+        drop(sized);
+        SIZED_COUNTS[2].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    *bytes += cap;
+    map.entry(cap).or_default().push(v);
+}
+
+#[cfg(test)]
+mod sized_pool_tests {
+    use super::*;
+
+    // Sizes no other test asks for: the pool is the process's.
+    #[test]
+    fn a_kept_buffer_is_taken_again_for_a_snapshot_it_holds() {
+        let v = Vec::<u8>::with_capacity((5 << 20) + 4096);
+        let cap = v.capacity();
+        sized_give(v, usize::MAX);
+        let w = sized_take((5 << 20) + 100);
+        assert_eq!(w.capacity(), cap);
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn a_buffer_over_four_times_the_ask_is_not_taken() {
+        let v = Vec::<u8>::with_capacity((97 << 20) + 8192);
+        sized_give(v, usize::MAX);
+        let w = sized_take((3 << 20) + 300);
+        assert!(w.capacity() < 97 << 20);
+        // The big one is still there for a big ask.
+        let big = sized_take((90 << 20) + 1);
+        assert!(big.capacity() >= (97 << 20) + 8192);
+    }
+
+    #[test]
+    fn nothing_is_kept_over_the_most() {
+        let cap = (7 << 20) + 12288;
+        let let_go = SIZED_COUNTS[2].load(Ordering::Relaxed);
+        sized_give(Vec::<u8>::with_capacity(cap), 0);
+        assert!(SIZED_COUNTS[2].load(Ordering::Relaxed) > let_go);
+        assert!(!SIZED.lock().unwrap().0.keys().any(|&c| c >= cap && c < cap + 4096));
+    }
+}
+
+/// For the memory line: the sized pool's buffers and bytes, and its
+/// reuses, buffers made anew and buffers let go since the start.
+pub(crate) fn sized_pool() -> Option<[u64; 5]> {
+    sized_most()?;
+    let (buffers, bytes) = {
+        let sized = SIZED.lock().unwrap_or_else(|e| e.into_inner());
+        (sized.0.values().map(|l| l.len() as u64).sum::<u64>(), sized.1 as u64)
+    };
+    Some([
+        buffers,
+        bytes,
+        SIZED_COUNTS[0].load(Ordering::Relaxed),
+        SIZED_COUNTS[1].load(Ordering::Relaxed),
+        SIZED_COUNTS[2].load(Ordering::Relaxed),
+    ])
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -1442,6 +1573,16 @@ pub(crate) fn back_line(frames: f64) {
         mb(c[1]),
         mb(c[4]),
     );
+    if let Some([buffers, bytes, reused, made, let_go]) = sized_pool() {
+        tracing::info!(
+            buffers,
+            mb = bytes >> 20,
+            reused,
+            made,
+            let_go,
+            "snapshot pool (VICTORY_SNAPSHOT_POOL_MB), since the start"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2033,9 +2174,12 @@ pub(crate) fn memory() -> [u64; 6] {
             .sum();
         (seen.len() as u64, bytes)
     };
-    let (kept, kept_bytes) = {
-        let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        (pool.len() as u64, pool.iter().map(|v| v.capacity() as u64).sum::<u64>())
+    let (kept, kept_bytes) = match sized_pool() {
+        Some([buffers, bytes, ..]) => (buffers, bytes),
+        None => {
+            let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            (pool.len() as u64, pool.iter().map(|v| v.capacity() as u64).sum::<u64>())
+        }
     };
     [
         LIVE[0].load(Ordering::Relaxed),
