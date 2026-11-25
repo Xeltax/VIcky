@@ -24,6 +24,8 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+mod bvh_copy;
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -2138,10 +2140,16 @@ impl State {
                 "partial DispatchX(USE_THREAD_DIMENSIONS) on a compute shader without thread-count masking"
             );
         }
+        // The structure builder's copy, by a pass of ours recorded before
+        // the program is bound (`VICTORY_BVH_COPY`, [`bvh_copy`]).
+        let ours = self.bvh_copy_before(list, p, [gx, gy, gz], partial);
         self.dispatch_threads = partial;
         let bound = self.bind(list, p, true);
         self.dispatch_threads = [0; 3];
         if !bound {
+            if let Some(ours) = &ours {
+                self.bvh_copy_dropped(list, ours);
+            }
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -2152,8 +2160,11 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {gx}x{gy}x{gz}"), true));
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(gx, gy, gz) };
+        match &ours {
+            Some(ours) => self.bvh_copy_after(list, ours, [gx, gy, gz]),
+            // SAFETY: an open list with everything set.
+            None => unsafe { list.list.Dispatch(gx, gy, gz) },
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 

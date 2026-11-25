@@ -718,3 +718,35 @@ pub(crate) fn ready(
         base,
     })
 }
+
+/// For a pass of ours that stands in for a translated program reading and
+/// writing title memory by address (`crate::draw`'s `bvh_copy`): how many
+/// bytes from `address` on, at most `most`, lie on pages the directory
+/// gives to `shadow` at the offsets `shadow` holds them, so that the pass
+/// reaches the very bytes the program would; with the number the
+/// directory gives the copy (its touch is dword [`MEMORY_TOUCHED`] +
+/// number of the notes) and the GPU address of the notes. None without a
+/// directory, or when the page of `address` is not `shadow`'s.
+pub(crate) fn run_in(shadow: &Arc<Shadow>, address: u64, most: u64) -> Option<(u64, u32, u64)> {
+    let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let m = guard.as_ref()?;
+    let (start, len) = shadow.span();
+    let end = address.saturating_add(most).min(start + len);
+    let (mut page, mut reach, mut number) = (address / PAGE, address, None);
+    while reach < end && page < u64::from(MEMORY_PAGES) - 1 {
+        // SAFETY: inside the directory's mapping.
+        let entry = unsafe { m.directory.1.add(page as usize * 2) };
+        // SAFETY: as above; entries are written on this side only.
+        let (n, offset) = unsafe { (entry.read(), entry.add(1).read()) };
+        let ours = n != 0
+            && m.copies.get(n as usize - 1).is_some_and(|c| Arc::ptr_eq(c, shadow))
+            && shadow.offset_in(page * PAGE) == Some(u64::from(offset));
+        if !ours {
+            break;
+        }
+        number.get_or_insert(n);
+        reach = ((page + 1) * PAGE).min(end);
+        page += 1;
+    }
+    Some((reach - address, number?, m.faults.2))
+}
