@@ -3997,6 +3997,8 @@ impl Host {
         let late = late && runs.iter().all(|list| {
             let d = list.deferred();
             d.missed.is_empty() && d.after.is_empty()
+                // The heap upload list and its allocator are reused by the next submission.
+                && !d.copies.iter().any(|s| matches!(s, Step::Heap(_)))
         });
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
@@ -4038,9 +4040,6 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
-        // The slots that waited for a texture's host copy, before the
-        // lists that may read them run.
-        crate::descriptor::make_waiting();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -4074,6 +4073,9 @@ impl Host {
         let uploads = (!heaps.is_empty())
             .then(|| crate::bindless::uploads(&heaps))
             .flatten();
+        // Upload preparation can create a lazy host texture. Publish its waiting
+        // descriptors before the same submission's shaders read them.
+        crate::descriptor::make_waiting();
         #[cfg(feature = "diagnostics")]
         drop(uploading);
         let runs: Vec<&HostList> = uploads
