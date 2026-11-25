@@ -116,6 +116,8 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
     }
     tracing::error!("{text}");
+    #[cfg(test)]
+    eprintln!("host GPU failure: {text}");
     match ON_FAILURE.get() {
         Some(report) => report(&text),
         None => std::process::abort(),
@@ -1294,6 +1296,7 @@ impl HostList {
             }
             let what = what();
             traced(&what);
+            crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
             // SAFETY: an open list; the marker is copied when recorded.
@@ -1304,6 +1307,8 @@ impl HostList {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((what, range));
+        } else {
+            crate::capture::op(std::ptr::from_ref(self) as usize, what);
         }
     }
 

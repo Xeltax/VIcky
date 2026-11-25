@@ -85,8 +85,9 @@ pub(crate) enum C {
     /// the time.
     CompareBytes,
     CompareUs,
+    PipelineWaitUs,
 }
-const COUNTERS: usize = 52;
+const COUNTERS: usize = C::PipelineWaitUs as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -204,6 +205,7 @@ pub(crate) fn log(frames: f64) {
         .collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
+    tracing::info!(pipeline_wait_ms = ms(c[C::PipelineWaitUs as usize]), "time waiting for host pipelines per frame");
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
