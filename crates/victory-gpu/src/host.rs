@@ -5470,9 +5470,18 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
-        for list in runs {
+        for (i, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
+            // Shaders' notes in the card's memory, once a frame: copied
+            // back and cleared ahead of everything the submission runs
+            // (`crate::memory::notes`; in the first run's group when each
+            // run is timed on its own).
+            if i == 0
+                && let Some(notes) = crate::memory::notes::list(this_submission)
+            {
+                lists.push(Some(notes));
+            }
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
@@ -6900,6 +6909,14 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// Whether the list asked about `key` since the reset ([`first_use`]),
+    /// without asking.
+    ///
+    /// [`first_use`]: HostList::first_use
+    pub(crate) fn used(&self, key: usize) -> bool {
+        self.deferred().textures.contains(&key)
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
@@ -7913,6 +7930,10 @@ impl Host {
         over: Option<(&ID3D12Resource, u32)>,
     ) -> Option<bool> {
         let showing = std::time::Instant::now();
+        // The frame ends here: shaders' notes in the card's memory are
+        // copied back with the next submission, as a rule the present's own
+        // (`crate::memory::notes`).
+        crate::memory::notes::presented();
         let shown = self.present_now(texture, state, frame, over);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown

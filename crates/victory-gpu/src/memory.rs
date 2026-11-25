@@ -20,6 +20,8 @@
 //!   once a frame, so the copies exist from the next frame on. A pointer a
 //!   shader takes out of memory cannot be known before it runs; the
 //!   addresses a dispatch is given as root views are made ready before it.
+//!   They and the other notes below are in the PC's memory, or with
+//!   `VICTORY_NOTES_ON_CARD=1` in the card's and copied back ([`notes`]).
 //!
 //! **A page that is not there when a shader touches it is a lost access**:
 //! the read gives 0, the store is dropped, and the fault note only helps
@@ -70,6 +72,9 @@ use windows::Win32::Graphics::Direct3D12::*;
 use crate::descriptor::host::HostHeap;
 use crate::host::{HostList, host};
 use crate::shadow::Shadow;
+
+pub(crate) mod notes;
+use notes::Notes;
 
 /// Copies that can be numbered (the run of heap slots is one longer). A
 /// listed frame of the opening cutscene names about 50 windows.
@@ -203,7 +208,13 @@ const REFRESH_FRAMES: u64 = 8;
 struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
-    faults: (ID3D12Resource, *mut u32, u64),
+    /// The buffer shaders note faults, marks and touches in (`SLOT_FAULTS`)
+    /// and its GPU address.
+    faults: (ID3D12Resource, u64),
+    /// Its mapping, where the notes are read and cleared, when it is in the
+    /// PC's memory; `None` when it is in the card's ([`notes::on_card`]):
+    /// the copies [`notes`] makes of it are read instead.
+    mapped: Option<*mut u32>,
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
     /// Per host view heap (by address): the first slot of its run, and how
@@ -240,9 +251,10 @@ static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 /// are new, because a dispatch named them, because a shader marked them
 /// lately, and their bytes; of the named, those never marked, and their
 /// bytes; copies a list's first dispatch did not refresh
-/// ([`refresh_touched`]).
+/// ([`refresh_touched`]); copies of the card's notes read ([`notes`]), and
+/// the frames from their sending to their reading, summed.
 #[cfg(feature = "diagnostics")]
-static TALLY: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+static TALLY: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
 
 #[cfg(feature = "diagnostics")]
 fn tally(i: usize, v: u64) {
@@ -274,6 +286,8 @@ fn tally_line(frame: u64, numbered: usize) {
         named_never_marked = t[7],
         named_mb = t[8] >> 20,
         refresh_skipped = t[9],
+        notes_copies_read = t[10],
+        notes_frames_late = t[11],
         "title memory by address, last frame: refreshes and copies declared written by reason"
     );
 }
@@ -299,9 +313,21 @@ impl Memory {
             Some((buffer, data.cast::<u32>(), gpu))
         };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
+        let (faults, mapped) = match notes::on_card().then(notes::card).flatten() {
+            Some(card) => {
+                // SAFETY: a live buffer.
+                let gpu = unsafe { card.buffer.GetGPUVirtualAddress() };
+                ((card.buffer.clone(), gpu), None)
+            }
+            None => {
+                let (buffer, data, gpu) = make(u64::from(MEMORY_NOTES), "faults, marks and touches")?;
+                ((buffer, gpu), Some(data))
+            }
+        };
         Some(Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
-            faults: make(u64::from(MEMORY_NOTES), "faults, marks and touches")?,
+            faults,
+            mapped,
             copies: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
@@ -392,19 +418,23 @@ impl Memory {
         Some(n)
     }
 
+    /// Everything shaders noted since the notes were last read, as of
+    /// `frame`.
+    fn take(&mut self, notes: &Notes, frame: u64) {
+        self.take_faults(notes);
+        self.take_marks(frame, notes);
+        self.take_touched(frame, notes);
+    }
+
     /// The pages shaders found empty since the last frame.
-    fn take_faults(&mut self) {
+    fn take_faults(&mut self, notes: &Notes) {
         let mut pages = Vec::new();
         for i in 1..MEMORY_FAULTS as usize {
-            // SAFETY: inside the faults' mapping; the GPU may be writing,
-            // a number missed now is written again next frame.
-            let at = unsafe { self.faults.1.add(i) };
-            // SAFETY: as above.
-            let page = unsafe { at.read_volatile() };
+            // A number missed now (the GPU may be writing) is written again
+            // next frame.
+            let page = notes.take(i);
             if page != 0 {
                 pages.push(page);
-                // SAFETY: as above.
-                unsafe { at.write_volatile(0) };
             }
         }
         if !pages.is_empty() {
@@ -425,25 +455,20 @@ impl Memory {
 
     /// The marks set since they were last read: their copies are ones
     /// shaders write, as of `frame`.
-    fn take_marks(&mut self, frame: u64) {
+    fn take_marks(&mut self, frame: u64, notes: &Notes) {
         self.marked.resize(self.copies.len(), (u64::MAX, u64::MAX));
         // Marks of copies no list had declared written lately: stores that
         // were not copied back.
         let mut late = 0;
         for n in 0..self.copies.len() {
             // The copy's pages' marks (`MEMORY_PAGE_MARKS`): the copy is
-            // marked if any of them is. Read and cleared; the GPU may be
+            // marked if any of them is. Each is taken once; the GPU may be
             // writing: a mark set after this read is found next frame.
             let (start, len) = self.copies[n].span();
             let (first, last) = (start / PAGE, (start + len).div_ceil(PAGE).min(u64::from(MEMORY_PAGES)));
             let mut any = false;
             for page in first..last {
-                // SAFETY: inside the mapping (`MEMORY_NOTES` dwords).
-                let d = unsafe { self.faults.1.add(MEMORY_PAGE_MARKS as usize + page as usize) };
-                // SAFETY: as above.
-                if unsafe { d.read_volatile() } != 0 {
-                    // SAFETY: as above.
-                    unsafe { d.write_volatile(0) };
+                if notes.take(MEMORY_PAGE_MARKS as usize + page as usize) != 0 {
                     self.page_marked.insert(page, frame);
                     any = true;
                 }
@@ -497,20 +522,14 @@ impl Memory {
     }
 
     /// The touches set since they were last read ([`refresh_touched`]).
-    fn take_touched(&mut self, frame: u64) {
+    fn take_touched(&mut self, frame: u64, notes: &Notes) {
         self.touched.resize(self.copies.len(), (u64::MAX, u64::MAX));
         for n in 0..self.copies.len() {
-            // SAFETY: inside the mapping (`MEMORY_NOTES` dwords); the GPU
-            // may be writing: a touch set after this read is found next
-            // frame.
-            let at = unsafe { self.faults.1.add(MEMORY_TOUCHED as usize + n + 1) };
-            // SAFETY: as above.
-            if unsafe { at.read_volatile() } == 0 {
-                continue;
+            // The GPU may be writing: a touch set after this read is found
+            // next frame.
+            if notes.take(MEMORY_TOUCHED as usize + n + 1) != 0 {
+                self.touched[n].0 = frame;
             }
-            // SAFETY: as above.
-            unsafe { at.write_volatile(0) };
-            self.touched[n].0 = frame;
         }
     }
 
@@ -567,14 +586,29 @@ pub(crate) fn ready(
     }
     let m = guard.as_mut()?;
     let frame = crate::frame::current();
+    // The key of the list's first dispatch by address (`first_read` below).
+    const READ: usize = usize::MAX - 0x6d;
     if m.frame != frame {
         #[cfg(feature = "diagnostics")]
         tally_line(m.frame, m.copies.len());
         m.frame = frame;
         m.refused.clear();
-        m.take_faults();
-        m.take_marks(frame);
-        m.take_touched(frame);
+        if let Some(at) = m.mapped {
+            m.take(&Notes::Shared(at), frame);
+        }
+    }
+    if m.mapped.is_none() && !list.used(READ) {
+        // The notes in the card's memory: their last copy once its
+        // submission has finished, at the first list's first dispatch after
+        // that, which brings every copy up to date: those the faults number
+        // now too.
+        let taken = notes::take(|copied| m.take(&Notes::copied(copied), frame));
+        #[cfg(feature = "diagnostics")]
+        if let Some(sent) = taken {
+            tally(10, 1);
+            tally(11, frame.saturating_sub(sent));
+        }
+        let _ = taken;
     }
     let numbered = m.copies.len();
     let mut named = Vec::new();
@@ -615,8 +649,8 @@ pub(crate) fn ready(
     // Once per list, and for copies numbered since: the builder alone
     // dispatches hundreds of times a frame.
     // shortcut: a copy another list numbers meanwhile is brought up to date
-    // by that list's submission, which may run after this one's.
-    const READ: usize = usize::MAX - 0x6d;
+    // by that list's submission, which may run after this one's. (`READ` is
+    // above.)
     const WRITE: usize = usize::MAX - 0x6e;
     // One key per copy below this one, for "this list declared it written".
     const WRITTEN: usize = usize::MAX - 0x1000;
@@ -714,7 +748,7 @@ pub(crate) fn ready(
     }
     Some(Ready {
         directory: m.directory.2,
-        faults: m.faults.2,
+        faults: m.faults.1,
         base,
     })
 }
