@@ -5606,6 +5606,53 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+#[cfg(all(test, feature = "diagnostics"))]
+#[test]
+#[ignore = "requires a D3D12 adapter and a desktop window"]
+fn present_probe_includes_the_second_plane() {
+    let host = host().expect("D3D12 adapter");
+    let list = host.new_list().unwrap();
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: 64,
+        Height: 64,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        ..Default::default()
+    };
+    let state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    // SAFETY: distinct RTV slots, both heaps and both textures live through execution.
+    let plane = |rgba: [f32; 4]| unsafe {
+        let mut texture: Option<ID3D12Resource> = None;
+        host.device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut texture,
+        ).unwrap();
+        let texture = texture.unwrap();
+        let heap: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(
+            &D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                NumDescriptors: 1,
+                ..Default::default()
+            },
+        ).unwrap();
+        let slot = heap.GetCPUDescriptorHandleForHeapStart();
+        host.device.CreateRenderTargetView(&texture, None, slot);
+        list.list.ClearRenderTargetView(slot, &rgba, None);
+        (texture, heap)
+    };
+    let (base, _base_rtv) = plane([0.0, 0.0, 0.0, 1.0]);
+    let (overlay, _overlay_rtv) = plane([0.0, 1.0, 0.0, 1.0]);
+    list.close();
+    host.execute(&[&list]);
+    let state = state.0 as u32;
+    assert_eq!(host.present(&base, state, 1, None, None), Some(true));
+    assert_eq!(host.present(&base, state, 2, Some((&overlay, state)), None), Some(false));
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
@@ -5877,7 +5924,14 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        frame: u64,
+        over: Option<(&ID3D12Resource, u32)>,
+        scene: Option<&crate::resource::HostTexture>,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -5953,21 +6007,85 @@ impl Host {
             ]);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
+            let (mut capture, mut probe) = (None, None);
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let mut read_frame = |source: &ID3D12Resource| {
+                if crate::capture::wanted(frame) {
+                    capture = crate::capture::read_back(&self.device, list, source);
+                }
+                probe = crate::capture::probe(&self.device, list, source);
+            };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            // The present's second plane, if it has one, goes over the copy
+            // ([`crate::over`]): the back buffer is a target meanwhile.
+            let readable = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            let over = over.and_then(|(plane, was)| {
+                // SAFETY: a live resource.
+                let format = swap_format(plane.GetDesc().Format)?;
+                Some((plane, D3D12_RESOURCE_STATES(was as i32), format))
+            });
+            let scene = scene.filter(|s| {
+                matches!(format, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM)
+                    && &s.texture != texture && over.is_none_or(|(p, _, _)| p != &s.texture)
+            });
+            if over.is_some() || scene.is_some() {
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    ),
+                ]);
+                let layer = |plane: &ID3D12Resource, was: D3D12_RESOURCE_STATES, plane_format,
+                             required: D3D12_RESOURCE_STATES, kind| {
+                    let moved = was.0 & required.0 != required.0;
+                    if moved {
+                        list.ResourceBarrier(&[transition(plane, was, required)]);
+                    }
+                    crate::over::record(&self.device, list, &back, format, (width, height), (plane, plane_format), kind);
+                    if moved {
+                        list.ResourceBarrier(&[transition(plane, required, was)]);
+                    }
+                };
+                if let Some(scene) = scene {
+                    // The scene is sampled by both the exposure meter and the pixel shader.
+                    // Keep its resource until a present sent ahead has finished.
+                    let source = &scene.texture;
+                    copy.keep(source);
+                    let state = D3D12_RESOURCE_STATES(scene.state.load(Ordering::Relaxed) as i32);
+                    layer(source, state, crate::over::typed(source.GetDesc().Format),
+                        readable | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, crate::over::Layer::Scene);
+                }
+                if let Some((plane, was, plane_format)) = over {
+                    layer(plane, was, plane_format, readable, crate::over::Layer::Overlay);
+                }
+                let back_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                #[cfg(feature = "diagnostics")]
+                let back_state = if slot.is_none() {
+                    // The Series S interface is visible only after the second plane is drawn.
+                    list.ResourceBarrier(&[transition(&back, back_state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    read_frame(&back);
+                    D3D12_RESOURCE_STATE_COPY_SOURCE
+                } else {
+                    back_state
+                };
+                list.ResourceBarrier(&[transition(&back, back_state, D3D12_RESOURCE_STATE_PRESENT)]);
+            } else {
+                #[cfg(feature = "diagnostics")]
+                if slot.is_none() {
+                    read_frame(texture);
+                }
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    ),
+                ]);
+            }
             copy.close();
             match slot {
                 Some(i) => {
