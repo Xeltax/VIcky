@@ -73,7 +73,8 @@ pub fn run(
     println!("console        {}", victory_hle::console::current().name());
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
-        if name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
+        if matches!(console, Console::SeriesS)
+            && name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
             && let Some(real) = dll.export("ffxDispatch")
         {
             victory_hle::modules::ffx::set_real_dispatch(real);
@@ -106,8 +107,8 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    // The upscale dispatch is ours (`victory_hle::modules::ffx`); the rest of
-    // that DLL is the title's own.
+    // Series S needs the stretch for its lower-resolution scene. Series X
+    // continues to bind all FidelityFX imports through the title's DLL.
     struct TakeDispatch<'a>(&'a dyn victory_loader::ImportResolver);
     impl victory_loader::ImportResolver for TakeDispatch<'_> {
         fn resolve(
@@ -126,7 +127,12 @@ pub fn run(
             self.0.resolve(dll, symbol)
         }
     }
-    show(&exe_name, image.bind_imports(&TakeDispatch(&with_dlls), policy)?);
+    let series_s_dispatch = TakeDispatch(&with_dlls);
+    let exe_resolver: &dyn victory_loader::ImportResolver = match console {
+        Console::SeriesS => &series_s_dispatch,
+        Console::SeriesX => &with_dlls,
+    };
+    show(&exe_name, image.bind_imports(exe_resolver, policy)?);
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
