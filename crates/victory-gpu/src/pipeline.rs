@@ -722,6 +722,9 @@ pub fn save_pipeline_cache() {
     library::save(true);
 }
 
+#[cfg(all(test, windows))]
+mod rejected_bind_tests;
+
 #[cfg(test)]
 mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]
