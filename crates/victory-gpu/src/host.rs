@@ -7525,6 +7525,11 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         use crate::watch::PAGE;
         let p = crate::watch::tests::pool(4);
         let len = 4 * PAGE;
+        // A kernel read can materialize untouched demand-zero pages and
+        // make Windows report them as written. Start with populated pages so
+        // the second refresh measures the single deliberate write below.
+        // SAFETY: the fresh allocation contains len writable bytes.
+        unsafe { (p as *mut u8).write_bytes(0, len) };
         crate::shadow::register(p, p as u64, len as u64);
         let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
             crate::shadow::unregister(p, p as u64);
