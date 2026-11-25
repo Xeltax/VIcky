@@ -98,6 +98,15 @@ So the answer to "denoiser or reflections" is both and more: the tiled sun shado
 - `frame-<n>-ops.txt` is cut short on some frames: 4–9 MB with a handful of draws and no trace program in it, where a whole frame is 14–22 MB. In the two builder-off runs every frame asked for from the 300th world frame on was (10 of 10). Check the size before comparing two frames.
 - The 64 programs were listed with a local change to `translate --list` that prints each container's count of node tests; it can go into a pull request if wanted.
 
+**Why one builder-on run stayed dark: not found; three causes ruled out** (`1a7eb50`, which differs from `493cc0d` in diagnostics only, plus local test switches that are not in a pull request).
+
+- It is rarer than 1 in 5. Six more unchanged builder-on runs of 340 s, with pictures only (no target dumps), were all lit: 10 of 11 unchanged builder-on runs so far. The five changed runs below were lit too.
+- Not the dynamic descriptor slots running out. All six dark runs log `no free dynamic descriptor slots` and none of the first four lit ones did, but refusing tables on purpose leaves the wall lit: every table of 48 slots or more refused in world frames 35–100 (2,800–5,300 of about 10,000 a frame), and every table refused in world frames 40–48. Two later lit runs ran out by themselves as well.
+- Not the title's water path. The dark run bound the `ShallowWaterSim` programs and the lit runs with dumps did not, but 4 of the 6 pictures-only runs bound them and were lit. Which path the title takes moves with how long the dumps hold a frame.
+- Not the 1,023 copies of title memory by address. Every builder-on run uses all 1,023 numbers by the second world frame (`no number left for another copy; its pages read zeros`). With the limit lowered to 512 (two runs) and to 256 (one run) the wall is still lit, though a page then went without a number more than 500,000 times in 340 s.
+- The builder is only needed at the start for this wall: in the run that refused every table in world frames 40–48 the builder turned itself off there for the rest of the run (`one of its dispatches could not be bound`), and the wall was lit 580 frames later. With the builder off from the start it is dark in 5 of 5.
+- What is left: the dark run differs from the lit ones before world frame 128 (the first picture of the shot), and its log has nothing the 15 lit runs lack except the points above. Catching it again takes about 15 runs.
+
 - Without #346, the CPU found 85 MB of shader writes a frame by comparing about 16 GB, roughly 0.5%.
 - With RT8's settings, copying back costs less than with the builder off. The GPU is now the biggest part.
 - These are single runs, and the spread between runs is large.
