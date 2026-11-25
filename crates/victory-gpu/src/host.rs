@@ -2131,6 +2131,23 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            // Which declared range a fill of upload memory
+                            // runs into: a range declared wider than what
+                            // shaders write makes every frame wait here.
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                                if SAID.fetch_add(1, Ordering::Relaxed) < 40
+                                    && let Some(&(a, e)) = written.iter().find(|&&(a, e)| a < src + len && e > src)
+                                {
+                                    tracing::info!(
+                                        fill = format_args!("{src:#x}+{len:#x}"),
+                                        declared = format_args!("{a:#x}+{:#x}", e - a),
+                                        ranges = written.len(),
+                                        "late wait: a fill of upload memory reads title memory a flight's shaders may write"
+                                    );
+                                }
+                            }
                         }
                         return Some(WHY_READ);
                     }
