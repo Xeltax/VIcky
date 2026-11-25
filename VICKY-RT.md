@@ -54,6 +54,23 @@ Build and run as for `fx-heapmap-8d` (see `VICKY.md`). The builder is off by def
 - These are single runs, and the spread between runs is large.
 - The picture with the builder on: the dark corner of the cell is no brighter yet.
 
+## Roadmap: from about 3.5 fps toward 15–20
+
+**Why it is possible.** The console runs this title at 30 fps on a 12-TFLOPS RDNA2 GPU. An RTX 4080 has about 49 TFLOPS, and the title's CPU code is x86-64 that runs natively. RT10's frame is about 280 ms against the console's 33 ms: the gap is our translation, not the hardware. shadPS4 (AMD GPU, unified memory, raw command buffers) shows that this class of runtime can reach playable speeds.
+
+**Where RT10's frame goes, and the levers:**
+
+| part | now | levers | possible gain |
+|---|---|---|---|
+| CPU waits (copy-back, flights blocking the next submission) | ~80–150 ms | precise write sets (a fill of upload memory waits 77 ms a frame on a declared range), lazy copy-back | ×1.3–1.5 soon |
+| CPU preparing (refresh, descriptors, ~53,000 list calls a frame) | ~150 ms | GPU-written dirty bitmaps, fewer write-watch checks, recording spread over threads | ×2–3 |
+| GPU work (card 68% busy, about 190 ms) | ~190 ms | the shader clean-up passes made safe (`VICTORY_SHADER_OPT=0` today), wave64 without barriers (tasks 8–9), ray queries on RT cores (task 7), less indirection for raw pointers | ×3–5 over time, ×1.5–2 per project |
+| Series S profile | | works already | ×1.3–1.5 |
+
+**Expectations.**
+- Near term: 5–7 fps.
+- 15–20 fps needs both the CPU and the GPU 3–5× faster. The GPU is the biggest part: about 190 ms where the console, four times weaker, takes 33. So the next step is a per-pass GPU profile (`VICTORY_GPU_TIMING=1 VICTORY_D3D12_DRED=1`), to find whether one or two programs dominate.
+
 ## Where to help (say on Discord which one you take, to avoid doubling up)
 
 1. **Measure this branch on your card,** builder on and off, two runs each. Post the `fps` line and the `shader writes looked for on the CPU` line from the log. Numbers only: no captures or game data on GitHub. AMD and other 64-lane cards are wanted most, since the builder runs there in its native form.
