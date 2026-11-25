@@ -2523,6 +2523,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
+        View::NullConstant => {
+            null_for(view, at);
+            Some(None)
+        }
         &View::Constant(address, size) => {
             // Constant buffers in the title's slots, through the heap itself
             // or a table, are read as raw buffers by translated shaders
@@ -2775,7 +2779,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
         // Read as raw buffers, as made (`make`).
-        View::Constant(..) => return null_buffer_view(at),
+        View::NullConstant | View::Constant(..) => return null_buffer_view(at),
         _ => return null_view(at),
     };
     let desc = if buffer {
@@ -3169,6 +3173,21 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    #[test]
+    fn a_null_cbv_drops_the_slots_previous_resource() {
+        let Some(host) = host() else { return };
+        let heap = HostHeap::new(false, 4).expect("view heap");
+        let (buffer, _) = host.shared_buffer(256).expect("buffer");
+        heap.keep(0, Some((buffer, None)));
+        let mut slot = [0u64; 4];
+        let handle = slot.as_mut_ptr() as u64;
+        crate::descriptor::create_cbv(std::ptr::null(), std::ptr::null(), handle);
+        assert_eq!(heap.mirror(0, handle, false), Some(View::NullConstant));
+        assert!(heap.kept.lock().unwrap()[0].is_none());
+        // SAFETY: the device is live.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     #[test]

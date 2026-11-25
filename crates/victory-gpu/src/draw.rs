@@ -2928,7 +2928,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 /// copied, textures moved to the state they need.
 fn view_kind(view: &View) -> Option<ResourceType> {
     match view {
-        View::Constant(..) => Some(ResourceType::Cbv),
+        View::NullConstant | View::Constant(..) => Some(ResourceType::Cbv),
         View::Shader(..) | View::Placed(false, ..) => Some(ResourceType::Srv),
         View::Unordered(..) | View::Placed(true, ..) => Some(ResourceType::Uav),
         _ => None,
