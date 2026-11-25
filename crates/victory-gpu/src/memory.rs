@@ -64,7 +64,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use victory_shader::emit::{MEMORY_FAULTS, MEMORY_MARKS, MEMORY_PAGES};
+use victory_shader::emit::{MEMORY_FAULTS, MEMORY_MARKS, MEMORY_NOTES, MEMORY_PAGES, MEMORY_TOUCHED};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
@@ -83,6 +83,53 @@ const PAGE: u64 = 1 << 16;
 const MARK_FRAMES: u64 = 8;
 const _: () = assert!(COPIES < MEMORY_MARKS);
 
+/// `VICTORY_MEMORY_NAMED_WRITES=0`: a copy that a dispatch only names (by a
+/// root view or a constant that looks like an address) stops being declared
+/// written by the name alone once it has been in [`NAMED_FRAMES`] frames
+/// without any shader ever marking it. Unset or 1: every name declares its
+/// copies written, as before.
+///
+/// Why: a constant at or above 0x0100_0000 is taken as an address in
+/// 256-byte units, and each name maps two 4 MiB windows. Copies so named
+/// cost a snapshot before each storing submission and a compare after it
+/// even when no shader stores there. The marks (#346) say which copies
+/// shaders store to; one that is never marked is one shaders did not write.
+///
+/// shortcut: a store to such a copy after it stopped being declared is not
+/// copied back until its mark is read (the next frame), as for any copy
+/// #346 had not declared.
+fn named_writes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_NAMED_WRITES").is_none_or(|v| v != "0"))
+}
+
+/// See [`named_writes`].
+const NAMED_FRAMES: u32 = 3;
+
+/// `VICTORY_MEMORY_REFRESH=touched`: on a list's first dispatch, only the
+/// copies a shader touched lately (`MEMORY_TOUCHED`, within
+/// [`MARK_FRAMES`]) are brought up to date, with the named, the new and
+/// those declared written, and every copy at least once in
+/// [`REFRESH_FRAMES`]. Unset: every numbered copy, as before.
+///
+/// Why: with the structure builder on, all 1,023 copies (4.3 GB) are
+/// refreshed on each list's first dispatch, 4 to 5 lists a frame, and each
+/// refresh asks the kernel's write watch over them: about 5,700 askings
+/// and 28 GB checked a frame against 2,400 and 11 GB without the builder
+/// (RTX 4080). Shaders read about a quarter of the copies in a frame.
+///
+/// shortcut: a copy no shader touched for [`MARK_FRAMES`] frames and not
+/// refreshed in the last [`REFRESH_FRAMES`] reads bytes up to that many
+/// frames old at its next first touch; it is refreshed from the next
+/// frame on.
+fn refresh_touched() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_MEMORY_REFRESH").is_ok_and(|v| v.trim() == "touched"))
+}
+
+/// See [`refresh_touched`].
+const REFRESH_FRAMES: u64 = 8;
+
 struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
@@ -99,6 +146,14 @@ struct Memory {
     /// Per copy: the frame its mark was last found set in (`u64::MAX`:
     /// never), and the frame a list last declared it written in.
     marked: Vec<(u64, u64)>,
+    /// Per copy: the last frame a dispatch's name alone declared it written,
+    /// and in how many frames that happened while it was never marked
+    /// ([`named_writes`]).
+    named: Vec<(u64, u32)>,
+    /// Per copy: the frame a shader was last found to have touched it
+    /// (`MEMORY_TOUCHED`), and the frame a list last refreshed it
+    /// (`u64::MAX`: never).
+    touched: Vec<(u64, u64)>,
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -106,6 +161,49 @@ struct Memory {
 unsafe impl Send for Memory {}
 
 static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
+
+/// For the log, per frame (diagnostics): lists that refreshed every copy,
+/// copies refreshed and their bytes; copies declared written because they
+/// are new, because a dispatch named them, because a shader marked them
+/// lately, and their bytes; of the named, those never marked, and their
+/// bytes; copies a list's first dispatch did not refresh
+/// ([`refresh_touched`]).
+#[cfg(feature = "diagnostics")]
+static TALLY: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+#[cfg(feature = "diagnostics")]
+fn tally(i: usize, v: u64) {
+    TALLY[i].fetch_add(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// One line for the frame just ended (the first 400 frames that had any).
+#[cfg(feature = "diagnostics")]
+fn tally_line(frame: u64, numbered: usize) {
+    use std::sync::atomic::Ordering;
+    let t: Vec<u64> = TALLY.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+    if t.iter().all(|&v| v == 0) {
+        return;
+    }
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) >= 400 {
+        return;
+    }
+    tracing::info!(
+        frame,
+        numbered,
+        lists_refreshing = t[0],
+        refreshed = t[1],
+        refreshed_mb = t[2] >> 20,
+        declared_new = t[3],
+        declared_named = t[4],
+        declared_marked = t[5],
+        declared_mb = t[6] >> 20,
+        named_never_marked = t[7],
+        named_mb = t[8] >> 20,
+        refresh_skipped = t[9],
+        "title memory by address, last frame: refreshes and copies declared written by reason"
+    );
+}
 
 /// What a draw binds.
 pub(crate) struct Ready {
@@ -130,12 +228,14 @@ impl Memory {
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
         Some(Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
-            faults: make(u64::from(MEMORY_FAULTS + MEMORY_MARKS), "faults and marks")?,
+            faults: make(u64::from(MEMORY_NOTES), "faults, marks and touches")?,
             copies: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
             marked: Vec::new(),
+            named: Vec::new(),
+            touched: Vec::new(),
         })
     }
 
@@ -284,6 +384,59 @@ impl Memory {
         }
     }
 
+    /// Whether a dispatch naming copy `n` declares it written in `frame`
+    /// ([`named_writes`]), and its count of such frames while unmarked.
+    fn name_declares(&mut self, n: usize, frame: u64) -> bool {
+        if named_writes() {
+            return true;
+        }
+        if self.named.len() <= n {
+            self.named.resize(n + 1, (u64::MAX, 0));
+        }
+        if self.marked.get(n).is_some_and(|&(marked, _)| marked != u64::MAX) {
+            return true;
+        }
+        let (last, frames) = &mut self.named[n];
+        if *last != frame {
+            if *frames >= NAMED_FRAMES {
+                return false;
+            }
+            *last = frame;
+            *frames += 1;
+        }
+        true
+    }
+
+    /// The touches set since they were last read ([`refresh_touched`]).
+    fn take_touched(&mut self, frame: u64) {
+        self.touched.resize(self.copies.len(), (u64::MAX, u64::MAX));
+        for n in 0..self.copies.len() {
+            // SAFETY: inside the mapping (`MEMORY_NOTES` dwords); the GPU
+            // may be writing: a touch set after this read is found next
+            // frame.
+            let at = unsafe { self.faults.1.add(MEMORY_TOUCHED as usize + n + 1) };
+            // SAFETY: as above.
+            if unsafe { at.read_volatile() } == 0 {
+                continue;
+            }
+            // SAFETY: as above.
+            unsafe { at.write_volatile(0) };
+            self.touched[n].0 = frame;
+        }
+    }
+
+    /// Whether copy `n` is to be refreshed on a list's first dispatch
+    /// ([`refresh_touched`]).
+    fn refresh_due(&self, n: usize, frame: u64) -> bool {
+        let Some(&(touched, refreshed)) = self.touched.get(n) else {
+            return true;
+        };
+        (touched != u64::MAX && frame.wrapping_sub(touched) <= MARK_FRAMES)
+            || refreshed == u64::MAX
+            || frame.wrapping_sub(refreshed) >= REFRESH_FRAMES
+            || self.written_lately(n, frame)
+    }
+
     /// Whether copy `n` is one shaders wrote lately.
     fn written_lately(&self, n: usize, frame: u64) -> bool {
         self.marked.get(n).is_some_and(|&(marked, _)| {
@@ -319,10 +472,13 @@ pub(crate) fn ready(
     let m = guard.as_mut()?;
     let frame = crate::frame::current();
     if m.frame != frame {
+        #[cfg(feature = "diagnostics")]
+        tally_line(m.frame, m.copies.len());
         m.frame = frame;
         m.refused.clear();
         m.take_faults();
         m.take_marks(frame);
+        m.take_touched(frame);
     }
     let numbered = m.copies.len();
     let mut named = Vec::new();
@@ -369,18 +525,65 @@ pub(crate) fn ready(
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
     m.marked.resize(m.copies.len(), (u64::MAX, u64::MAX));
+    m.touched.resize(m.copies.len(), (u64::MAX, u64::MAX));
+    // With [`refresh_touched`]: one key per copy below this one, for "this
+    // list refreshed it".
+    const REFRESHED: usize = usize::MAX - 0x2000;
+    let touched_only = refresh_touched();
+    // Which copies a list's first dispatch refreshes: all of them, or
+    // ([`refresh_touched`]) those due and those named.
+    let due: Vec<bool> = if touched_only && first_read {
+        (0..m.copies.len()).map(|n| named.contains(&n) || m.refresh_due(n, frame)).collect()
+    } else {
+        Vec::new()
+    };
+    // The named copies whose name declares them written ([`named_writes`]).
+    let named: Vec<usize> = named.into_iter().filter(|&n| m.name_declares(n, frame)).collect();
     for (n, shadow) in m.copies.iter().enumerate() {
         let (start, len) = shadow.span();
-        if first_read || n >= numbered {
-            shadow.refresh(list, start, len);
-        }
         // Written: see the module. The copies marked lately once per list,
         // the named and the new ones as they come.
-        let wanted =
-            n >= numbered || named.contains(&n) || (first_write && m.written_lately(n, frame));
-        if writes && wanted && list.first_use(WRITTEN - n) {
+        let is_new = n >= numbered;
+        let is_named = named.contains(&n);
+        let wanted = is_new || is_named || (first_write && m.written_lately(n, frame));
+        let declaring = writes && wanted && list.first_use(WRITTEN - n);
+        let refresh = if !touched_only {
+            first_read || is_new
+        } else {
+            // Once per list: due on its first dispatch, or new, or about to
+            // be declared written (its snapshot is taken after it).
+            (is_new || declaring || (first_read && due[n])) && list.first_use(REFRESHED - n)
+        };
+        if refresh {
+            shadow.refresh(list, start, len);
+            m.touched[n].1 = frame;
+            #[cfg(feature = "diagnostics")]
+            {
+                tally(1, 1);
+                tally(2, len);
+            }
+        } else if first_read {
+            #[cfg(feature = "diagnostics")]
+            tally(9, 1);
+        }
+        if declaring {
             shadow.gpu_writes(list, start, len);
+            #[cfg(feature = "diagnostics")]
+            {
+                tally(if is_new { 3 } else if is_named { 4 } else { 5 }, 1);
+                tally(6, len);
+                if is_named && !is_new && m.marked[n].0 == u64::MAX {
+                    tally(7, 1);
+                    tally(8, len);
+                }
+            }
             m.marked[n].1 = frame;
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        if first_read {
+            tally(0, 1);
         }
     }
     if first_read {

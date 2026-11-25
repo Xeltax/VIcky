@@ -5,7 +5,7 @@
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{
-    HostShader, MEMORY_FAULTS, MEMORY_MARKS, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE, lower,
+    HostShader, MEMORY_FAULTS, MEMORY_MARKS, MEMORY_NOTES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE, lower,
     validator,
 };
 use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
@@ -135,7 +135,7 @@ fn run(host: &Host, shader: &HostShader, copy: u32) -> Vec<Vec<u32>> {
             views: &[
                 View::RawUav(64),
                 View::RawUav(64),
-                View::RawUav(MEMORY_FAULTS + MEMORY_MARKS),
+                View::RawUav(MEMORY_NOTES),
             ],
             samplers: &[],
             groups: [1, 1, 1],
@@ -180,11 +180,17 @@ fn a_store_by_address_lands_in_its_copy_and_marks_it_on_the_card() {
             none.iter().all(|&d| d == 0),
             "{label}: nothing at the base slot"
         );
-        let (faults, marks) = notes.split_at(MEMORY_FAULTS as usize);
+        let (faults, rest) = notes.split_at(MEMORY_FAULTS as usize);
+        let (marks, touched) = rest.split_at(MEMORY_MARKS as usize);
         // Dword 0 is the sink of the lanes that do not run.
         assert!(
             faults[1..].iter().all(|&d| d == 0),
             "{label}: no fault note"
+        );
+        assert_eq!(touched[1], ADDRESS >> 16, "{label}: copy 1 is touched");
+        assert!(
+            touched.iter().enumerate().all(|(n, &d)| n == 1 || d == 0),
+            "{label}: no other copy touched"
         );
         assert_eq!(marks[1], 1, "{label}: copy 1 is marked");
         assert!(
@@ -197,7 +203,9 @@ fn a_store_by_address_lands_in_its_copy_and_marks_it_on_the_card() {
         let out = run(&host, &shader, 0);
         let (copy, notes) = (&out[1], &out[2]);
         assert!(copy.iter().all(|&d| d == 0), "{label}: copy 1 untouched");
-        let (faults, marks) = notes.split_at(MEMORY_FAULTS as usize);
+        let (faults, rest) = notes.split_at(MEMORY_FAULTS as usize);
+        let (marks, touched) = rest.split_at(MEMORY_MARKS as usize);
+        assert!(touched.iter().all(|&d| d == 0), "{label}: no copy touched");
         let page = ADDRESS >> 16;
         let place = (page % (MEMORY_FAULTS - 1) + 1) as usize;
         assert_eq!(faults[place], page, "{label}: the page is noted");

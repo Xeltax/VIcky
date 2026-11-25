@@ -296,6 +296,19 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 /// written, with the number of the asking that stands (as [`writes`] gives
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    asked_inner(start, end)
+}
+
+/// The number of the asking that stands, if `[start, end)` lies in a range
+/// asked ahead ([`ask_ahead`], [`ask_once`]): while that number holds, the
+/// journal can note no new write in the range (`VICTORY_REFRESH_STAMP`).
+pub(crate) fn ahead_now(start: usize, end: usize) -> Option<u64> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then_some(j.ahead_asked)
+}
+
+fn asked_inner(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     j.ahead

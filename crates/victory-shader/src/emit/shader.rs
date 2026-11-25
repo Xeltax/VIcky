@@ -59,6 +59,15 @@ pub const MEMORY_FAULTS: u32 = 4096;
 /// reads and clears them to learn which copies shaders write, so that it
 /// need not take every copy for written.
 pub const MEMORY_MARKS: u32 = 1024;
+/// After the marks in the [`SLOT_FAULTS`] buffer: one dword per numbered
+/// copy (dword [`MEMORY_TOUCHED`] + n for copy `n`), set to the page number
+/// by every access, load or store, a running lane makes through that copy.
+/// It is where the fault note's store of such an access goes instead of
+/// the sink, so it costs no store of its own. The host reads and clears
+/// them to learn which copies shaders read (`VICTORY_MEMORY_REFRESH`).
+pub const MEMORY_TOUCHED: u32 = MEMORY_FAULTS + MEMORY_MARKS;
+/// Dwords of the whole [`SLOT_FAULTS`] buffer: notes, marks and touches.
+pub const MEMORY_NOTES: u32 = MEMORY_TOUCHED + MEMORY_MARKS;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;

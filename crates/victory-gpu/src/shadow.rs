@@ -53,6 +53,9 @@ pub(crate) struct Shadow {
     /// hold the copy's bytes as they are now, and whether the snapshot is
     /// counted in [`KEPT_BYTES`].
     kept: Mutex<(Vec<bool>, bool)>,
+    /// The last refresh that trusted the journal alone: its asking and
+    /// range ([`stamp_on`]).
+    stamp: Mutex<(u64, usize, usize)>,
     /// When the copy was last asked for (`crate::host::moment`): a window
     /// outside buffers nothing asked for in a while, and nothing holds, is
     /// let go ([`let_go_idle`]).
@@ -1048,6 +1051,21 @@ fn give_back(v: Vec<u8>) {
     });
 }
 
+/// `VICTORY_REFRESH_STAMP=1`: a refresh of a copy's range that the
+/// journal answered alone (the range lies in one asked ahead) is noted with
+/// the asking's number; a refresh of a range inside it under the same
+/// number returns at once. While the number holds, no write can be noted
+/// in such a range: a write of ours moves the number (`watch::wrote`), and
+/// a range asked ahead is not asked again until the asking ends. Off by
+/// default.
+fn stamp_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_STAMP").is_some_and(|v| v == "1"))
+}
+
+/// Refreshes [`stamp_on`] returned at once, and their bytes.
+static STAMP_SKIPS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
 /// `VICTORY_SNAPSHOT_POOL_MB`: snapshot buffers kept for reuse by their
 /// size, up to that many megabytes in all; unset, the pool above (eight
 /// buffers, 512 MB).
@@ -1573,6 +1591,14 @@ pub(crate) fn back_line(frames: f64) {
         mb(c[1]),
         mb(c[4]),
     );
+    if stamp_on() {
+        let (n, bytes) = (STAMP_SKIPS[0].swap(0, Ordering::Relaxed), STAMP_SKIPS[1].swap(0, Ordering::Relaxed));
+        tracing::info!(
+            refreshes = n as f64 / frames,
+            mb = bytes as f64 / frames / (1 << 20) as f64,
+            "refreshes skipped per frame: checked already under the asking that stands (VICTORY_REFRESH_STAMP)"
+        );
+    }
     if let Some([buffers, bytes, reused, made, let_go]) = sized_pool() {
         tracing::info!(
             buffers,
@@ -2274,6 +2300,7 @@ impl Shadow {
             flights: Mutex::default(),
             before: Mutex::default(),
             kept: Mutex::default(),
+            stamp: Mutex::new((u64::MAX, 0, 0)),
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
@@ -2932,9 +2959,23 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+            // Checked already under the asking that stands, and the
+            // journal alone answers for the range: nothing can be newer.
+            let ahead = if stamp_on() { crate::watch::ahead_now(from, to) } else { None };
+            if let Some(now) = ahead {
+                let stamp = *self.stamp.lock().unwrap_or_else(|e| e.into_inner());
+                if stamp.0 == now && stamp.1 <= from && to <= stamp.2 {
+                    STAMP_SKIPS[0].fetch_add(1, Ordering::Relaxed);
+                    STAMP_SKIPS[1].fetch_add((to - from) as u64, Ordering::Relaxed);
+                    return 0;
+                }
+            }
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
+                if ahead == Some(now) {
+                    *self.stamp.lock().unwrap_or_else(|e| e.into_inner()) = (now, from, to);
+                }
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {

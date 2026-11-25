@@ -2773,7 +2773,7 @@ impl<'a> Lower<'a> {
     /// access that writes (`store`) also marks its copy for the host
     /// (`shader.rs` `MEMORY_MARKS`), for lanes that run.
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>, store: bool) -> (V, V) {
-        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_TOUCHED, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -2816,7 +2816,17 @@ impl<'a> Lower<'a> {
         let place = self.s.m.bin(c, Bin::Add, place, one);
         let k2 = k(self, 2);
         let place = self.s.m.bin(c, Bin::Shl, place, k2);
-        let place = self.s.m.select(c, missing, place, zero);
+        // A page with a copy, for lanes that run: the copy's touch
+        // (`MEMORY_TOUCHED`); else the sink.
+        let mut has = self.s.m.cmp(c, pred::NE, copy, zero);
+        if let Some(g) = guard {
+            has = self.s.m.bin(c, Bin::And, has, g);
+        }
+        let touched = k(self, MEMORY_TOUCHED);
+        let touched = self.s.m.bin(c, Bin::Add, touched, copy);
+        let touched = self.s.m.bin(c, Bin::Shl, touched, k2);
+        let other = self.s.m.select(c, has, touched, zero);
+        let place = self.s.m.select(c, missing, place, other);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
         let void = self.s.t.void;
         let mask = self.s.m.i8(1);
