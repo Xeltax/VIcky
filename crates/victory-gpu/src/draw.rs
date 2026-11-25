@@ -196,8 +196,18 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    /// The entries the bind being prepared added to the three maps above
+    /// ([`State::bind`]): a rejected bind takes them out again.
+    bind_made: Vec<BindMade>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+}
+
+/// An entry a bind added to one of [`State`]'s per-list slot maps.
+enum BindMade {
+    Table((u64, u32, u64)),
+    RootSrv((usize, u64)),
+    RootUav((usize, u64)),
 }
 
 impl Drop for State {
@@ -912,6 +922,39 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let reserved = self.dynamic.len();
+        self.bind_made.clear();
+        let bound = self.bind_attempt(list, p, compute);
+        if !bound {
+            self.release_rejected(reserved);
+        }
+        self.bind_made.clear();
+        bound
+    }
+
+    /// Release the descriptors reserved for an operation that will never be
+    /// recorded. Earlier draws can still reference reservations before the mark.
+    fn release_rejected(&mut self, reserved: usize) {
+        for made in self.bind_made.drain(..) {
+            match made {
+                BindMade::Table(key) => {
+                    self.fresh_tables.remove(&key);
+                }
+                BindMade::RootSrv(key) => {
+                    self.root_srv_slots.remove(&key);
+                }
+                BindMade::RootUav(key) => {
+                    self.root_uav_slots.remove(&key);
+                }
+            }
+        }
+        for (heap, first, n) in self.dynamic.drain(reserved..) {
+            release_slots(heap, first, n);
+        }
+    }
+
+    /// [`State::bind`] before a rejection's slots are given back.
+    fn bind_attempt(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
@@ -1257,6 +1300,7 @@ impl State {
                 };
                 ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
                 self.dynamic.push((key.0, index, 1));
+                self.bind_made.push(BindMade::RootUav(key));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -1408,6 +1452,7 @@ impl State {
                 };
                 ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
                 self.dynamic.push((key.0, index, 1));
+                self.bind_made.push(BindMade::RootSrv(key));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -2206,11 +2251,13 @@ impl State {
             }
             let Some(first) = host.dynamic(n) else {
                 // No room: the draw must not run with the title's own
-                // offsets (slots never made for it); `bind` drops it.
+                // offsets (slots never made for it); `bind` drops it and
+                // gives back the tables made before this one.
                 made.push((slot, u32::MAX));
-                continue;
+                break;
             };
             self.fresh_tables.insert(key, first);
+            self.bind_made.push(BindMade::Table(key));
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of

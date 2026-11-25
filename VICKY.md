@@ -6,7 +6,7 @@ This branch is the base that renders the world **lit and textured** on NVIDIA: [
 
 ## What this branch adds: a heap map for NVIDIA's view-heap cap
 
-NVIDIA takes at most **1,000,000** shader-visible views; the title's view heap has **1,245,184** slots. On a capped host the base keeps the first ~737,855 title slots at their own index and lets every view past them read the null slot.
+The title requests **1,245,184** shader-visible views. On an 8 GB RTX 4060 Laptop with driver 617.14, D3D12 accepted 1,000,001 views and refused the full title heap. VIcky probes the translator's full 2,097,152-slot range before compiling shaders and uses its **1,000,000**-slot layout if that allocation fails. On a capped host the base keeps the first ~737,855 title slots at their own index and lets every view past them read the null slot.
 
 Measured on an RTX 4080 (diagnostics scan of the title's heap, every 30 s in the world):
 - 650k–700k title slots hold a view, up to slot 1,245,182.
