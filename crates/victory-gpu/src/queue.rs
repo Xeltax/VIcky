@@ -815,6 +815,8 @@ extern "system" fn present(
         }
     }
     #[cfg(windows)]
+    let scene = crate::over::scene_enabled().then(crate::over::take_scene).flatten();
+    #[cfg(windows)]
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
         && let Some(plane) = unsafe { plane_parameters.as_ref() }
@@ -839,7 +841,7 @@ extern "system" fn present(
             let was = crate::resource::host_transition(r, READABLE).map_or(READABLE, |(_, before)| before);
             (r, t, was)
         });
-        let shown = host.present(texture, state, frame, over.map(|(_, t, was)| (t, was)));
+        let shown = host.present(texture, state, frame, over.map(|(_, t, was)| (t, was)), scene.as_deref());
         if let Some((r, _, was)) = over {
             crate::resource::host_transition(r, was);
         }

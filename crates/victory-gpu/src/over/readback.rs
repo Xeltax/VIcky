@@ -4,15 +4,28 @@ use super::*;
 
 #[test]
 fn stretch_and_overlay_preserve_the_expected_pixels() {
+    check_display(None, [[0, 0, 255, 255], [0, 0, 255, 255], [0, 128, 127, 255],
+                         [255, 0, 0, 255], [255, 0, 0, 255]]);
+}
+
+#[test]
+fn dim_scene_colour_is_visible_beneath_the_interface() {
+    check_display(Some([0.001, 0.001, 0.001, 0.0]),
+        [[109, 109, 109, 255], [109, 109, 109, 255], [54, 182, 54, 255],
+         [255, 0, 0, 255], [255, 0, 0, 255]]);
+}
+
+fn check_display(dim_scene: Option<[f32; 4]>, expected: [[u8; 4]; 5]) {
     use crate::host::{host, transition};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT as RGBA16F;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM as RGBA8;
     let Some(host) = host() else {
         eprintln!("no D3D12 device; skipping display readback");
         return;
     };
-    let texture = |width: u32, height, flags, state| {
+    let texture = |width: u32, height, format, flags, state| {
         let mut resource: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation of a texture with one RGBA8 subresource.
+        // SAFETY: plain creation of a texture with one subresource.
         unsafe {
             host.device
                 .CreateCommittedResource(
@@ -27,7 +40,7 @@ fn stretch_and_overlay_preserve_the_expected_pixels() {
                         Height: height,
                         DepthOrArraySize: 1,
                         MipLevels: 1,
-                        Format: RGBA8,
+                        Format: format,
                         SampleDesc: DXGI_SAMPLE_DESC {
                             Count: 1,
                             Quality: 0,
@@ -70,11 +83,13 @@ fn stretch_and_overlay_preserve_the_expected_pixels() {
     };
     let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     let rtv = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    let scene = texture(3, 2, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, rtv);
-    let ui = texture(5, 3, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, rtv);
+    let scene_format = if dim_scene.is_some() { RGBA16F } else { RGBA8 };
+    let scene = texture(3, 2, scene_format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, rtv);
+    let ui = texture(5, 3, RGBA8, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, rtv);
     let target = texture(
         5,
         3,
+        RGBA8,
         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         uav,
     );
@@ -85,7 +100,7 @@ fn stretch_and_overlay_preserve_the_expected_pixels() {
     unsafe {
         let scene_view = host.rtv(Some(&scene), None);
         let ui_view = host.rtv(Some(&ui), None);
-        list.ClearRenderTargetView(scene_view, &[0.0, 0.0, 1.0, 1.0], None);
+        list.ClearRenderTargetView(scene_view, &dim_scene.unwrap_or([0.0, 0.0, 1.0, 1.0]), None);
         list.ClearRenderTargetView(ui_view, &[0.0; 4], None);
         let strip = |left, right| RECT {
             left,
@@ -105,14 +120,19 @@ fn stretch_and_overlay_preserve_the_expected_pixels() {
         ]);
         assert!(record_stretch(&host.device, list, &target, &scene, [3, 2]));
         list.ResourceBarrier(&[transition(&target, uav, rtv)]);
+        if dim_scene.is_some() {
+            list.ResourceBarrier(&[transition(&scene, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)]);
+            assert!(record(&host.device, list, &target, RGBA8, (5, 3), (&scene, scene_format), Layer::Scene));
+        }
         assert!(record(
             &host.device,
             list,
             &target,
             RGBA8,
             (5, 3),
-            &ui,
-            RGBA8
+            (&ui, RGBA8),
+            Layer::Overlay,
         ));
         list.ResourceBarrier(&[transition(&target, rtv, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
         list.CopyTextureRegion(&rows(&readback), 0, 0, 0, &sub(&target), None);
@@ -132,13 +152,6 @@ fn stretch_and_overlay_preserve_the_expected_pixels() {
         }
         readback.Unmap(0, None);
     }
-    let expected = [
-        [0, 0, 255, 255],
-        [0, 0, 255, 255],
-        [0, 128, 127, 255],
-        [255, 0, 0, 255],
-        [255, 0, 0, 255],
-    ];
     for row in pixels {
         assert_eq!(&row[..], expected.as_flattened());
     }

@@ -5649,8 +5649,8 @@ fn present_probe_includes_the_second_plane() {
     list.close();
     host.execute(&[&list]);
     let state = state.0 as u32;
-    assert_eq!(host.present(&base, state, 1, None), Some(true));
-    assert_eq!(host.present(&base, state, 2, Some((&overlay, state))), Some(false));
+    assert_eq!(host.present(&base, state, 1, None, None), Some(true));
+    assert_eq!(host.present(&base, state, 2, Some((&overlay, state)), None), Some(false));
 }
 
 struct Presenter {
@@ -5930,6 +5930,7 @@ impl Host {
         state: u32,
         frame: u64,
         over: Option<(&ID3D12Resource, u32)>,
+        scene: Option<&crate::resource::HostTexture>,
     ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
@@ -6024,29 +6025,42 @@ impl Host {
                 let format = swap_format(plane.GetDesc().Format)?;
                 Some((plane, D3D12_RESOURCE_STATES(was as i32), format))
             });
-            if let Some((plane, was, plane_format)) = over {
-                let mut barriers = vec![
+            let scene = scene.filter(|s| {
+                matches!(format, DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM)
+                    && &s.texture != texture && over.is_none_or(|(p, _, _)| p != &s.texture)
+            });
+            if over.is_some() || scene.is_some() {
+                list.ResourceBarrier(&[
                     transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
                     transition(
                         &back,
                         D3D12_RESOURCE_STATE_COPY_DEST,
                         D3D12_RESOURCE_STATE_RENDER_TARGET,
                     ),
-                ];
-                let moved = was.0 & readable.0 == 0;
-                if moved {
-                    barriers.push(transition(plane, was, readable));
+                ]);
+                let layer = |plane: &ID3D12Resource, was: D3D12_RESOURCE_STATES, plane_format,
+                             required: D3D12_RESOURCE_STATES, kind| {
+                    let moved = was.0 & required.0 != required.0;
+                    if moved {
+                        list.ResourceBarrier(&[transition(plane, was, required)]);
+                    }
+                    crate::over::record(&self.device, list, &back, format, (width, height), (plane, plane_format), kind);
+                    if moved {
+                        list.ResourceBarrier(&[transition(plane, required, was)]);
+                    }
+                };
+                if let Some(scene) = scene {
+                    // The scene is sampled by both the exposure meter and the pixel shader.
+                    // Keep its resource until a present sent ahead has finished.
+                    let source = &scene.texture;
+                    copy.keep(source);
+                    let state = D3D12_RESOURCE_STATES(scene.state.load(Ordering::Relaxed) as i32);
+                    layer(source, state, crate::over::typed(source.GetDesc().Format),
+                        readable | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, crate::over::Layer::Scene);
                 }
-                list.ResourceBarrier(&barriers);
-                crate::over::record(
-                    &self.device,
-                    list,
-                    &back,
-                    format,
-                    (width, height),
-                    plane,
-                    plane_format,
-                );
+                if let Some((plane, was, plane_format)) = over {
+                    layer(plane, was, plane_format, readable, crate::over::Layer::Overlay);
+                }
                 let back_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
                 #[cfg(feature = "diagnostics")]
                 let back_state = if slot.is_none() {
@@ -6057,11 +6071,7 @@ impl Host {
                 } else {
                     back_state
                 };
-                let mut barriers = vec![transition(&back, back_state, D3D12_RESOURCE_STATE_PRESENT)];
-                if moved {
-                    barriers.push(transition(plane, readable, was));
-                }
-                list.ResourceBarrier(&barriers);
+                list.ResourceBarrier(&[transition(&back, back_state, D3D12_RESOURCE_STATE_PRESENT)]);
             } else {
                 #[cfg(feature = "diagnostics")]
                 if slot.is_none() {

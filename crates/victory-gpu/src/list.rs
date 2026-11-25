@@ -809,6 +809,16 @@ pub fn upscale_stretch(
         done = crate::over::record_stretch(&host.device, &list.list, to, from, render);
         if done {
             crate::texture::host_written(output);
+            if crate::over::scene_enabled()
+                && let Some(scene) = crate::resource::host_copy(output)
+            {
+                list.defer_host(move || crate::over::submit_scene(scene.clone()));
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                list.note_op(|| format!("upscale {colour:p} -> {output:p} render={render:?}"));
+                crate::capture::note_upscale(colour, output);
+            }
         }
         state.replay(list);
     });

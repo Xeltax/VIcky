@@ -350,6 +350,22 @@ pub(crate) fn note_target(resource: crate::object::This) {
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
     }
+    keep_target(resource);
+}
+
+/// Capture just the two upscale resources at present, without reading back
+/// every render target. The operation trace identifies each resource's role.
+pub(crate) fn note_upscale(colour: crate::object::This, output: crate::object::This) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_UPSCALE").is_some_and(|v| v == "1"))
+        && listed(crate::queue::presented() + 1)
+    {
+        keep_target(colour);
+        keep_target(output);
+    }
+}
+
+fn keep_target(resource: crate::object::This) {
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
     if !targets.iter().any(|&(r, _)| r == resource as usize)
         && let Some(copy) = crate::resource::host_copy(resource)

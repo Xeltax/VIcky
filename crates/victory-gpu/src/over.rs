@@ -15,7 +15,8 @@
 //! second, and the placement and scaling a plane's parameters can ask for,
 //! are not read.
 
-use std::sync::Mutex;
+use crate::resource::HostTexture;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -32,6 +33,35 @@ Corner corner(uint i : SV_VertexID) {
     return c;
 }
 float4 over(Corner c) : SV_Target { return plane.Sample(bilinear, c.at); }
+
+struct SceneCorner {
+    float4 position : SV_Position;
+    float2 at : TEXCOORD0;
+    nointerpolation float exposure : TEXCOORD1;
+};
+SceneCorner sceneCorner(uint i : SV_VertexID) {
+    Corner c = corner(i);
+    SceneCorner s;
+    s.position = c.position;
+    s.at = c.at;
+    // Meter the same grid for each of the three vertices, once per frame.
+    float luminance = 0;
+    [unroll] for (uint y = 0; y < 4; ++y)
+        [unroll] for (uint x = 0; x < 4; ++x) {
+            float3 rgb = plane.SampleLevel(bilinear, (float2(x, y) + 0.5) / 4.0, 0).rgb;
+            luminance += dot(max(rgb, 0), float3(0.2126, 0.7152, 0.0722));
+        }
+    s.exposure = luminance > 0 ? 0.18 / max(luminance / 16, 0.000001) : 0;
+    return s;
+}
+float4 displayScene(SceneCorner s) : SV_Target {
+    if (s.exposure == 0) return 0;
+    float3 colour = max(plane.Sample(bilinear, s.at).rgb, 0) * s.exposure;
+    colour = colour / (1 + colour);
+    float3 srgb = lerp(12.92 * colour, 1.055 * pow(colour, 1.0 / 2.4) - 0.055,
+                       step(0.0031308, colour));
+    return float4(srgb, 1);
+}
 "#;
 
 /// Views kept until the list that uses them has run: a present can be sent
@@ -58,6 +88,23 @@ struct Pass {
 unsafe impl Send for Pass {}
 
 static PASS: Mutex<Option<Pass>> = Mutex::new(None);
+static SCENE_PASS: Mutex<Option<Pass>> = Mutex::new(None);
+
+static SCENE: Mutex<Option<Arc<HostTexture>>> = Mutex::new(None);
+
+pub(crate) fn scene_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SERIES_S_SCENE").is_some_and(|v| v == "1"))
+}
+
+/// Publish on submission, so a discarded command list cannot supply a frame.
+pub(crate) fn submit_scene(scene: Arc<HostTexture>) {
+    *SCENE.lock().unwrap_or_else(|e| e.into_inner()) = Some(scene);
+}
+
+pub(crate) fn take_scene() -> Option<Arc<HostTexture>> {
+    SCENE.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
 
 /// A bilinear, clamping sampler at `s0` for the stages `visibility` names.
 fn bilinear(visibility: D3D12_SHADER_VISIBILITY) -> D3D12_STATIC_SAMPLER_DESC {
@@ -132,10 +179,20 @@ fn table(ranges: &[D3D12_DESCRIPTOR_RANGE], visibility: D3D12_SHADER_VISIBILITY)
     }
 }
 
-fn make(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Pass> {
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Layer {
+    Overlay,
+    Scene,
+}
+
+fn make(device: &ID3D12Device, format: DXGI_FORMAT, layer: Layer) -> windows::core::Result<Pass> {
     use windows::core::s;
-    let vs = crate::host::compile(SOURCE, s!("corner"), s!("vs_5_1"))?;
-    let ps = crate::host::compile(SOURCE, s!("over"), s!("ps_5_1"))?;
+    let (vertex, pixel, visibility) = match layer {
+        Layer::Overlay => (s!("corner"), s!("over"), D3D12_SHADER_VISIBILITY_PIXEL),
+        Layer::Scene => (s!("sceneCorner"), s!("displayScene"), D3D12_SHADER_VISIBILITY_ALL),
+    };
+    let vs = crate::host::compile(SOURCE, vertex, s!("vs_5_1"))?;
+    let ps = crate::host::compile(SOURCE, pixel, s!("ps_5_1"))?;
     let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
         pShaderBytecode: bytes.as_ptr().cast(),
         BytecodeLength: bytes.len(),
@@ -143,8 +200,8 @@ fn make(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Pas
     let plane = [range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0)];
     let root = root_signature(
         device,
-        &[table(&plane, D3D12_SHADER_VISIBILITY_PIXEL)],
-        D3D12_SHADER_VISIBILITY_PIXEL,
+        &[table(&plane, visibility)],
+        visibility,
         D3D12_ROOT_SIGNATURE_FLAG_NONE,
     )?;
     // SAFETY: the description points at live data and never releases its
@@ -225,22 +282,26 @@ pub(crate) fn record(
     back: &ID3D12Resource,
     format: DXGI_FORMAT,
     (width, height): (u32, u32),
-    plane: &ID3D12Resource,
-    plane_format: DXGI_FORMAT,
+    (plane, plane_format): (&ID3D12Resource, DXGI_FORMAT),
+    layer: Layer,
 ) -> bool {
-    let mut pass = PASS.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = match layer {
+        Layer::Overlay => &PASS,
+        Layer::Scene => &SCENE_PASS,
+    };
+    let mut pass = cache.lock().unwrap_or_else(|e| e.into_inner());
     if pass.as_ref().is_none_or(|p| p.format != format.0) {
-        *pass = match make(device, format) {
+        *pass = match make(device, format, layer) {
             Ok(p) => Some(p),
             Err(e) => {
                 static TOLD: std::sync::Once = std::sync::Once::new();
                 TOLD.call_once(|| {
-                    tracing::warn!(error = %e, "no pass to draw a present's second plane: it is not shown");
+                    tracing::warn!(?layer, error = %e, "could not create the presentation pass");
                 });
                 return false;
             }
         };
-        tracing::info!(format = format.0, "a present's second plane is drawn over the first");
+        tracing::info!(?layer, format = format.0, "presentation pass ready");
     }
     let Some(p) = pass.as_mut() else { return false };
     let slot = p.next % RING;
@@ -408,7 +469,7 @@ fn make_stretch(device: &ID3D12Device) -> windows::core::Result<Stretch> {
 }
 
 /// A typeless colour format as the typed one shaders read and write.
-fn typed(format: DXGI_FORMAT) -> DXGI_FORMAT {
+pub(crate) fn typed(format: DXGI_FORMAT) -> DXGI_FORMAT {
     DXGI_FORMAT(match format.0 {
         1 => 2,
         9 => 10,
