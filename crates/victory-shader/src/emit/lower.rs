@@ -194,6 +194,9 @@ struct Lower<'a> {
     /// when early-exit is not used (group barriers or wave64-over-wave32
     /// LDS exchange require all threads to remain active).
     partial_active: Option<V>,
+    /// A compute program's group number in x with the host's first group
+    /// of the part added ([`Self::group_id`]), once made (entry block).
+    group_x: Option<V>,
     bools: HashMap<(usize, Bool), V>,
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
@@ -1532,6 +1535,7 @@ impl<'a> Lower<'a> {
             cur: 0,
             body_entry: entry,
             partial_active: None,
+            group_x: None,
             bools: HashMap::new(),
             lane_bits: HashMap::new(),
             phi_at,
@@ -2415,7 +2419,7 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => return self.group_id(c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
@@ -2478,6 +2482,30 @@ impl<'a> Lower<'a> {
             }
         };
         self.load_input(id, col)
+    }
+
+    /// Component `c` of a compute program's group number, read in the entry
+    /// block. In x the host's first group of the part that runs is added
+    /// (`shader.rs` `USER_GROUP_BASE`): the host runs at most 65,535 groups
+    /// in a dimension, the console any number, so a larger dispatch runs in
+    /// parts. The dword is 0 for a dispatch that runs whole; every program
+    /// that reads its x number asks for it, so its translation does not
+    /// depend on its dispatches. (myokex's fix, ZSlayerHQ/victory-world-runtime
+    /// 892d259, there for programs that read the x number alone.)
+    fn group_id(&mut self, c: u8) -> Val {
+        if c != 0 || !matches!(self.x.native.io, StageIo::Cs(_)) {
+            return self.compute_id("groupId.i32", 94, c);
+        }
+        if let Some(v) = self.group_x {
+            return Val::I32(v);
+        }
+        let Val::I32(id) = self.compute_id("groupId.i32", 94, 0) else {
+            unreachable!()
+        };
+        let base = self.host_word(RootType::Other(super::shader::USER_GROUP_BASE), 0, 0);
+        let v = self.s.m.bin(self.s.entry, Bin::Add, id, base);
+        self.group_x = Some(v);
+        Val::I32(v)
     }
 
     /// A component of a compute thread or group id, read in the entry block.
@@ -4077,7 +4105,8 @@ impl<'a> Lower<'a> {
             let Val::I32(tid) = self.thread_id(c as u8) else {
                 unreachable!()
             };
-            let Val::I32(gid) = self.compute_id("groupId.i32", 94, c as u8) else {
+            // (In x with the first group of the part that runs added.)
+            let Val::I32(gid) = self.group_id(c as u8) else {
                 unreachable!()
             };
             let g = self.s.m.i32(dim);

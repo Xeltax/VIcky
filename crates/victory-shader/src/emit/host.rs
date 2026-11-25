@@ -1037,6 +1037,30 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_with(root, pso, d, None)
+    }
+
+    /// [`Host::dispatch`] as the runtime runs a dispatch of more groups in
+    /// x than one dispatch runs: in parts of at most 65,535 groups, each
+    /// after setting the number of its first group at `base` (root
+    /// parameter, dword: the program's `USER_GROUP_BASE`), 0 again after.
+    pub fn dispatch_in_parts(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        base: (u32, u32),
+    ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_with(root, pso, d, Some(base))
+    }
+
+    fn dispatch_with(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        base: Option<(u32, u32)>,
+    ) -> Result<Vec<Vec<u32>>, String> {
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
@@ -1403,7 +1427,19 @@ impl Host {
                 }
             }
             let [x, y, z] = d.groups;
-            list.Dispatch(x, y, z);
+            match base {
+                None => list.Dispatch(x, y, z),
+                Some((param, dword)) => {
+                    const PART: u32 = 65_535;
+                    let mut first = 0;
+                    while first < x {
+                        list.SetComputeRoot32BitConstant(param, first, dword);
+                        list.Dispatch((x - first).min(PART), y, z);
+                        first += PART;
+                    }
+                    list.SetComputeRoot32BitConstant(param, 0, dword);
+                }
+            }
             for (r, size, n, rb) in &uavs {
                 // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
