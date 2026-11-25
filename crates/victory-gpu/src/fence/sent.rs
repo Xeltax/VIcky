@@ -3,7 +3,9 @@
 //! to the card, not when the layer has landed them (the card done, what
 //! their shaders wrote copied back) (`VICTORY_FENCE_SENT=1`; off by
 //! default, and idle without submissions sent ahead, `crate::host::late`).
-//! Every other signal is as before.
+//! Every other signal is as before. While such a value is ahead, a byte
+//! both the card and the title changed is the title's in the relay's
+//! merges ("The title's writes after a value is published").
 //!
 //! # Why
 //!
@@ -82,16 +84,10 @@
 //!    back, bottom-of-pipe writes done): an upper bound of what could have
 //!    been read stale (it cannot see the title's reads).
 //! 2. write memory the frame before's shaders write (a buffer reused before
-//!    its copy-back landed). The relay's merge (on by default) stores only
-//!    the bytes the card changed (`crate::shadow`'s `merge_piece`), so the
-//!    title's other bytes stay; a byte both wrote ends as the card's, the
-//!    title's write lost (without the relay, `back_piece`, as the title's).
-//!    `VICTORY_FENCE_SENT_CHECK=1` counts those bytes while a value is
-//!    published ahead (the pace line; `VICTORY_MERGE_RACE=1` sees only title
-//!    writes between a merge's read and its write). A submission prepared
-//!    before the landing puts the title's bytes there into the copies
-//!    beside the shaders' writes (late stage 2: "title bytes put in under
-//!    flights' shader writes").
+//!    its copy-back landed). While a value is published ahead, the relay's
+//!    merges keep the title's byte where the card and the title both
+//!    changed one, as the console's order has it: "The title's writes after
+//!    a value is published", below.
 //! 3. write memory the frame before's lists read (constants, upload rings)
 //!    before those lists ran. Their copies were brought up when they were
 //!    prepared; a later refresh of a copy in the PC's memory may reach a
@@ -112,6 +108,90 @@
 //! of upload memory that do not wait are checked when the flights land
 //! ("fills that read bytes a flight then changed", which must stay 0), and
 //! a blocking fence wait of the title settles everything.
+//!
+//! # The title's writes after a value is published
+//!
+//! On the console the card's writes before a signal are done when its value
+//! is reached, so a byte the title writes after it read the value is
+//! written after them, and the title's byte stays. Here the frame before's
+//! flights may still be on the card, or being landed, when the title is
+//! told. The relay's merge decides per byte (`crate::shadow`'s
+//! `merge_piece`) from what the copy holds now (`now`, the card's bytes),
+//! the copy's reference (`held`: the copy's bytes when the flight was
+//! prepared, with the title's bytes put in since by `merge_under_writes`
+//! and what earlier merges took from the card) and title memory as just
+//! read (`title`). A byte the card changed (`now` differs from `held`) went
+//! into title memory whatever `title` held; every other byte stays the
+//! title's.
+//!
+//! What run RT55b's check counted (about 8,900 bytes a frame) were bytes
+//! the card AND the title changed since the reference, to different values:
+//! its test was `now != held && title != held && title != now`. A byte only
+//! the title changed was never among them, and the merge never puts the
+//! card's over one (it takes nothing where `now` equals `held`). The title's
+//! own writes since the reference are seen in two ways only: as `title`
+//! differing from `held` at the merge, or put into the copy and its
+//! reference when a submission prepared in between refreshes the range
+//! ("title bytes put in under flights' shader writes", under 5 KB a frame
+//! in RT55b). In both the card's byte won where a shader wrote it too
+//! (after the putting in, for a copy in the PC's memory; a copy in the
+//! card's memory leaves bytes put in out of the merge until the card has
+//! them).
+//!
+//! The rule now, while a value is published ahead ([`keeping`], asked
+//! after title memory was read): where the card and the title both changed
+//! a byte, the title's stays, and the reference takes the card's (the copy
+//! holds it; the next merge must not take it again). The flights merged
+//! then are those before the published signal (and any behind it in the
+//! same landing, merged with them), so the title has been told they are
+//! done:
+//!
+//! - a title write after the value was published comes after the card's on
+//!   the console: the title's byte, as there;
+//! - a title write between the flight's preparing and the publishing (the
+//!   two cannot be told apart here) is the title writing memory a shader of
+//!   its own may be writing, without a wait: a race on the console too, and
+//!   the title's byte is one the console could end with;
+//! - it is the rule the waited copy-back has always had (`back_piece`, the
+//!   title's byte where both changed: a shader's byte computed from older
+//!   data once broke a title object).
+//!
+//! Copies in the card's memory merged with a wait (`card_merge`, without
+//! the relay) take the same rule while a value is ahead.
+//!
+//! The title's bytes put into a copy in the PC's memory while a value is
+//! ahead (`merge_under_writes`) go into the copy and its reference, so a
+//! shader of the frame before that writes one afterwards would show as a
+//! change of the card's alone: they are noted with the stretch's number
+//! (`crate::fence::ahead_period`), and a merge in the same stretch keeps
+//! the title's byte there too. In a copy in the card's memory they go up on
+//! the queue behind the flights, and the merge skips them already. Left as
+//! it is: such a byte is the card's for the next submission's shaders if a
+//! shader of the frame before writes it after it was put into a copy in the
+//! PC's memory (the copy is shared, and only a wait orders the two). A byte
+//! another copy's merge put into title memory (two copies of the same
+//! memory, both written by shaders) looks like the title's to this merge,
+//! and stays as the other copy's.
+//!
+//! A merge stores its stretch, from the first byte the card changed to the
+//! last, as it made it: the title's bytes in between as it read them, so a
+//! title write that lands between that read and the store is put back.
+//! `VICTORY_FENCE_SENT_KEEP_TITLE=1` ([`keep_exact`]) stores only the
+//! 4-byte words the merge took a byte of the card's in (shaders store
+//! words): a title byte in a word the card did not write is never stored.
+//! Off by default: it is a store per run of such words instead of one per
+//! stretch, which may cost time where the card's bytes are scattered.
+//!
+//! `VICTORY_FENCE_SENT_CHECK=1` counts, while a value is ahead (the pace
+//! line): the bytes both changed (kept as the title's: what the check
+//! counted before as put under the card's), and of the title writes made
+//! between a merge's read and its store (title memory read once more just
+//! before the store; a lower bound, a write during the store itself is not
+//! seen), the bytes in words the merge took nothing of the card's in that
+//! the store put back to an older value (title-only writes lost: 0 with
+//! `VICTORY_FENCE_SENT_KEEP_TITLE=1`, which never stores such a word) and
+//! those in words it took the card's bytes in (a race on the word, lost to
+//! the card's).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -129,14 +209,48 @@ pub(crate) fn on() -> bool {
     })
 }
 
-/// Diagnostics: whether the relay's merges count the title's bytes they put
-/// the card's over while a value is published ahead
-/// (`VICTORY_FENCE_SENT_CHECK=1`; one more pass over the merged bytes then,
-/// on the landing thread).
+/// Diagnostics: whether the relay's merges count, while a value is
+/// published ahead, the bytes both the card and the title changed and the
+/// title writes their stores met (`VICTORY_FENCE_SENT_CHECK=1`; one more
+/// pass over the merged bytes and one more read of each stretch stored,
+/// on the landing thread). The module's docs, "The title's writes after a
+/// value is published", say what each count is.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn check() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| on() && std::env::var_os("VICTORY_FENCE_SENT_CHECK").is_some_and(|v| v == "1"))
+}
+
+/// With the switch, while a value is published ahead of its landing: the
+/// number of that stretch of time (`crate::fence::ahead_period`), and the
+/// relay's merges keep the title's byte where the card and the title both
+/// changed one (`crate::shadow`'s `Both::Title`). None otherwise, at the
+/// cost of a look at a counter: the card's byte, as before.
+pub(crate) fn keeping() -> Option<u64> {
+    if !on() {
+        return None;
+    }
+    super::ahead_period()
+}
+
+/// Whether, while a value is published ahead, the relay's merges store into
+/// title memory only the 4-byte words they took a byte of the card's in
+/// (`VICTORY_FENCE_SENT_KEEP_TITLE=1`, with the switch; off by default: a
+/// store per run of such words, not one per stretch, which may cost time
+/// where the card's bytes are scattered). Without it a merge stores its
+/// whole stretch, the title's bytes as it read them included, and a title
+/// write that lands between that read and the store is put back.
+pub(crate) fn keep_exact() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let exact = on() && std::env::var_os("VICTORY_FENCE_SENT_KEEP_TITLE").is_some_and(|v| v == "1");
+        if exact {
+            tracing::info!(
+                "while a frame-begin value is published ahead, the relay's merges store only the words the card wrote into title memory (VICTORY_FENCE_SENT_KEEP_TITLE=1)"
+            );
+        }
+        exact
+    })
 }
 
 /// What a signal of the title's is to [`Begins`].

@@ -178,6 +178,22 @@ pub(crate) fn ahead() -> bool {
     AHEAD.load(Ordering::Relaxed) > 0
 }
 
+/// VIcky ([`sent`]): the stretches of time in which a value is published
+/// ahead of its landing, numbered: counted up each time a fence goes ahead
+/// (before [`AHEAD`] is), so that what is noted in one stretch can be told
+/// from what was noted in an earlier one (`crate::shadow`'s title bytes put
+/// into a copy while a value was ahead).
+static PERIOD: AtomicU64 = AtomicU64::new(0);
+
+/// VIcky ([`sent`]): whether a fence's value is published ahead of its
+/// landing now, and if so the number of that stretch ([`PERIOD`]). The
+/// relay's merges ask it after they read title memory: a title write they
+/// saw that was made after the title read the published value finds the
+/// count up (it went up before the value was stored).
+pub(crate) fn ahead_period() -> Option<u64> {
+    (AHEAD.load(Ordering::Acquire) > 0).then(|| PERIOD.load(Ordering::Acquire))
+}
+
 /// VIcky ([`sent`]): publishes `value` to the title now (the fence's memory,
 /// its events), ahead of the landing of the signal that carries it, which
 /// still comes ([`set`]). Whether it went ahead; false if the fence is
@@ -192,7 +208,8 @@ pub(crate) fn set_early(this: This, value: u64) -> bool {
             return false;
         }
         if !was {
-            AHEAD.fetch_add(1, Ordering::Relaxed);
+            PERIOD.fetch_add(1, Ordering::AcqRel);
+            AHEAD.fetch_add(1, Ordering::AcqRel);
         }
     }
     fence.value.store(value, Ordering::Release);
@@ -277,9 +294,14 @@ pub(crate) mod pace {
     /// microseconds since the publishing; landings below a published value
     /// (not stored); bytes copied back into title memory and bottom-of-pipe
     /// writes done while a published value was ahead of its landing; and
-    /// with `VICTORY_FENCE_SENT_CHECK=1` the title's bytes the copy-back put
-    /// the card's over meanwhile.
-    static SENT: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+    /// with `VICTORY_FENCE_SENT_CHECK=1`, of the relay's merges meanwhile
+    /// (`super::sent`, "The title's writes after a value is published"):
+    /// bytes both the card and the title changed since the copy's reference
+    /// (kept as the title's), title bytes the card did not change whose
+    /// newer value a merge's store put back to an older one, and bytes the
+    /// card changed that a merge's store put over a title write made after
+    /// the merge read title memory.
+    static SENT: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
     const S_TAKEN: usize = 0;
     const S_FIRST: usize = 1;
     const S_NONE: usize = 2;
@@ -295,7 +317,9 @@ pub(crate) mod pace {
     const S_BEHIND: usize = 12;
     const S_BACK_BYTES: usize = 13;
     const S_BACK_WRITES: usize = 14;
-    const S_LOST: usize = 15;
+    const S_BOTH: usize = 15;
+    const S_TITLE_ONLY: usize = 16;
+    const S_BOTH_LATE: usize = 17;
 
     /// Values published when sent and not landed yet: fence, value, when.
     static EARLY: Mutex<Vec<(usize, u64, Instant)>> = Mutex::new(Vec::new());
@@ -500,10 +524,25 @@ pub(crate) mod pace {
     }
 
     /// With `VICTORY_FENCE_SENT_CHECK=1`, while a published value is ahead:
-    /// `bytes` the title had written that a relay merge put the card's over
-    /// (`crate::shadow`'s `lost_under_published`).
-    pub(crate) fn lost_ahead(bytes: u64) {
-        SENT[S_LOST].fetch_add(bytes, Ordering::Relaxed);
+    /// `bytes` the card and the title both changed since the copy's
+    /// reference, found by a relay merge (`crate::shadow`'s
+    /// `both_under_published`). The merge keeps the title's there now; it
+    /// put the card's over them before (these were the check's "title bytes
+    /// the copy-back put the card's over").
+    pub(crate) fn both_ahead(bytes: u64) {
+        SENT[S_BOTH].fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// With `VICTORY_FENCE_SENT_CHECK=1`, while a published value is ahead:
+    /// of the title writes a relay merge's store met (made between the
+    /// merge's read of title memory and its store, `crate::shadow`'s
+    /// `stored_over`), `title_only` bytes in words the merge took nothing of
+    /// the card's in, put back to an older value (must be 0 with
+    /// `VICTORY_FENCE_SENT_KEEP_TITLE=1`), and `late` bytes in words it took
+    /// the card's bytes in (a race on the word).
+    pub(crate) fn stored_ahead(title_only: u64, late: u64) {
+        SENT[S_TITLE_ONLY].fetch_add(title_only, Ordering::Relaxed);
+        SENT[S_BOTH_LATE].fetch_add(late, Ordering::Relaxed);
     }
 
     /// Once a frame, on the thread that presents: a line every 256 frames.
@@ -541,7 +580,19 @@ pub(crate) mod pace {
                 s[S_BACK_BYTES] / frames / 1024.0,
                 s[S_BACK_WRITES] / frames,
                 if super::sent::check() {
-                    format!(", title bytes the copy-back put the card's over {:.1} (VICTORY_FENCE_SENT_CHECK=1)", s[S_LOST] / frames)
+                    format!(
+                        "; of the relay's merges meanwhile (VICTORY_FENCE_SENT_CHECK=1): bytes the card and the title both changed {:.1} (kept as the title's), \
+                         title-only bytes a merge's store put back to an older value {:.1}, card bytes a merge's store put over a title write made after its read {:.1} \
+                         (stores of {})",
+                        s[S_BOTH] / frames,
+                        s[S_TITLE_ONLY] / frames,
+                        s[S_BOTH_LATE] / frames,
+                        if super::sent::keep_exact() {
+                            "the card's words only, VICTORY_FENCE_SENT_KEEP_TITLE=1"
+                        } else {
+                            "whole stretches, VICTORY_FENCE_SENT_KEEP_TITLE unset"
+                        },
+                    )
                 } else {
                     String::new()
                 },
@@ -644,7 +695,9 @@ mod tests {
         };
         // The frame-begin value 27 is published while 25 and 26 (the frame
         // before's) are still behind flights.
+        assert_eq!(ahead_period(), None, "nothing is ahead yet");
         assert!(set_early(f, 27));
+        let period = ahead_period().expect("a value is ahead");
         assert_eq!(completed(f), 27, "the title reads the published value");
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
@@ -661,12 +714,19 @@ mod tests {
         assert!(!is_set(at_28));
         // Publishing what the fence holds already does nothing.
         assert!(!set_early(f, 27));
+        assert_eq!(ahead_period(), Some(period), "the same stretch while the value is ahead");
         // Its own landing ends it; the signals after it are as before.
         set(f, 27);
         assert_eq!((completed(f), landed(f)), (27, 27));
+        assert_eq!(ahead_period(), None, "the stretch ended with the landing");
         set(f, 28);
         assert_eq!((completed(f), landed(f)), (28, 28));
         assert!(is_set(at_28));
+        // The next value published ahead opens a new stretch.
+        assert!(set_early(f, 30));
+        assert!(ahead_period().is_some_and(|p| p > period));
+        set(f, 30);
+        assert_eq!(ahead_period(), None);
         // SAFETY: ours.
         unsafe {
             CloseHandle(at_27);

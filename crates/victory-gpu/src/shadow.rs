@@ -49,6 +49,13 @@ pub(crate) struct Shadow {
     /// GPU wrote differs. Room for the whole copy; only those ranges' bytes
     /// are set (and read).
     before: Mutex<Option<Vec<u8>>>,
+    /// VIcky (`crate::fence::sent`), for a copy in the PC's memory: the
+    /// offsets the title's bytes were put into (the copy and the snapshot,
+    /// [`Shadow::merge_under_writes`]) while a value was published ahead of
+    /// its landing, as (from, to, that stretch's number,
+    /// `crate::fence::ahead_period`): a merge in the same stretch keeps the
+    /// title's bytes there ([`Both::Put`]). Locked inside `before`'s lock.
+    put_ahead: Mutex<Vec<(usize, usize, u64)>>,
     /// With snapshots kept ([`keeps`]): which 64 KiB pieces of the snapshot
     /// hold the copy's bytes as they are now, and whether the snapshot is
     /// counted in [`KEPT_BYTES`].
@@ -727,24 +734,63 @@ impl Flights {
     }
 }
 
+/// Whose byte a merge keeps where the card and the title both changed one
+/// since the copy's reference was taken ([`merge_piece`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Both {
+    /// The card's: the relay's rule (a title write the merge finds there
+    /// was made while the card ran, without a wait for it).
+    Card,
+    /// The title's: while a value is published ahead of its landing
+    /// (`crate::fence::sent`, "The title's writes after a value is
+    /// published"), the title having been told the flights are done.
+    Title,
+    /// The title's wherever the card changed a byte: bytes the title put
+    /// into the copy and its reference while a value was published ahead
+    /// (`Shadow::merge_under_writes`), which `title` no longer tells from
+    /// the reference.
+    Put,
+}
+
+/// The rule of the relay's merges now: [`Both::Title`] while a value is
+/// published ahead (with `crate::fence::sent`), with the number of that
+/// stretch; else [`Both::Card`]. Asked after title memory is read.
+fn both_now() -> (Both, Option<u64>) {
+    match crate::fence::sent::keeping() {
+        Some(period) => (Both::Title, Some(period)),
+        None => (Both::Card, None),
+    }
+}
+
 /// The relay's merge of a stretch of a copy ([`relay`]). `now` is what the
 /// card's memory holds, read once; `held` is the copy's reference for the
 /// stretch (its snapshot, or the CPU's side of a copy in the card's
 /// memory): what the card's memory held when it was last looked at;
 /// `title` is title memory as just read. Every byte the card changed
-/// (`now` differs from `held`) goes into `title` and into `held`; every
-/// other byte of both stays as it is, so a byte the title wrote and the
-/// card did not keeps the title's value. Whether `title` changed.
+/// (`now` differs from `held`) goes into `held`, and into `title` unless
+/// the title changed it too (`title` differs from `held`) and `both` says
+/// the title's stays; every other byte of both stays as it is, so a byte
+/// the title wrote and the card did not keeps the title's value. Whether
+/// `title` changed.
 ///
 /// Nothing is stored into `now`'s source: the card may be writing it for a
 /// later flight at this moment, and a store there, even of the value just
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
-fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8], both: Both) -> bool {
+    // Without a branch, as before: `keep` is all ones where the title's
+    // byte stays though the card changed it.
+    let (keep, put) = match both {
+        Both::Card => (0u8, 0u8),
+        Both::Title => (0xff, 0),
+        Both::Put => (0xff, 0xff),
+    };
     let mut differs = 0u8;
     for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
+        let titled = put | if *t != *h { 0xffu8 } else { 0 };
+        let take = wrote & !(titled & keep);
+        let merged = (*t & !take) | (*n & take);
         differs |= merged ^ *t;
         *t = merged;
         *h = (*h & !wrote) | (*n & wrote);
@@ -753,29 +799,126 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 }
 
 /// VIcky (`crate::fence::sent`; diagnostics, `VICTORY_FENCE_SENT_CHECK=1`):
-/// before a relay merge, while a fence's value is published ahead of its
-/// landing, the bytes the card changed (`now` differs from `held`) that the
-/// title changed too since the reference was taken (`title`, as just read,
-/// differs from both). The merge puts the card's over them: the title's
-/// writes lost, as a title that reuses memory the frame before's shaders
-/// write would lose them once told early that those are done.
+/// before a relay merge that keeps the title's bytes ([`Both::Title`],
+/// [`Both::Put`]: a value is published ahead), the bytes the card and the
+/// title both changed ([`both_changed`]). These were put under the card's
+/// before; they are kept as the title's now.
 #[cfg(feature = "diagnostics")]
-fn lost_under_published(now: &[u8], held: &[u8], title: &[u8]) {
-    if !crate::fence::sent::check() || !crate::fence::ahead() {
+fn both_under_published(now: &[u8], held: &[u8], title: &[u8], both: Both) {
+    if both == Both::Card || !crate::fence::sent::check() {
         return;
     }
-    let lost = title_bytes_lost(now, held, title);
-    if lost > 0 {
-        crate::fence::pace::lost_ahead(lost as u64);
+    let n = both_changed(now, held, title, both == Both::Put);
+    if n > 0 {
+        crate::fence::pace::both_ahead(n as u64);
     }
 }
 
-/// [`lost_under_published`]'s count: the bytes where the card and the title
-/// both changed `held`, to different values ([`merge_piece`] keeps the
-/// card's there).
+/// [`both_under_published`]'s count: the bytes the card changed (`now`
+/// differs from `held`) that the title changed too, to another value
+/// (`title` differs from both). With `put` (the title's bytes put into the
+/// copy, [`Both::Put`]) every byte the card changed to another value than
+/// the title's.
 #[cfg(any(test, feature = "diagnostics"))]
-fn title_bytes_lost(now: &[u8], held: &[u8], title: &[u8]) -> usize {
-    now.iter().zip(held).zip(title).filter(|&((n, h), t)| n != h && t != h && t != n).count()
+fn both_changed(now: &[u8], held: &[u8], title: &[u8], put: bool) -> usize {
+    now.iter().zip(held).zip(title).filter(|&((n, h), t)| n != h && (put || t != h) && t != n).count()
+}
+
+/// The 4-byte words of title memory a merged stretch at `address` takes a
+/// byte of the card's in (`merged` differs from `read`, title memory as the
+/// merge read it), in runs, as (offset, bytes): what a merge stores with
+/// `VICTORY_FENCE_SENT_KEEP_TITLE=1` ([`crate::fence::sent::keep_exact`]).
+/// No byte of a word outside them is stored, so a title write there that
+/// lands between the merge's read and its store stays.
+fn card_words(address: usize, read: &[u8], merged: &[u8]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    word_runs(address, read, merged, |at, n| runs.push((at, n)));
+    runs
+}
+
+/// VIcky (`crate::fence::sent`; diagnostics and tests): of a merged stretch
+/// at `address` that title memory read `read` when the merge read it and
+/// `again` right before its store, which stores `merged`'s bytes in
+/// `stored` ((offset, bytes); all of it if none): the title bytes written
+/// in between that the store puts something else over, as (those in words
+/// the merge took nothing of the card's in: a title write put back to an
+/// older value for nothing; those in words it took the card's bytes in: a
+/// race on the word, the card's kept).
+#[cfg(any(test, feature = "diagnostics"))]
+fn stored_over(address: usize, read: &[u8], merged: &[u8], again: &[u8], stored: Option<&[(usize, usize)]>) -> (usize, usize) {
+    let n = read.len().min(merged.len()).min(again.len());
+    let whole = [(0, n)];
+    let stored = stored.unwrap_or(&whole);
+    // The words the merge took a byte of the card's in, byte by byte.
+    let mut in_card = vec![false; n];
+    for (at, len) in card_words(address, &read[..n], &merged[..n]) {
+        in_card[at..at + len].fill(true);
+    }
+    let (mut title_only, mut late) = (0, 0);
+    for &(at, len) in stored {
+        for i in at..(at + len).min(n) {
+            if again[i] == read[i] || again[i] == merged[i] {
+                continue;
+            }
+            if in_card[i] {
+                late += 1;
+            } else {
+                title_only += 1;
+            }
+        }
+    }
+    (title_only, late)
+}
+
+/// [`stored_over`] for a store about to be made, while a value is published
+/// ahead (`VICTORY_FENCE_SENT_CHECK=1`): title memory is read once more.
+#[cfg(feature = "diagnostics")]
+fn store_check(address: usize, read: Option<&[u8]>, merged: &[u8], stored: Option<&[(usize, usize)]>) {
+    let Some(read) = read else {
+        return;
+    };
+    let mut again = vec![0u8; merged.len()];
+    if !crate::host::read_into(address as *const u8, &mut again) {
+        return;
+    }
+    let (title_only, late) = stored_over(address, read, merged, &again, stored);
+    if title_only + late > 0 {
+        crate::fence::pace::stored_ahead(title_only as u64, late as u64);
+    }
+}
+
+/// Stores `merged` into title memory at `address`: all of it, or only the
+/// runs `stored` ((offset, bytes) in order) if given.
+fn write_back(address: usize, merged: &[u8], stored: Option<&[(usize, usize)]>) {
+    match stored {
+        None => crate::host::write_mapped(address as *mut u8, merged.as_ptr(), merged.len()),
+        Some(runs) => {
+            for &(at, n) in runs {
+                crate::host::write_mapped((address + at) as *mut u8, merged[at..].as_ptr(), n);
+            }
+        }
+    }
+}
+
+/// The parts of offsets `[at, at + n)` of a copy that hold title bytes put
+/// in while a value was published ahead in stretch `period` (`put`: from,
+/// to, stretch; [`Shadow::merge_under_writes`]), as (offset, end) in order.
+/// Notes of other stretches are dropped: a merge in a later one is of
+/// flights sent after them.
+fn put_in(put: &mut Vec<(usize, usize, u64)>, at: usize, n: usize, period: u64) -> Vec<(usize, usize)> {
+    put.retain(|p| p.2 == period);
+    let mut parts: Vec<(usize, usize)> =
+        put.iter().filter(|p| p.0 < at + n && p.1 > at).map(|p| (p.0.max(at), p.1.min(at + n))).collect();
+    parts.sort_unstable();
+    // Notes that overlap (the same bytes put in twice) are one part.
+    let mut joined: Vec<(usize, usize)> = Vec::with_capacity(parts.len());
+    for (a, b) in parts {
+        match joined.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => joined.push((a, b)),
+        }
+    }
+    joined
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -872,8 +1015,17 @@ static MERGE_RACE: Mutex<MergeRace> =
 /// A lower bound: a title write that lands after this read (while the
 /// write-back itself runs) is not seen, nor one that wrote a byte and then
 /// its old value again. Costs one more read and two compares of every
-/// stretch written back, on the thread that merges.
-fn merge_race(read: Option<&[u8]>, copy: (u64, u64), address: usize, merged: &[u8], which: &'static str) {
+/// stretch written back, on the thread that merges. `stored`: the runs the
+/// write-back stores, if not all of the stretch
+/// (`VICTORY_FENCE_SENT_KEEP_TITLE=1`).
+fn merge_race(
+    read: Option<&[u8]>,
+    copy: (u64, u64),
+    address: usize,
+    merged: &[u8],
+    stored: Option<&[(usize, usize)]>,
+    which: &'static str,
+) {
     if !merge_race_on() {
         return;
     }
@@ -885,7 +1037,7 @@ fn merge_race(read: Option<&[u8]>, copy: (u64, u64), address: usize, merged: &[u
     let mut runs: Vec<(usize, usize)> = Vec::new();
     word_runs(address, read, merged, |off, len| runs.push((off, len)));
     let whole = [(0, n)];
-    let looked: &[(usize, usize)] = &whole;
+    let looked: &[(usize, usize)] = stored.unwrap_or(&whole);
     let mut again = vec![0u8; n];
     let (mut put_back, mut both, mut first) = (0u64, 0u64, None);
     if crate::host::read_into(address as *const u8, &mut again) {
@@ -952,7 +1104,7 @@ fn merge_race(read: Option<&[u8]>, copy: (u64, u64), address: usize, merged: &[u
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, changed_runs, merge_piece, outside, title_bytes_lost};
+    use super::{Both, Flights, both_changed, card_words, changed_runs, merge_piece, outside, put_in, stored_over};
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
@@ -997,7 +1149,7 @@ mod relay_tests {
         }
         let title0 = title.clone();
         let mut held = held0.clone();
-        assert!(merge_piece(&now, &mut held, &mut title));
+        assert!(merge_piece(&now, &mut held, &mut title, Both::Card));
         for at in 0..200 {
             if now[at] != held0[at] {
                 assert_eq!((title[at], held[at]), (now[at], now[at]), "the card's byte at {at}");
@@ -1007,22 +1159,206 @@ mod relay_tests {
         }
         // Again with nothing new: nothing changes and nothing is reported.
         let (title1, held1) = (title.clone(), held.clone());
-        assert!(!merge_piece(&now, &mut held, &mut title));
+        assert!(!merge_piece(&now, &mut held, &mut title, Both::Card));
         assert_eq!((title, held), (title1, held1));
     }
 
-    /// VIcky (`crate::fence::sent`): the title's bytes a merge puts the
-    /// card's over are those both changed, to different values.
+    /// VIcky (`crate::fence::sent`): the check's "both changed" are the
+    /// bytes the card and the title both changed, to different values; a
+    /// byte only the title changed is never among them. Bytes the title put
+    /// into the copy count wherever the card changed them to another value.
     #[test]
-    fn title_bytes_lost_are_those_both_changed_differently() {
+    fn both_changed_are_bytes_the_card_and_the_title_changed_differently() {
         let held = [1u8, 2, 3, 4, 5, 6];
         let now = [1u8, 20, 30, 40, 5, 6]; // the card wrote bytes 1, 2, 3
         let title = [1u8, 2, 33, 40, 55, 6]; // the title wrote bytes 2, 3, 4
-        // 2: both, to different values (lost); 3: both, the same value; 1:
-        // the card alone; 4: the title alone.
-        assert_eq!(title_bytes_lost(&now, &held, &title), 1);
-        assert_eq!(title_bytes_lost(&now, &held, &held), 0, "the title wrote nothing");
-        assert_eq!(title_bytes_lost(&held, &held, &title), 0, "the card wrote nothing");
+        // 2: both, to different values; 3: both, the same value; 1: the
+        // card alone; 4: the title alone.
+        assert_eq!(both_changed(&now, &held, &title, false), 1);
+        assert_eq!(both_changed(&now, &held, &held, false), 0, "the title wrote nothing");
+        assert_eq!(both_changed(&held, &held, &title, false), 0, "the card wrote nothing");
+        // Put in (the reference holds the title's bytes): 1 and 2 differ
+        // from the title's, 3 does not.
+        assert_eq!(both_changed(&now, &held, &title, true), 2);
+    }
+
+    /// VIcky (`crate::fence::sent`): a byte only the title changed is kept
+    /// and a byte only the card changed is taken, under either rule; a byte
+    /// both changed is the card's under [`Both::Card`] and the title's under
+    /// [`Both::Title`]; the reference takes the card's byte wherever the
+    /// card changed one, so a later merge does not take it again. Under
+    /// [`Both::Put`] (bytes the title put into the copy) the title's byte
+    /// stays wherever the card changed one.
+    #[test]
+    fn each_byte_under_each_rule() {
+        // 0: nobody; 1: the card alone; 2: the title alone; 3: both, to
+        // different values; 4: both, to the same value.
+        let held = [10u8, 11, 12, 13, 14];
+        let now = [10u8, 21, 12, 23, 24];
+        let title = [10u8, 11, 32, 33, 24];
+        for (both, three) in [(Both::Card, 23u8), (Both::Title, 33)] {
+            let (mut h, mut t) = (held, title);
+            assert!(merge_piece(&now, &mut h, &mut t, both));
+            assert_eq!(t[0], 10, "{both:?}: untouched");
+            assert_eq!(t[1], 21, "{both:?}: the card's change is taken");
+            assert_eq!(t[2], 32, "{both:?}: the title's change is kept");
+            assert_eq!(t[3], three, "{both:?}: both changed");
+            assert_eq!(t[4], 24, "{both:?}: both wrote the same value");
+            assert_eq!(h, now, "{both:?}: the reference takes what the copy holds");
+            // A later merge with nothing new changes nothing.
+            let t1 = t;
+            assert!(!merge_piece(&now, &mut h, &mut t, Both::Card), "{both:?}");
+            assert_eq!(t, t1, "{both:?}: the title's byte is not taken back");
+        }
+        let (mut h, mut t) = (held, title);
+        assert!(!merge_piece(&now, &mut h, &mut t, Both::Put), "nothing of the card's is taken");
+        assert_eq!(t, title);
+        assert_eq!(h, now);
+    }
+
+    /// VIcky (`crate::fence::sent`), a model of a copy in the PC's memory:
+    /// flight F (the frame before's) is in the air; the frame-begin value is
+    /// published; the title, told F is done, rewrites bytes F's shader
+    /// writes (as on the console, after the card's writes) and others; F
+    /// lands. The title's bytes stay and F's other bytes arrive; under the
+    /// old rule the title's rewritten bytes were lost (what RT55b's check
+    /// counted). A later flight that does not write them leaves them alone.
+    #[test]
+    fn a_title_write_after_the_publishing_survives_the_merge_of_the_frame_before() {
+        const N: usize = 32;
+        let base: Vec<u8> = (0..N as u32).map(|i| (i * 3) as u8).collect();
+        let (mut copy, snap) = (base.clone(), base.clone());
+        // F's shaders write 4..12 on the card.
+        for at in 4..12 {
+            copy[at] = 0xf0;
+        }
+        // Published: the title rewrites 8..10 (F's too) and 20 (its own).
+        let mut title = base.clone();
+        for at in [8usize, 9, 20] {
+            title[at] = 0x77;
+        }
+        let land = |both: Both| {
+            let (mut s, mut t) = (snap.clone(), title.clone());
+            assert!(merge_piece(&copy, &mut s, &mut t, both));
+            (s, t)
+        };
+        let (mut s, mut t) = land(Both::Title);
+        for at in (4..8).chain(10..12) {
+            assert_eq!(t[at], 0xf0, "F's byte at {at}");
+        }
+        assert_eq!((t[8], t[9], t[20]), (0x77, 0x77, 0x77), "the title wrote them after F, as it was told");
+        assert_eq!(both_changed(&copy, &snap, &title, false), 2);
+        // The old rule: the two bytes both changed went to the card's.
+        let (_, old) = land(Both::Card);
+        assert_eq!((old[8], old[9], old[20]), (0xf0, 0xf0, 0x77));
+        // Flight G, later, writes 0..2 only, with no value ahead: the
+        // title's bytes stay.
+        for at in 0..2 {
+            copy[at] = 0x99;
+        }
+        assert!(merge_piece(&copy, &mut s, &mut t, Both::Card));
+        assert_eq!((t[0], t[1], t[8], t[9]), (0x99, 0x99, 0x77, 0x77));
+    }
+
+    /// VIcky (`crate::fence::sent`), a model of a copy in the PC's memory:
+    /// while a value is ahead, a submission's preparing puts the title's
+    /// rewritten byte into the copy and the snapshot
+    /// (`merge_under_writes`); F's shader, still running, writes it again
+    /// afterwards. `title` then equals the reference there, so only the
+    /// note of the bytes put in ([`Both::Put`]) keeps the title's.
+    #[test]
+    fn a_title_byte_put_in_while_ahead_survives_a_later_shader_write() {
+        let (mut copy, mut snap, mut title) = (vec![5u8; 16], vec![5u8; 16], vec![5u8; 16]);
+        // Published; the title writes 3, and it is put in.
+        title[3] = 0x77;
+        for (at, n) in changed_runs(&title, &snap) {
+            copy[at..at + n].copy_from_slice(&title[at..at + n]);
+            snap[at..at + n].copy_from_slice(&title[at..at + n]);
+        }
+        let put = vec![(3usize, 4usize)];
+        // F's shader writes 2..5 afterwards.
+        for at in 2..5 {
+            copy[at] = 0xf0;
+        }
+        let merge = |rule_outside: Both, put: &[(usize, usize)]| {
+            let (mut s, mut t) = (snap.clone(), title.clone());
+            for (a, b) in outside(0, 16, put.to_vec()) {
+                merge_piece(&copy[a..b], &mut s[a..b], &mut t[a..b], rule_outside);
+            }
+            for &(a, b) in put {
+                merge_piece(&copy[a..b], &mut s[a..b], &mut t[a..b], Both::Put);
+            }
+            t
+        };
+        let t = merge(Both::Title, &put);
+        assert_eq!((t[2], t[3], t[4]), (0xf0, 0x77, 0xf0), "the title's byte put in stays");
+        // Without the note the title's byte looks like the reference's.
+        let t = merge(Both::Title, &[]);
+        assert_eq!(t[3], 0xf0);
+    }
+
+    /// VIcky (`crate::fence::sent`): the notes of title bytes put in hold
+    /// for their stretch only, cut to the range merged and joined where
+    /// they overlap.
+    #[test]
+    fn notes_of_bytes_put_in_hold_for_their_stretch_only() {
+        let mut put = vec![(10, 20, 7), (15, 30, 7), (40, 50, 6), (60, 70, 7)];
+        assert_eq!(put_in(&mut put, 12, 30, 7), vec![(12, 30)], "cut and joined");
+        assert_eq!(put, vec![(10, 20, 7), (15, 30, 7), (60, 70, 7)], "the earlier stretch's note is dropped");
+        assert_eq!(put_in(&mut put, 0, 100, 7), vec![(10, 30), (60, 70)]);
+        assert_eq!(put_in(&mut put, 0, 100, 8), vec![], "a new stretch: none holds");
+        assert!(put.is_empty());
+    }
+
+    /// VIcky (`crate::fence::sent`): the words a store with
+    /// `VICTORY_FENCE_SENT_KEEP_TITLE=1` takes hold every byte the merge
+    /// took from the card and no word without one, cut on title addresses.
+    #[test]
+    fn the_card_words_hold_every_card_byte_and_no_other_word() {
+        let read: Vec<u8> = (0..40u32).map(|i| i as u8).collect();
+        let mut merged = read.clone();
+        for at in [1usize, 2, 9, 10, 11, 12, 30] {
+            merged[at] ^= 0x80;
+        }
+        // The stretch starts 2 bytes into a word of title memory.
+        let address = 0x1002;
+        let runs = card_words(address, &read, &merged);
+        // Words of title memory in the stretch's offsets: [0, 2), [2, 6),
+        // [6, 10), [10, 14), ...; words in a row are one run.
+        assert_eq!(runs, vec![(0, 14), (30, 4)]);
+        for (at, (r, m)) in read.iter().zip(&merged).enumerate() {
+            let held = runs.iter().any(|&(a, n)| a <= at && at < a + n);
+            if r != m {
+                assert!(held, "the card's byte at {at}");
+            }
+        }
+        let bytes: usize = runs.iter().map(|r| r.1).sum();
+        assert_eq!(bytes, 18, "four words and the stretch's first two bytes, nothing else");
+        // Nothing the card changed: nothing to store.
+        assert!(card_words(address, &read, &read).is_empty());
+    }
+
+    /// VIcky (`crate::fence::sent`): title writes made between a merge's
+    /// read and its store, as the check counts them. A store of the whole
+    /// stretch puts a title write in a word the card did not write back to
+    /// the value read (title-only, lost); a store of the card's words only
+    /// never does. In a word the card wrote, the card's byte goes over it
+    /// either way (a race on the word).
+    #[test]
+    fn a_store_of_the_card_words_puts_no_title_only_write_back() {
+        let address = 0x2000;
+        let read = vec![0u8; 16];
+        let mut merged = read.clone();
+        merged[4] = 0xc0; // the card's byte, in word [4, 8)
+        let mut again = read.clone();
+        again[5] = 0x11; // the title, after the read: in the card's word
+        again[12] = 0x22; // the title, after the read: a word of its own
+        again[4] = 0xc0; // the title wrote the card's value: nothing lost
+        assert_eq!(stored_over(address, &read, &merged, &again, None), (1, 1), "the whole stretch");
+        let words = card_words(address, &read, &merged);
+        assert_eq!(words, vec![(4, 4)]);
+        assert_eq!(stored_over(address, &read, &merged, &again, Some(&words)), (0, 1), "the card's words");
+        assert_eq!(stored_over(address, &read, &merged, &read, None), (0, 0), "nothing written in between");
     }
 
     #[test]
@@ -1071,7 +1407,7 @@ mod relay_tests {
         let seen = copy.clone();
         {
             let mut t = title[a.0..a.1].to_vec();
-            assert!(merge_piece(&seen[a.0..a.1], &mut snap[a.0..a.1], &mut t));
+            assert!(merge_piece(&seen[a.0..a.1], &mut snap[a.0..a.1], &mut t, Both::Card));
             title[a.0..a.1].copy_from_slice(&t);
         }
         assert_eq!(copy, seen, "the merge stores nothing into the copy");
@@ -1101,7 +1437,7 @@ mod relay_tests {
         let seen = copy.clone();
         {
             let mut t = title[b.0..b.1].to_vec();
-            assert!(merge_piece(&seen[b.0..b.1], &mut snap[b.0..b.1], &mut t));
+            assert!(merge_piece(&seen[b.0..b.1], &mut snap[b.0..b.1], &mut t, Both::Card));
             title[b.0..b.1].copy_from_slice(&t);
         }
         // B's results are there, never replaced by A's older ones.
@@ -1119,7 +1455,7 @@ mod relay_tests {
         assert_eq!(snap[a.0..b.1], title[a.0..b.1]);
         // A third merge finds nothing.
         let mut t = title.clone();
-        assert!(!merge_piece(&copy, &mut snap, &mut t));
+        assert!(!merge_piece(&copy, &mut snap, &mut t, Both::Card));
     }
 
     /// A model of a copy in the card's memory under the relay: `card` is
@@ -1159,7 +1495,7 @@ mod relay_tests {
         let mut changed = false;
         for (a, b) in outside(0, N, skip) {
             let mut t = title[a..b].to_vec();
-            changed |= merge_piece(&fetched[a..b], &mut cpu[a..b], &mut t);
+            changed |= merge_piece(&fetched[a..b], &mut cpu[a..b], &mut t, Both::Card);
             title[a..b].copy_from_slice(&t);
         }
         assert!(changed);
@@ -1176,7 +1512,7 @@ mod relay_tests {
         // been taken for a shader write and put over the title's.
         let mut wrong_title = title.clone();
         let mut wrong_cpu = cpu.clone();
-        merge_piece(&fetched, &mut wrong_cpu, &mut wrong_title);
+        merge_piece(&fetched, &mut wrong_cpu, &mut wrong_title, Both::Card);
         assert_eq!(wrong_title[30], base[30]);
     }
 }
@@ -2560,6 +2896,7 @@ impl Shadow {
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
+            put_ahead: Mutex::default(),
             kept: Mutex::default(),
             stamp: Mutex::new((u64::MAX, 0, 0)),
             used: AtomicU64::new(crate::host::moment()),
@@ -2869,6 +3206,22 @@ impl Shadow {
 
     /// [`Shadow::relay_merge`], untimed.
     fn relay_merge_timed(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
+        self.relay_merge_as(at, n, now, title, both_now, crate::fence::sent::keep_exact())
+    }
+
+    /// [`Shadow::relay_merge`] with the rule for bytes both the card and the
+    /// title changed given by `rule` ([`both_now`]: asked once title memory
+    /// is read) and, with `exact`, only the card's words stored while it is
+    /// not [`Both::Card`] ([`card_words`]).
+    fn relay_merge_as(
+        &self,
+        at: usize,
+        n: usize,
+        now: &mut Vec<u8>,
+        title: &mut Vec<u8>,
+        rule: impl FnOnce() -> (Both, Option<u64>),
+        exact: bool,
+    ) -> usize {
         let start = self.start as usize;
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
@@ -2904,22 +3257,55 @@ impl Shadow {
         if !crate::host::read_into((start + at) as *const u8, title) {
             return 0;
         }
+        // VIcky (`crate::fence::sent`): asked now that title memory is read.
+        let (both, period) = rule();
+        let exact = exact && both != Both::Card;
+        #[cfg(feature = "diagnostics")]
+        let check = both != Both::Card && crate::fence::sent::check();
+        #[cfg(not(feature = "diagnostics"))]
+        let check = false;
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
-        let as_read = merge_race_on().then(|| title.clone());
-        #[cfg(feature = "diagnostics")]
-        lost_under_published(now, held, title);
-        if !merge_piece(now, held, title) {
+        let as_read = (merge_race_on() || exact || check).then(|| title.clone());
+        // The title's bytes put into the copy while this value was ahead:
+        // the title's wherever the card changed one.
+        let put = match period {
+            Some(period) => put_in(&mut self.put_ahead.lock().unwrap_or_else(|e| e.into_inner()), at, n, period),
+            None => Vec::new(),
+        };
+        let parts: Vec<(usize, usize, Both)> = if put.is_empty() {
+            vec![(at, at + n, both)]
+        } else {
+            let mut parts: Vec<(usize, usize, Both)> = outside(at, at + n, put.clone()).into_iter().map(|(a, b)| (a, b, both)).collect();
+            parts.extend(put.into_iter().map(|(a, b)| (a, b, Both::Put)));
+            parts
+        };
+        let mut changed = false;
+        for (a, b, both) in parts {
+            let (a, b) = (a - at, b - at);
+            #[cfg(feature = "diagnostics")]
+            both_under_published(&now[a..b], &held[a..b], &title[a..b], both);
+            changed |= merge_piece(&now[a..b], &mut held[a..b], &mut title[a..b], both);
+        }
+        if !changed {
             return 0;
         }
+        // With `VICTORY_FENCE_SENT_KEEP_TITLE=1`: only the card's words.
+        let stored = if exact { as_read.as_deref().map(|read| card_words(start + at, read, title)) } else { None };
+        let stored = stored.as_deref();
+        let written = stored.map_or(n, |runs| runs.iter().map(|r| r.1).sum());
         crate::host::shaders_write(start + at, &title[..]);
-        if self.put_back_own(start + at, &title[..]) {
-            return n;
+        #[cfg(feature = "diagnostics")]
+        if check {
+            store_check(start + at, as_read.as_deref(), title, stored);
+        }
+        if self.put_back_own(start + at, &title[..], stored) {
+            return written;
         }
         crate::watch::writing(start + at, n);
-        merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], stored, "pc relay");
+        write_back(start + at, title, stored);
+        written
     }
 
     /// With `crate::inplace::back_own` (`VICTORY_BACK_OWN_VIEW=1`): stores
@@ -2932,7 +3318,9 @@ impl Shadow {
     /// and is reported at a later asking, which every copy then takes,
     /// this one too. False with nothing done if the switch is off or the
     /// memory cannot be written that way (the caller writes as before).
-    fn put_back_own(&self, at: usize, bytes: &[u8]) -> bool {
+    /// `stored`: only those runs of `bytes` ((offset, bytes) in order) are
+    /// stored, if given (`VICTORY_FENCE_SENT_KEEP_TITLE=1`).
+    fn put_back_own(&self, at: usize, bytes: &[u8], stored: Option<&[(usize, usize)]>) -> bool {
         /// Since the start: stretches and bytes stored this way, pages
         /// noted current for their copy, stretches written the old way;
         /// and with `VICTORY_BACK_OWN_CHECK=1`: stores the title's own
@@ -2946,14 +3334,16 @@ impl Shadow {
         if !crate::inplace::back_own() {
             return false;
         }
-        let Some(shown) = crate::inplace::write_own(at, bytes) else {
+        let whole = [(0, bytes.len())];
+        let runs = stored.unwrap_or(&whole);
+        let Some(shown) = crate::inplace::write_own(at, bytes, runs) else {
             OWN_WRITES[3].fetch_add(1, Ordering::Relaxed);
             return false;
         };
         if check {
             // The title's own address must show what went in through ours.
             let mut back = vec![0u8; bytes.len()];
-            if crate::host::read_into(at as *const u8, &mut back) && back != bytes {
+            if crate::host::read_into(at as *const u8, &mut back) && runs.iter().any(|&(a, n)| back[a..a + n] != bytes[a..a + n]) {
                 OWN_WRITES[4].fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -3103,6 +3493,9 @@ impl Shadow {
         if let Some(bytes) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
             give_back(bytes);
         }
+        // No range is declared any more: no merge is left to keep the
+        // title's bytes put in from (`crate::fence::sent`).
+        self.put_ahead.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory, as
@@ -3275,14 +3668,27 @@ impl Shadow {
                     // bytes at the copy's offsets (`writing`), and these
                     // are in a declared range.
                     let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
+                    // VIcky (`crate::fence::sent`): while a value is
+                    // published ahead, the bytes put in are noted, so that
+                    // a merge keeps them over a shader of the frame before
+                    // that writes them afterwards ([`Both::Put`]).
+                    let ahead = crate::fence::sent::keeping();
+                    let mut put = ahead.map(|_| self.put_ahead.lock().unwrap_or_else(|e| e.into_inner()));
                     for (r, m) in changed_runs(title, held) {
                         // SAFETY: inside the copy's mapping. The card may be
                         // writing the copy beside these bytes; they are
                         // written here and nothing around them.
                         unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
+                        if let (Some(put), Some(period)) = (put.as_mut(), ahead) {
+                            put.push((at + r, at + r + m, period));
+                        }
                         MERGED[1].fetch_add(1, Ordering::Relaxed);
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    }
+                    if let (Some(put), Some(period)) = (put.as_mut(), ahead) {
+                        // Notes of an earlier stretch are of no use.
+                        put.retain(|p| p.2 == period);
                     }
                 }
                 drop(before);
@@ -3621,25 +4027,48 @@ impl Shadow {
         title.resize(n, 0);
         let mut written = 0;
         if crate::host::read_into((start + at) as *const u8, title) {
+            // VIcky (`crate::fence::sent`): asked now that title memory is
+            // read.
+            let (both, _) = both_now();
+            let keep = if both == Both::Card { 0u8 } else { 0xff };
+            let exact = both != Both::Card && crate::fence::sent::keep_exact();
+            #[cfg(feature = "diagnostics")]
+            let check = both != Both::Card && crate::fence::sent::check();
+            #[cfg(not(feature = "diagnostics"))]
+            let check = false;
             // The stretch as read: what the card did not change is the
             // title's, and may have been written again since.
-            let as_read = merge_race_on().then(|| title.clone());
-            // As in `copy_back`: the card's byte where it is not what it
-            // was before the submission, else the title's.
+            let as_read = (merge_race_on() || exact || check).then(|| title.clone());
+            #[cfg(feature = "diagnostics")]
+            both_under_published(gpu, old, title, both);
+            // The card's byte where it is not what it was before the
+            // submission, else the title's; while a value is published
+            // ahead the title's also where both changed it (as
+            // `copy_back` always has it, [`merge_piece`]'s rule).
             let mut differs = 0u8;
             for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
                 let wrote = if *g != *o { 0xffu8 } else { 0 };
-                let merged = (*t & !wrote) | (*g & wrote);
+                let titled = if *t != *o { 0xffu8 } else { 0 };
+                let take = wrote & !(titled & keep);
+                let merged = (*t & !take) | (*g & take);
                 differs |= merged ^ *t;
                 *t = merged;
                 *o = merged;
             }
             if differs != 0 {
+                // With `VICTORY_FENCE_SENT_KEEP_TITLE=1`: only the card's
+                // words.
+                let stored = if exact { as_read.as_deref().map(|read| card_words(start + at, read, title)) } else { None };
+                let stored = stored.as_deref();
                 crate::host::shaders_write(start + at, &title[..]);
+                #[cfg(feature = "diagnostics")]
+                if check {
+                    store_check(start + at, as_read.as_deref(), title, stored);
+                }
                 crate::watch::writing(start + at, n);
-                merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                written = n;
+                merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], stored, "card");
+                write_back(start + at, title, stored);
+                written = stored.map_or(n, |runs| runs.iter().map(|r| r.1).sum());
             }
         } else {
             // Title memory is not mapped there: the copy keeps what the
@@ -3702,31 +4131,66 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
+        self.card_merge_relay_as(at, gpu, held, skip, title, mapped, both_now, crate::fence::sent::keep_exact())
+    }
+
+    /// [`Shadow::card_merge_relay`] once title memory is read (`mapped`:
+    /// it was), with the rule for bytes both the card and the title changed
+    /// given by `rule` ([`both_now`]) and, with `exact`, only the card's
+    /// words stored while it is not [`Both::Card`] ([`card_words`]). `gpu`
+    /// and `held` are the stretch from the first byte that differs to the
+    /// last, at offset `at`; `skip`, ranges of the copy not merged.
+    #[allow(clippy::too_many_arguments)]
+    fn card_merge_relay_as(
+        &self,
+        at: usize,
+        gpu: &[u8],
+        held: &mut [u8],
+        skip: Vec<(usize, usize)>,
+        title: &mut [u8],
+        mapped: bool,
+        rule: impl FnOnce() -> (Both, Option<u64>),
+        exact: bool,
+    ) -> usize {
+        let (start, n) = (self.start as usize, gpu.len());
+        // VIcky (`crate::fence::sent`): asked now that title memory is read.
+        // Title memory that is not mapped: the CPU's side keeps what the
+        // card wrote, as before; `title` is scratch then.
+        let both = if mapped { rule().0 } else { Both::Card };
+        let exact = exact && both != Both::Card;
+        #[cfg(feature = "diagnostics")]
+        let check = both != Both::Card && crate::fence::sent::check();
+        #[cfg(not(feature = "diagnostics"))]
+        let check = false;
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
-        let as_read = (mapped && merge_race_on()).then(|| title.clone());
+        let as_read = (mapped && (merge_race_on() || exact || check)).then(|| title.to_vec());
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
-            // Title memory that is not mapped: the CPU's side keeps what
-            // the card wrote, as before; `title` is scratch then.
             #[cfg(feature = "diagnostics")]
-            if mapped {
-                lost_under_published(&gpu[a..b], &held[a..b], &title[a..b]);
-            }
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            both_under_published(&gpu[a..b], &held[a..b], &title[a..b], both);
+            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b], both);
         }
         if !mapped || !changed {
             return 0;
         }
-        crate::host::shaders_write(start + at, &title[..]);
-        if self.put_back_own(start + at, &title[..]) {
-            return n;
+        // With `VICTORY_FENCE_SENT_KEEP_TITLE=1`: only the card's words.
+        let stored = if exact { as_read.as_deref().map(|read| card_words(start + at, read, title)) } else { None };
+        let stored = stored.as_deref();
+        let written = stored.map_or(n, |runs| runs.iter().map(|r| r.1).sum());
+        crate::host::shaders_write(start + at, title);
+        #[cfg(feature = "diagnostics")]
+        if check {
+            store_check(start + at, as_read.as_deref(), title, stored);
+        }
+        if self.put_back_own(start + at, title, stored) {
+            return written;
         }
         crate::watch::writing(start + at, n);
-        merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        merge_race(as_read.as_deref(), (self.start, self.len), start + at, title, stored, "card relay");
+        write_back(start + at, title, stored);
+        written
     }
 }
 
@@ -4314,7 +4778,7 @@ mod window_tests {
 
 #[cfg(test)]
 mod card_merge_tests {
-    use super::{Card, Shadow};
+    use super::{Both, Card, Shadow};
     use std::sync::Mutex;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     use windows::Win32::Graphics::Direct3D12::*;
@@ -4406,6 +4870,122 @@ mod card_merge_tests {
         // older card byte is taken for a shader's write.
         let before = land(7);
         assert_eq!(before[title_byte], content[title_byte]);
+    }
+
+    /// VIcky (`crate::fence::sent`), on a real copy in the PC's memory and
+    /// its relay merge (`Shadow::relay_merge_as`): flight F's shaders wrote
+    /// a run of bytes and one more; the title, told F was done, rewrote one
+    /// of F's bytes and one of its own; a byte it put into the copy while
+    /// the value was ahead was written again by F afterwards. With the value
+    /// ahead the title's bytes stay and F's others arrive, whether the
+    /// whole stretch or the card's words only are stored; without it (the
+    /// relay's rule) the bytes both changed are the card's.
+    #[test]
+    fn a_pc_copy_keeps_the_title_bytes_while_a_value_is_ahead() {
+        let Some(buffer) = warp_buffer() else {
+            return;
+        };
+        const LEN: usize = 4096;
+        let base: Vec<u8> = (0..LEN).map(|i| (i * 7 + 3) as u8).collect();
+        let (both_byte, own_byte, put_byte, lone_byte) = (120usize, 2000usize, 500usize, 300usize);
+        let land = |both: Both, put_period: u64, exact: bool| -> Vec<u8> {
+            let mut title = base.clone();
+            let mut copy = base.clone();
+            let mut snapshot = base.clone();
+            // F's shaders: 100..140 and one byte apart.
+            for at in (100..140).chain([lone_byte]) {
+                copy[at] ^= 0xc3;
+            }
+            // The title, after the value was published.
+            title[both_byte] ^= 0x5a;
+            title[own_byte] ^= 0x5a;
+            // Put into the copy and the snapshot while ahead, then written
+            // again by F's shader.
+            title[put_byte] ^= 0x11;
+            snapshot[put_byte] = title[put_byte];
+            copy[put_byte] = title[put_byte] ^ 0xc3;
+            let shadow = Shadow::new(buffer.clone(), copy.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64);
+            *shadow.before.lock().unwrap() = Some(snapshot);
+            *shadow.put_ahead.lock().unwrap() = vec![(put_byte, put_byte + 1, put_period)];
+            let period = (both != Both::Card).then_some(3);
+            let (mut now, mut scratch) = (Vec::new(), Vec::new());
+            let mut written = 0;
+            for piece in (0..LEN).step_by(1024) {
+                written += shadow.relay_merge_as(piece, 1024, &mut now, &mut scratch, || (both, period), exact);
+            }
+            assert!(written > 0);
+            drop(shadow);
+            title
+        };
+        for exact in [false, true] {
+            let title = land(Both::Title, 3, exact);
+            for at in (100..140).chain([lone_byte]).filter(|&at| at != both_byte) {
+                assert_eq!(title[at], base[at] ^ 0xc3, "F's byte at {at} (exact {exact})");
+            }
+            assert_eq!(title[both_byte], base[both_byte] ^ 0x5a, "the title's rewrite of F's byte (exact {exact})");
+            assert_eq!(title[own_byte], base[own_byte] ^ 0x5a, "the title's own byte (exact {exact})");
+            assert_eq!(title[put_byte], base[put_byte] ^ 0x11, "the title's byte put in (exact {exact})");
+        }
+        // A note of an earlier stretch does not hold.
+        let title = land(Both::Title, 2, false);
+        assert_eq!(title[put_byte], base[put_byte] ^ 0x11 ^ 0xc3);
+        // The relay's rule without a value ahead: the card's.
+        let title = land(Both::Card, 3, false);
+        assert_eq!(title[both_byte], base[both_byte] ^ 0xc3);
+        assert_eq!(title[own_byte], base[own_byte] ^ 0x5a, "a byte only the title changed stays under any rule");
+        assert_eq!(title[put_byte], base[put_byte] ^ 0x11 ^ 0xc3);
+    }
+
+    /// VIcky (`crate::fence::sent`), on a real copy in the card's memory and
+    /// its relay merge (`Shadow::card_merge_relay_as`): a byte both a
+    /// flight's shader and the title changed is the title's with a value
+    /// published ahead, the card's without; the CPU's side takes the card's
+    /// either way (it mirrors the card's side).
+    #[test]
+    fn a_card_copy_keeps_the_title_bytes_while_a_value_is_ahead() {
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const LEN: usize = 64 << 10;
+        let content: Vec<u8> = (0..LEN).map(|i| (i * 5 + 1) as u8).collect();
+        let (both_byte, card_byte, own_byte) = (100usize, 200usize, 300usize);
+        let land = |both: Both| -> (Vec<u8>, Vec<u8>) {
+            let mut title = content.clone();
+            let mut side = content.clone();
+            title[both_byte] ^= 0x5a;
+            title[own_byte] ^= 0x5a;
+            let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64);
+            shadow.card = Some(Card {
+                staging: staging.clone(),
+                before: Mutex::new(None),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                // 0: no card bytes counted (`Drop` takes them off again).
+                size: 0,
+            });
+            let mut slot = content.clone();
+            slot[both_byte] ^= 0xc3;
+            slot[card_byte] ^= 0xc3;
+            let (first, last) = (both_byte, card_byte);
+            let mut scratch = vec![0u8; last + 1 - first];
+            assert!(crate::host::read_into((title.as_ptr() as usize + first) as *const u8, &mut scratch));
+            // SAFETY: inside `side`, which the shadow maps; nothing else
+            // touches it meanwhile.
+            let held = unsafe { std::slice::from_raw_parts_mut(side.as_mut_ptr().add(first), last + 1 - first) };
+            let written =
+                shadow.card_merge_relay_as(first, &slot[first..=last], held, Vec::new(), &mut scratch, true, || (both, Some(1)), false);
+            assert!(written > 0);
+            drop(shadow);
+            (title, side)
+        };
+        let (title, side) = land(Both::Title);
+        assert_eq!(title[both_byte], content[both_byte] ^ 0x5a, "the title's byte stays");
+        assert_eq!(title[card_byte], content[card_byte] ^ 0xc3, "the card's byte arrives");
+        assert_eq!(title[own_byte], content[own_byte] ^ 0x5a);
+        assert_eq!((side[both_byte], side[card_byte]), (content[both_byte] ^ 0xc3, content[card_byte] ^ 0xc3));
+        let (title, _) = land(Both::Card);
+        assert_eq!(title[both_byte], content[both_byte] ^ 0xc3, "the relay's rule: the card's");
+        assert_eq!(title[own_byte], content[own_byte] ^ 0x5a);
     }
 }
 

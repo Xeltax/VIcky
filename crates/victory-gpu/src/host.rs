@@ -2080,7 +2080,10 @@ fn late_stage() -> u8 {
 /// shader wrote is the title's if the shader wrote it first, the shader's
 /// if it wrote it afterwards; settled first it was always the shader's.
 /// The title writing a byte a shader of its own is writing is a race on
-/// the console too.
+/// the console too. (VIcky: with `crate::fence::sent`, a byte put in while
+/// a frame-begin value is published ahead stays the title's in title
+/// memory either way, the title having been told the flights were done:
+/// `crate::shadow`'s `Both::Put`.)
 fn late_exact() -> bool {
     late_stage() > 1
 }
