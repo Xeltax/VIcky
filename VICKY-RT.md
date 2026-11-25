@@ -159,6 +159,23 @@ So the answer to "denoiser or reflections" is both and more: the tiled sun shado
 
 **What this does not cover.** All 27 runs are the same scene, the cell cutscene, with no input after the menus. Nothing here says the open world is safe, and task 2 above counts pointers in the builder's structures that lead out of them: the stores that crashed run 98 may still happen where they hit nothing the title reads in this scene.
 
+### Task 5 on the RTX 5090: fork #814 against this branch (`b18fce0`), same card and scene
+
+**This branch is about twice as fast here: 4.9–5.5 fps against 2.5–2.7.** Two runs each of 600 s from the same save, alternating, the cell scene, Series X mode, builder on, no capture, after a warm-up run each. #814 is `staronthehorizon:rt-preliminary` at `ece4a19` (4 commits on fork main `9376fd6`; this branch has 89 commits it lacks). The last twelve `fps` lines of each run, and the last three `shader writes looked for on the CPU` lines:
+
+| | run | fps | ms/frame | preparing | GPU | copying back | dropped draws | compared in windows |
+|---|---|---|---|---|---|---|---|---|
+| this branch, `b18fce0` | 1 | 4.9–5.5 | 183–206 | 92–111 | 25–46 | 43–55 | 4 | 324–351 MB |
+| | 2 | 5.1–5.4 | 186–197 | 93–101 | 37–48 | 48–62 | 4 | 358–393 MB |
+| #814, `ece4a19` | 1 | 2.5–2.7 | 364–393 | 247–276 | 61–73 | 84–131 | 0 | 216–220 MB |
+| | 2 | 2.5–2.7 | 367–397 | 250–283 | 57–74 | 97–123 | 0 | 240–241 MB |
+
+- **Switches.** Both ran with everything "Recommended with the builder on" above. #814 also had its own `VICTORY_BVH_QUARANTINE=0 VICTORY_CARD_FETCH_INFLIGHT=1`, and not its two for 8 GB cards (`VICTORY_TEXTURE_DROP_MIPS`, `VICTORY_TEXTURE_ROOM_PERCENT`). #814 predates most of the recommended switches and ignores the ones it does not know, so this compares the two branches as they are, not the dirty-page bitmask against #346 alone.
+- **Where the time goes.** #814 spends about 170 ms a frame more preparing (247–283 against 92–111), about 55 ms more copying back and about 25 ms more on the GPU.
+- **What #814 does better here.** It compares about a third less in windows (216–241 MB against 324–393 MB). It drops no draw, where this branch drops 4 a frame. It does not run out of copy numbers of title memory by address: `no number left for another copy` is in neither #814 run and in both of this branch's.
+- **Both held.** The builder ran whole to the end in all four runs, with no panic and no device removal. Both #814 runs were still running 180 s after the window was asked to close and were killed by the script; this branch's runs closed by themselves with exit code 0.
+- **Not looked at:** the picture (no capture was taken), and Series S mode, which is what #814 was written and measured for.
+
 ### What we tried after RT10 (RTX 4080; most worth knowing so nobody repeats them)
 
 GPU profiles come from `VICTORY_GPU_TIMING=1 VICTORY_D3D12_DRED=1`.
