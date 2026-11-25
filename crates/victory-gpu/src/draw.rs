@@ -954,6 +954,13 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // Timing run: what binding records on the card (copies sent up,
+        // passes over copies in the card's memory) gets a line of its own.
+        // Without it, a command's time ran to the next command's stamp,
+        // written after that command's bind, and so took its bind's work
+        // (a 16-group memset showed 79 ms).
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| "bind (work recorded while binding the next command)".to_owned());
         let reserved = self.dynamic.len();
         self.bind_made.clear();
         let bound = self.bind_attempt(list, p, compute);
