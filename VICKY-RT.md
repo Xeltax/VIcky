@@ -110,7 +110,7 @@ So the answer to "denoiser or reflections" is both and more: the tiled sun shado
 - Without #346, the CPU found 85 MB of shader writes a frame by comparing about 16 GB, roughly 0.5%.
 - With RT8's settings, copying back costs less than with the builder off. The GPU is now the biggest part.
 - These are single runs, and the spread between runs is large.
-- The picture with the builder on: the dark corner of the cell is no brighter yet.
+- The picture with the builder on: the dark corner of the cell is lit on the 4080 too. Measured as in task 4 (mean blue of the left fifth of the last frame of the window shot; on the RTX 5090 about 10 when lit, 1–2 when dark): RT8 43–45, RT10 30, RT28 (no input) 29, the fork main merge (RT29b) 27–30.
 
 ### What we tried after RT10 (RTX 4080; most worth knowing so nobody repeats them)
 
