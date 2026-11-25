@@ -2337,8 +2337,14 @@ impl State {
                 "partial DispatchX(USE_THREAD_DIMENSIONS) on a compute shader without thread-count masking"
             );
         }
-        // The structure builder's copy, by a pass of ours recorded before
-        // the program is bound (`VICTORY_BVH_COPY`, [`bvh_copy`]).
+        // The structure builder's copy: onto itself it changes nothing and
+        // is not recorded; otherwise by a pass of ours recorded before the
+        // program is bound (`VICTORY_BVH_COPY`, [`bvh_copy`]).
+        if self.bvh_copy_skips(p, partial) {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| "structure copy onto itself, not recorded (VICTORY_BVH_COPY)".to_owned());
+            return;
+        }
         let ours = self.bvh_copy_before(list, p, [gx, gy, gz], partial);
         self.dispatch_threads = partial;
         let bound = self.bind(list, p, true);
