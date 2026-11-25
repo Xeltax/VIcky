@@ -120,7 +120,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
-pub use per_program::{deep_skips_allowed, for_program, wave64_retried};
+pub use per_program::{deep_skips_allowed, for_program, shader_opt_allowed, wave64_retried};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_MARKS, MEMORY_NOTES, MEMORY_PAGE_MARKS, MEMORY_PAGES, MEMORY_TOUCHED, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY,
@@ -180,22 +180,42 @@ pub fn group_sync() -> u8 {
 
 /// The clean-up passes that run over a translated program before it is
 /// written (`bitcode::opt`): a set of that module's pass bits. Every pass
-/// is exact, so the switch is for telling a translator fault from a
-/// clean-up fault, and for measuring what the clean-up is worth.
+/// is meant to be exact, so the switch is for telling a translator fault
+/// from a clean-up fault, and for measuring what the clean-up is worth.
 /// `VICTORY_SHADER_OPT`:
-/// - unset: every pass.
+/// - unset: every pass but 64 (`bitcode::opt::DEFAULT`, which is 63).
 /// - `0`: none (the module as the lowering made it).
 /// - a number (decimal or `0x` hex): those passes; 1 dead code, 2 constants
 ///   and identities, 4 one instruction for one value, 8 what a branch taken
 ///   says about its condition, 16 one read for one place within a block,
 ///   32 a first-lane read of two host waves without the round that asks
-///   which half has a lane (where every lane has one).
+///   which half has a lane (where every lane has one), 64 wave operations
+///   taken as values by 1 and 16 (`bitcode::opt::WAVES`).
+/// - names, separated by commas, `+` or spaces: those passes (`dead`,
+///   `fold`, `reuse`, `facts`, `loads`, `first`, `waves`; `none`; `all`,
+///   which is 127), so a run can be bisected without the numbers
+///   (`dead,fold`).
+///
+/// Per program, `VICTORY_SHADER_OPT_NOT` and `_ONLY` keep programs out of
+/// all of them ([`program_shader_opt`], `per_program`).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+/// The passes of [`shader_opt`] for the program being translated on this
+/// thread ([`for_program`]): none when `VICTORY_SHADER_OPT_NOT` or `_ONLY`
+/// keeps it out ([`shader_opt_allowed`]). The shader cache keys each
+/// program on its own decision (`victory-gpu`'s `program_key`).
+pub(crate) fn program_shader_opt() -> u32 {
+    let passes = shader_opt();
+    if passes != 0 && !shader_opt_allowed(per_program::current().as_deref()) {
+        return 0;
+    }
+    passes
 }
 
 /// Everything a translation depends on besides the container: the
@@ -211,10 +231,12 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.push(u8::from(cfg!(debug_assertions)));
     // (Not the per-program lists: each program's decision is in its own
     // cache key, `victory-gpu`'s `program_key`.)
-    for name in env!("VICTORY_SHADER_SWITCHES")
-        .split(',')
-        .filter(|n| !n.is_empty() && !per_program::PER_PROGRAM_SWITCHES.contains(n))
-    {
+    // (Nor `VICTORY_SHADER_OPT_CHECK`: it only reports, `bitcode::check`.)
+    for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| {
+        !n.is_empty()
+            && !per_program::PER_PROGRAM_SWITCHES.contains(n)
+            && *n != bitcode::check::SWITCH
+    }) {
         out.extend_from_slice(name.as_bytes());
         out.push(b'=');
         if let Some(value) = std::env::var_os(name) {
@@ -236,16 +258,42 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out
 }
 
-/// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
-/// unreadable. Pure, for testing.
+/// `VICTORY_SHADER_OPT`'s value; the default passes when it is unset or
+/// unreadable (a name it does not know makes the whole value unreadable).
+/// Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {
-    let parsed = value
-        .map(str::trim)
-        .and_then(|v| match v.strip_prefix("0x") {
-            Some(hex) => u32::from_str_radix(hex, 16).ok(),
-            None => v.parse().ok(),
-        });
-    parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
+    use bitcode::opt::{ALL, DEAD, DEFAULT, FACTS, FIRST, FOLD, LOADS, REUSE, WAVES};
+    let one = |v: &str| -> Option<u32> {
+        let v = v.trim().to_ascii_lowercase();
+        Some(match v.as_str() {
+            "dead" => DEAD,
+            "fold" => FOLD,
+            "reuse" => REUSE,
+            "facts" => FACTS,
+            "loads" => LOADS,
+            "first" => FIRST,
+            "waves" => WAVES,
+            "none" => 0,
+            "all" => ALL,
+            _ => match v.strip_prefix("0x") {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => v.parse().ok()?,
+            },
+        })
+    };
+    let parsed = value.and_then(|v| {
+        let items: Vec<&str> = v
+            .split(|c: char| c == ',' || c == '+' || c.is_whitespace())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if items.is_empty() {
+            return None;
+        }
+        items
+            .into_iter()
+            .try_fold(0, |all, item| Some(all | one(item)?))
+    });
+    parsed.map_or(DEFAULT, |n| n & ALL)
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -839,14 +887,49 @@ mod tests {
     use super::parse_loop_limit;
 
     #[test]
-    fn the_clean_up_switch_parses_or_runs_every_pass() {
-        let all = super::bitcode::opt::ALL;
-        assert_eq!(parse_shader_opt(None), all);
+    fn the_clean_up_switch_parses_or_runs_the_default_passes() {
+        use super::bitcode::opt::{ALL, DEAD, DEFAULT, FACTS, FIRST, FOLD, LOADS, REUSE, WAVES};
+        assert_eq!(DEFAULT, 63, "the old every pass");
+        assert_eq!(ALL, 127);
+        assert_eq!(parse_shader_opt(None), DEFAULT);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
-        assert_eq!(parse_shader_opt(Some("on")), all);
+        assert_eq!(parse_shader_opt(Some("0xffffffff")), ALL);
+        assert_eq!(parse_shader_opt(Some("on")), DEFAULT);
+        // By name, for a bisect.
+        assert_eq!(parse_shader_opt(Some("dead")), DEAD);
+        assert_eq!(parse_shader_opt(Some("dead,fold")), DEAD | FOLD);
+        assert_eq!(
+            parse_shader_opt(Some(" Reuse + FACTS loads ")),
+            REUSE | FACTS | LOADS
+        );
+        assert_eq!(parse_shader_opt(Some("first,1")), FIRST | DEAD);
+        assert_eq!(parse_shader_opt(Some("waves,63")), ALL);
+        assert_eq!(parse_shader_opt(Some("none")), 0);
+        assert_eq!(parse_shader_opt(Some("all")), ALL);
+        assert_eq!(WAVES, 64);
+        for bad in ["", " , ", "dead,typo", "-1"] {
+            assert_eq!(parse_shader_opt(Some(bad)), DEFAULT, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_per_program_and_report_switches_are_in_no_build_key() {
+        let print = super::translation_fingerprint();
+        let has = |name: &str| {
+            print
+                .windows(name.len() + 1)
+                .any(|w| w == format!("{name}=").as_bytes())
+        };
+        assert!(has("VICTORY_SHADER_OPT"), "the passes are");
+        for name in [
+            "VICTORY_SHADER_OPT_NOT",
+            "VICTORY_SHADER_OPT_ONLY",
+            "VICTORY_SHADER_OPT_CHECK",
+        ] {
+            assert!(!has(name), "{name}");
+        }
     }
 
     #[test]

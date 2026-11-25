@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 pub mod census;
+pub mod check;
 pub mod opt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -49,6 +50,7 @@ pub(crate) enum V {
 }
 
 /// A global variable declaration (thread-group shared memory).
+#[derive(Clone)]
 struct Global {
     name: String,
     ty: Ty,
@@ -194,6 +196,7 @@ pub(crate) enum Attr {
     NoDuplicate = 4,
 }
 
+#[derive(Clone)]
 struct Func {
     name: String,
     ty: Ty,
@@ -205,13 +208,14 @@ struct Func {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Md(u32);
 
+#[derive(Clone)]
 enum MdDef {
     Str(String),
     Value(Ty, V),
     Node(Vec<Option<Md>>),
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Module {
     types: Vec<TypeDef>,
     type_ids: HashMap<TypeDef, u32>,
@@ -549,6 +553,77 @@ impl Module {
         live
     }
 
+    /// The blocks reached from the entry, in reverse postorder: the order
+    /// [`Module::write`] lays them out in.
+    fn reverse_postorder(&self) -> Vec<usize> {
+        let succs = |b: usize| successors(self.blocks[b].term);
+        let mut seen = vec![false; self.blocks.len()];
+        let mut post = Vec::new();
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            match succs(b).get(k) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        post
+    }
+
+    /// Per block of `post` (the layout, [`Module::reverse_postorder`]): the
+    /// predecessor and loop header it is folded into when written, if it is
+    /// an empty latch (only a branch back to its loop header) with one
+    /// predecessor. The predecessor then branches to the header itself, so
+    /// the exiting block is the latch as in DXC's loops; the AMD driver
+    /// hangs on divergent loops otherwise.
+    ///
+    /// Not when the predecessor already branches to the header, nor for a
+    /// second latch of one predecessor into one header (two empty latches of
+    /// one branch, as the clean-up's dead code can leave): both edges would
+    /// come from the predecessor, and a join in the header would take two
+    /// values from one block (a module LLVM's verifier refuses and drivers
+    /// read as they like). No program of the pack has such a pair today.
+    fn latch_folds(&self, post: &[usize]) -> Vec<Option<(usize, usize)>> {
+        let succs = |b: usize| successors(self.blocks[b].term);
+        let mut pos = vec![u64::MAX; self.blocks.len()];
+        for (n, &b) in post.iter().enumerate() {
+            pos[b] = n as u64;
+        }
+        let mut preds = vec![Vec::new(); self.blocks.len()];
+        for &b in post {
+            for &s in succs(b).iter() {
+                preds[s].push(b);
+            }
+        }
+        let mut fold = vec![None; self.blocks.len()];
+        let mut folded: Vec<(usize, usize)> = Vec::new();
+        for &b in post {
+            let blk = &self.blocks[b];
+            if let (Some(Term::Br(h)), true, [p]) = (
+                blk.term,
+                blk.phis.is_empty() && blk.body.is_empty(),
+                &preds[b][..],
+            ) && pos[h] < pos[b]
+                && !succs(*p).contains(&h)
+                && !folded.contains(&(*p, h))
+            {
+                fold[b] = Some((*p, h));
+                folded.push((*p, h));
+            }
+        }
+        fold
+    }
+
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
@@ -688,53 +763,8 @@ impl Module {
         // Blocks are laid out in reverse postorder, so every block follows
         // its forward predecessors (drivers take a branch to an earlier
         // block for a loop's back edge).
-        let succs = |b: usize| successors(self.blocks[b].term);
-        let mut seen = vec![false; self.blocks.len()];
-        let mut post = Vec::new();
-        let mut stack = vec![(0usize, 0usize)];
-        seen[0] = true;
-        while let Some(top) = stack.last_mut() {
-            let (b, k) = *top;
-            top.1 += 1;
-            match succs(b).get(k) {
-                Some(&s) if !seen[s] => {
-                    seen[s] = true;
-                    stack.push((s, 0));
-                }
-                Some(_) => {}
-                None => {
-                    post.push(b);
-                    stack.pop();
-                }
-            }
-        }
-        post.reverse();
-        let mut pos = vec![u64::MAX; self.blocks.len()];
-        for (n, &b) in post.iter().enumerate() {
-            pos[b] = n as u64;
-        }
-        // An empty latch (only a branch back to its loop header) is folded
-        // into its one predecessor, so the exiting block is the latch as in
-        // DXC's loops; the AMD driver hangs on divergent loops otherwise.
-        let mut preds = vec![Vec::new(); self.blocks.len()];
-        for &b in &post {
-            for &s in succs(b).iter() {
-                preds[s].push(b);
-            }
-        }
-        let mut fold = vec![None; self.blocks.len()];
-        for &b in &post {
-            let blk = &self.blocks[b];
-            if let (Some(Term::Br(h)), true, [p]) = (
-                blk.term,
-                blk.phis.is_empty() && blk.body.is_empty(),
-                &preds[b][..],
-            ) && pos[h] < pos[b]
-                && !succs(*p).contains(&h)
-            {
-                fold[b] = Some((*p, h));
-            }
-        }
+        let post = self.reverse_postorder();
+        let fold = self.latch_folds(&post);
         let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
         let mut pos = vec![u64::MAX; self.blocks.len()];
         for (n, &b) in layout.iter().enumerate() {
@@ -1063,6 +1093,50 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
         assert_eq!(signed(-3), 7);
         assert_eq!(signed(2), 4);
+    }
+
+    /// A loop whose body branches to one of two empty latches, each taking
+    /// its own value back to the header: `(module, latches, header, body)`.
+    fn two_latches() -> (Module, [usize; 2], usize, usize) {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let void = m.void();
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        let f = m.function("dx.op.bufferStore.i32", fty, Some(Attr::NoUnwind), false);
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+        let entry = m.new_block();
+        let [head, body, a, b, exit] = [(); 5].map(|_| m.new_block());
+        let (zero, one, two, three) = (m.i32(0), m.i32(1), m.i32(2), m.i32(3));
+        m.terminate(entry, Term::Br(head));
+        let count = m.phi(head, i32t);
+        let acc = m.phi(head, i32t);
+        let more = m.cmp(head, pred::IULT, count, three);
+        m.terminate(head, Term::CondBr(more, body, exit));
+        let next = m.bin(body, Bin::Add, count, one);
+        let odd = m.bin(body, Bin::And, count, one);
+        let odd = m.cmp(body, pred::NE, odd, zero);
+        let plus1 = m.bin(body, Bin::Add, acc, one);
+        let plus2 = m.bin(body, Bin::Add, acc, two);
+        m.terminate(body, Term::CondBr(odd, a, b));
+        m.terminate(a, Term::Br(head));
+        m.terminate(b, Term::Br(head));
+        m.set_phi(count, vec![(zero, entry), (next, a), (next, b)]);
+        m.set_phi(acc, vec![(zero, entry), (plus1, a), (plus2, b)]);
+        m.call(exit, f, vec![acc, acc]);
+        m.terminate(exit, Term::Ret);
+        (m, [a, b], head, body)
+    }
+
+    #[test]
+    fn two_empty_latches_of_one_branch_are_not_both_folded() {
+        let (m, [a, b], head, body) = two_latches();
+        let fold = m.latch_folds(&m.reverse_postorder());
+        // One latch goes (its branch comes from the body), the other stays,
+        // so the header's join has one value per block it comes from.
+        let folded: Vec<_> = [a, b].iter().filter_map(|&l| fold[l]).collect();
+        assert_eq!(folded, [(body, head)]);
+        m.write();
     }
 
     /// A structured shader's shape: `stages` if/else diamonds in a row, each

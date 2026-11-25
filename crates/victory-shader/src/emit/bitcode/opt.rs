@@ -14,8 +14,9 @@
 //!   left alone: `x + 0.0` and `x * 1.0` are not `x` for every `x`.
 //! - [`REUSE`]: an instruction without an effect whose operands are those
 //!   of an earlier one that every path to it has run gives that one's
-//!   result (a descriptor handle made again in each block, an index clamped
-//!   again, a register read as a float again).
+//!   result (an index clamped again, a register read as a float again).
+//!   Not a resource handle: it is made again in each block that uses it
+//!   (two of one block are one), as DXC leaves them.
 //! - [`FACTS`]: in the blocks only one side of a branch leads to, the
 //!   branch's condition is that side's constant, and so is what the
 //!   condition was made of (both terms of an `and` that held, the opposite
@@ -26,9 +27,14 @@
 //!   with an effect stands between them (another thread's unsynchronised
 //!   store may fall between any two reads or before both: the title's code
 //!   cannot tell which).
+//! - [`WAVES`]: wave and quad operations are values like the others (see
+//!   there; not in the default).
 //!
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
-//! the translation and so of the shader cache's key.
+//! the translation and so of the shader cache's key; `VICTORY_SHADER_OPT_NOT`
+//! and `_ONLY` keep chosen programs out of all of them (`per_program`).
+//! `VICTORY_SHADER_OPT_CHECK` runs each program before and after them side
+//! by side ([`super::check`]).
 
 use std::collections::HashMap;
 
@@ -52,10 +58,22 @@ pub const LOADS: u32 = 16;
 /// half has a lane where every lane is in EXEC (`lower.rs`,
 /// `v_readfirstlane_b32`).
 pub const FIRST: u32 = 32;
+/// Wave and quad operations taken as values: [`DEAD`] drops one nothing
+/// reads, [`LOADS`] makes two of a block one, and neither stops a read
+/// being reused across it. Without it they stay where the lowering put
+/// them, with the weight of an effect, as a driver may take them: a call
+/// declared with effects, which no memory access moves across. The
+/// translation of a console wave's lanes sharing LDS in step (without a
+/// barrier, `lower.rs`) may lean on that order, which no single thread can
+/// tell, so it is not in the default.
+pub const WAVES: u32 = 64;
 /// The passes over the module.
-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
+pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | WAVES;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST;
+/// The passes that run when `VICTORY_SHADER_OPT` is unset: all but
+/// [`WAVES`] (the old "every pass", 63).
+pub const DEFAULT: u32 = ALL & !WAVES;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -187,14 +205,34 @@ pub(super) enum Effect {
     /// (buffer and texture reads).
     Reads,
     /// Nothing, but the result depends on which lanes run the instruction
-    /// (wave and quad operations).
+    /// (wave and quad operations): one for the same arguments within a
+    /// block only, and only with [`WAVES`] (an effect without it).
     Lanes,
+    /// Nothing, and the result depends on the arguments alone, but the
+    /// value is made again in each block that uses it (resource handles):
+    /// one for the same arguments within a block only.
+    Local,
     /// Stores, atomics, barriers, outputs, discards: always kept.
     Writes,
 }
 
 pub(super) fn effect(f: &Func) -> Effect {
     let name = f.name.strip_prefix("dx.op.").unwrap_or(&f.name);
+    // Wave and quad operations read the other lanes' values, whatever
+    // attribute they are declared with (those with effects have none).
+    if name.starts_with("wave") || name.starts_with("quad") {
+        return Effect::Lanes;
+    }
+    // A resource handle stays in its block: one block's handle reused in
+    // the blocks below it crashed AMD's compiler (an RX 9070, fork PR #317;
+    // #576 proposes the same), and the driver merges handles itself anyway.
+    // Two of a block are still one, and an unused one still goes.
+    if matches!(
+        name,
+        "createHandle" | "createHandleFromBinding" | "createHandleFromHeap" | "annotateHandle"
+    ) {
+        return Effect::Local;
+    }
     match f.attr {
         Some(Attr::ReadNone) => Effect::Pure,
         // A shader cannot write a constant buffer or resize a resource.
@@ -203,11 +241,7 @@ pub(super) fn effect(f: &Func) -> Effect {
         {
             Effect::Pure
         }
-        Some(Attr::ReadOnly) if name.starts_with("wave") => Effect::Lanes,
         Some(Attr::ReadOnly) => Effect::Reads,
-        // Declared with the attribute of calls that have effects, and have
-        // none: they read the other lanes' values.
-        _ if name.starts_with("wave") || name.starts_with("quad") => Effect::Lanes,
         _ => Effect::Writes,
     }
 }
@@ -230,13 +264,20 @@ impl Module {
             }
         }
         if passes & DEAD != 0 {
-            self.drop_dead();
+            self.drop_dead(passes);
         }
     }
 
-    /// Per function: what a call of it does.
-    pub(super) fn effects(&self) -> Vec<Effect> {
-        self.funcs.iter().map(effect).collect()
+    /// Per function: what a call of it does, for `passes` (wave operations
+    /// have the weight of an effect without [`WAVES`]).
+    pub(super) fn effects(&self, passes: u32) -> Vec<Effect> {
+        self.funcs
+            .iter()
+            .map(|f| match effect(f) {
+                Effect::Lanes if passes & WAVES == 0 => Effect::Writes,
+                e => e,
+            })
+            .collect()
     }
 
     /// The blocks reached from the entry.
@@ -666,7 +707,7 @@ impl Module {
         if self.blocks.is_empty() {
             return false;
         }
-        let effects = self.effects();
+        let effects = self.effects(passes);
         let tree = self.dominator_tree();
         let mut repl: Vec<Option<V>> = vec![None; self.insts.len()];
         let mut changed = false;
@@ -711,6 +752,8 @@ impl Module {
         let mut known: HashMap<Key, V> = HashMap::new();
         // The reads of the block being walked since its last store.
         let mut read: HashMap<Key, V> = HashMap::new();
+        // The resource handles of the block being walked.
+        let mut local: HashMap<Key, V> = HashMap::new();
         let mut facts = Facts::default();
         let (yes, no) = (self.bool(true), self.bool(false));
         enum Step {
@@ -751,6 +794,7 @@ impl Module {
                 None => v,
             };
             read.clear();
+            local.clear();
             // Two joins of the same values from the same blocks are one.
             if passes & REUSE != 0 && self.blocks[b].phis.len() > 1 {
                 let mut joins: HashMap<Vec<(usize, V)>, V> = HashMap::new();
@@ -817,8 +861,21 @@ impl Module {
                     known.insert(key.clone(), V::Inst(i));
                     added.push(key);
                 }
-                // Reads of memory, and wave operations (the same lanes run
-                // the whole block): the block's own earlier one.
+                // A resource handle: the block's own earlier one.
+                if passes & REUSE != 0
+                    && class == Effect::Local
+                    && let Some(key) = self.key(i)
+                {
+                    if let Some(&first) = local.get(&key) {
+                        repl[i as usize] = Some(first);
+                        changed = true;
+                        continue;
+                    }
+                    local.insert(key, V::Inst(i));
+                }
+                // Reads of memory, and wave operations with [`WAVES`] (the
+                // same lanes run the whole block): the block's own earlier
+                // one.
                 if passes & LOADS != 0
                     && matches!(class, Effect::Reads | Effect::Lanes)
                     && let Some(key) = self.key(i)
@@ -919,8 +976,8 @@ impl Module {
     /// [`DEAD`]: keeps the instructions with an effect, the branch
     /// conditions, and what they read, transitively; the rest leave their
     /// blocks. Blocks no branch reaches are emptied (they are not written).
-    fn drop_dead(&mut self) {
-        let effects = self.effects();
+    fn drop_dead(&mut self, passes: u32) {
+        let effects = self.effects(passes);
         let reached = self.reached();
         let mut live = vec![false; self.insts.len()];
         let mut work: Vec<u32> = Vec::new();
@@ -1216,7 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn wave_operations_have_no_effect_of_their_own() {
+    fn wave_operations_have_no_effect_of_their_own_with_waves() {
         let mut k = kit();
         let i32t = k.m.int(32);
         let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
@@ -1232,7 +1289,11 @@ mod tests {
         k.m.call(k.b, first, vec![one, one]);
         k.m.call(k.b, barrier, vec![one, one]);
         k.m.terminate(k.b, Term::Ret);
-        k.m.optimise(DEAD);
+        // Without `WAVES` the unread one stays, as a driver keeps it.
+        let mut kept = k.m.clone();
+        kept.optimise(DEAD);
+        assert_eq!(body(&kept, k.b), 2, "the wave operation and the barrier");
+        k.m.optimise(DEAD | WAVES);
         assert_eq!(body(&k.m, k.b), 1, "the barrier");
         // The declarations nothing calls any more are gone, and the call
         // that stayed names its function by the new number.
@@ -1243,6 +1304,43 @@ mod tests {
         };
         assert_eq!(k.m.funcs[f as usize].name, "dx.op.barrier");
         k.m.write();
+    }
+
+    #[test]
+    fn without_waves_a_wave_operation_stands_between_two_reads() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        let ballot = m.function("dx.op.waveActiveBallot", fty, Some(Attr::NoUnwind), false);
+        let one = m.i32(1);
+        let x = m.call(b, reads, vec![one, one]);
+        let w = m.call(b, ballot, vec![x, one]);
+        let w2 = m.call(b, ballot, vec![x, one]);
+        let y = m.call(b, reads, vec![one, one]);
+        m.call(b, writes, vec![x, y]);
+        m.call(b, writes, vec![w, w2]);
+        m.terminate(b, Term::Ret);
+        let mut with = m.clone();
+        m.optimise(DEFAULT);
+        assert_eq!(
+            stores(&m, b),
+            [[x, y], [w, w2]],
+            "both reads and both wave operations"
+        );
+        with.optimise(ALL);
+        assert_eq!(
+            stores(&with, b),
+            [[x, x], [w, w]],
+            "with WAVES: one of each"
+        );
+        m.write();
+        with.write();
     }
 
     /// The operands of each store left in block `b`.
@@ -1531,6 +1629,52 @@ mod tests {
         assert_eq!(incoming, &vec![(x, meet), (y, other)]);
         let _ = b;
         m.write();
+    }
+
+    #[test]
+    fn a_handle_is_one_within_its_block_and_made_again_below_it() {
+        for name in [
+            "dx.op.createHandleFromHeap",
+            "dx.op.createHandleFromBinding",
+            "dx.op.annotateHandle",
+        ] {
+            let Diamond {
+                k: Kit {
+                    mut m, b, writes, ..
+                },
+                then,
+                ..
+            } = diamond();
+            let i32t = m.int(32);
+            let fty = m.func_ty(i32t, vec![i32t, i32t]);
+            let handle = m.function(name, fty, Some(Attr::ReadNone), false);
+            let (one, two) = (m.i32(1), m.i32(2));
+            let first = m.call(b, handle, vec![one, two]);
+            let again = m.call(b, handle, vec![one, two]);
+            let unused = m.call(b, handle, vec![two, two]);
+            m.call(b, writes, vec![first, again]);
+            let below = m.call(then, handle, vec![one, two]);
+            m.call(then, writes, vec![below, below]);
+            m.optimise(ALL);
+            assert_eq!(
+                stores(&m, b),
+                [[first, first]],
+                "{name}: one within the block"
+            );
+            assert!(
+                !m.blocks[b].body.contains(&match unused {
+                    V::Inst(i) => i,
+                    _ => unreachable!(),
+                }),
+                "{name}: an unused one goes"
+            );
+            assert_eq!(
+                stores(&m, then),
+                [[below, below]],
+                "{name}: made again below"
+            );
+            m.write();
+        }
     }
 
     #[test]
