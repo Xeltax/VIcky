@@ -1,7 +1,7 @@
 # VIcky: a research fork of VIctory
 
-> **Latest (2026-11-25): use branch [`fx-heapmap-8d`](https://github.com/Xeltax/VIcky/tree/fx-heapmap-8d).** It is [fxceless/victory-fork](https://github.com/fxceless/victory-fork) at `8dd30ab` (all of its rendering work is fxceless's, GPL-3.0) plus VIcky's commits (heap map for NVIDIA's 1,000,000-view cap, per-program wave64 switch, contributors' fixes). On an RTX 4080: a lit, textured prologue with the cell's walls in 2 of 2 runs, 3.5–4.5 fps, no device removal. Settings and measurements are in that branch's [VICKY.md](https://github.com/Xeltax/VIcky/blob/fx-heapmap-8d/VICKY.md). (`fx-heapmap` and `fx-heapmap-4e` are older bases.)
-> **FR —** dernière branche : `fx-heapmap-8d` (fork de fxceless à `8dd30ab`, crédité, + nos commits) : prologue éclairé et texturé, murs de la cellule présents 2 runs sur 2, 3,5–4,5 i/s sur RTX 4080.
+> **Latest (2026-11-25): use branch [`fx-heapmap-8d`](https://github.com/Xeltax/VIcky/tree/fx-heapmap-8d).** It is [fxceless/victory-fork](https://github.com/fxceless/victory-fork) at `8dd30ab` (all of its rendering work is fxceless's, GPL-3.0) plus VIcky's commits (heap map for NVIDIA's 1,000,000-view cap, per-program wave64 switch, contributors' fixes). On an RTX 4080: a lit, textured prologue with the cell's walls in 2 of 2 runs, 3.5–4.5 fps, no device removal; **Series S mode (`--console series-s`) 5.7–6.0 fps**. Settings and measurements are in that branch's [VICKY.md](https://github.com/Xeltax/VIcky/blob/fx-heapmap-8d/VICKY.md). (`fx-heapmap` and `fx-heapmap-4e` are older bases.)
+> **FR —** dernière branche : `fx-heapmap-8d` (fork de fxceless à `8dd30ab`, crédité, + nos commits) : prologue éclairé et texturé, murs de la cellule présents 2 runs sur 2, 3,5–4,5 i/s sur RTX 4080, et 5,7–6 i/s en mode Series S (`--console series-s`).
 >
 > What follows is the older research tree on `main`, based on VIctory's integration branch.
 
