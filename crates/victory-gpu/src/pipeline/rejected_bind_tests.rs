@@ -88,6 +88,7 @@ fn compute_pipeline(used: &[UsedResource]) -> HostPipeline {
             threads: [1, 1, 1],
         })
         .into(),
+        walks: Default::default(),
     };
     HostPipeline::new(&[Arc::new(shader)], None).expect("create the test pipeline")
 }

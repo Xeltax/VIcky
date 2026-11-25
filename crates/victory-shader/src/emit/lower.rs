@@ -1052,6 +1052,26 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+/// The refusal of a first half of an interpolation whose result is read
+/// as data ([`Lower::interp`]).
+pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
+
+thread_local! {
+    /// Whether first halves of interpolations are evaluated as the pair
+    /// they start ([`with_first_half_pairs`]).
+    static FIRST_HALF_PAIRS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `translate` with first halves of interpolations evaluated as the
+/// pair they start: the translation of a program refused with
+/// [`FIRST_HALF`] (`VICTORY_FIRST_HALF=0`: refused again, as before).
+pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
+    let before = FIRST_HALF_PAIRS.replace(true);
+    let result = translate();
+    FIRST_HALF_PAIRS.set(before);
+    result
+}
+
 pub(super) fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -1538,7 +1558,9 @@ impl<'a> Lower<'a> {
                 // the other half of its dst, PS_DeferredTextured): evaluated as the pair it
                 // starts. Approximate for those other bits (P0 + i P10 on the console); a
                 // first half only the second half reads is gone before lowering.
-                if std::env::var_os("VICTORY_FIRST_HALF").is_none_or(|v| v != "0") {
+                // Only in the second translation of a program the first
+                // one refused for it ([`with_first_half_pairs`]).
+                if FIRST_HALF_PAIRS.get() && std::env::var_os("VICTORY_FIRST_HALF").is_none_or(|v| v != "0") {
                     for (_, i) in &x.io.interps {
                         if let Interp::Interpolated { first, .. } = i {
                             for s in first {
@@ -2135,8 +2157,9 @@ impl<'a> Lower<'a> {
         if !every {
             if halves {
                 need(self.cur_ir);
+                return Err(WHERE);
             }
-            return Err(WHERE);
+            return Ok(self.half_sum_present(x));
         }
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -2162,6 +2185,61 @@ impl<'a> Lower<'a> {
         let total = self.s.m.bin(c, Bin::And, total, low);
         let first = self.s.m.bin(c, Bin::And, lo, high);
         Ok(self.s.m.bin(c, Bin::Or, first, total))
+    }
+
+    /// [`Self::half_sum`] in one host wave of 64 where some lanes have left (a thread past
+    /// the end of the data returns early): the console runs the sum in every lane, a lane
+    /// outside EXEC with +0, so after step k every lane of an aligned run of 2^k lanes holds
+    /// that run's partial sum, the lanes that left included. A lane reads its partner run's
+    /// sum from the first lane of that run that is here, and +0 where none is (every lane of
+    /// the run left, so its terms were all +0). Lane 0's high half likewise: 0 if it left.
+    fn half_sum_present(&mut self, x: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        self.s.flags |= flags::WAVE_OPS;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let here = self.s.m.bool(true);
+        let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[here]);
+        let (blo, bhi) = (self.s.m.extract(c, ballot, 0), self.s.m.extract(c, ballot, 1));
+        let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let [zero, k31, k32] = [0, 31, 32].map(|k| self.s.m.i32(k));
+        // The lanes of the run of `size` lanes at `base` that are here, from bit 0.
+        let present = |l: &mut Self, base: V, size: u32| -> V {
+            let upper = l.s.m.cmp(c, pred::IUGE, base, k32);
+            let word = l.s.m.select(c, upper, bhi, blo);
+            let at = l.s.m.bin(c, Bin::And, base, k31);
+            let bits = l.s.m.bin(c, Bin::LShr, word, at);
+            if size >= 32 {
+                bits
+            } else {
+                let m = l.s.m.i32((1u32 << size) - 1);
+                l.s.m.bin(c, Bin::And, bits, m)
+            }
+        };
+        let mut sum = x;
+        for step in 0..6u32 {
+            let size = 1u32 << step;
+            let (bit, run) = (self.s.m.i32(size), self.s.m.i32(!(size - 1)));
+            let other = self.s.m.bin(c, Bin::Xor, lane, bit);
+            let base = self.s.m.bin(c, Bin::And, other, run);
+            let bits = present(self, base, size);
+            // FirstbitLo (dx.op 32): the run's first lane that is here
+            let first = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[bits]);
+            let any = self.s.m.cmp(c, pred::NE, bits, zero);
+            let first = self.s.m.select(c, any, first, zero);
+            let from = self.s.m.bin(c, Bin::Add, base, first);
+            let theirs = self.read_lane(sum, from);
+            let theirs = self.s.m.select(c, any, theirs, zero);
+            sum = self.add_halves(sum, theirs);
+        }
+        let (high, low, one) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF), self.s.m.i32(1));
+        let lane0 = self.s.m.bin(c, Bin::And, blo, one);
+        let lane0 = self.s.m.cmp(c, pred::NE, lane0, zero);
+        let first = self.read_lane(x, zero);
+        let first = self.s.m.select(c, lane0, first, zero);
+        let first = self.s.m.bin(c, Bin::And, first, high);
+        let sum = self.s.m.bin(c, Bin::And, sum, low);
+        self.s.m.bin(c, Bin::Or, first, sum)
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -5809,6 +5887,18 @@ impl<'a> Lower<'a> {
                 .find_map(|(s, _)| use_of(*s))
         };
         let use_at = use_of(site).or_else(twin);
+        // A descriptor nothing uses as one, whose size the code reads all the same (a
+        // texture picked from the heap by an index in a constant buffer, its width and
+        // height turned into a texel size; a buffer tested for being empty by its record
+        // count): the kind from its dwords and its used-resource entry.
+        let unused = if use_at.is_none() {
+            self.unused_descriptor_kind(inst, site, code, count)
+        } else {
+            None
+        };
+        let (first, props, image, uav, used) = if let Some(kind) = unused {
+            kind
+        } else {
         let Some((at, first)) = use_at else {
             // A descriptor kept per lane in VGPRs (`Resources::lane_copied`): the code only
             // copies its dwords and compares them, lane against first lane, and every load
@@ -5918,6 +6008,9 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
+        (first, props, image, uav, used)
+        };
+        let src = Source::Loaded { load: site, first };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -5985,8 +6078,10 @@ impl<'a> Lower<'a> {
                     inst.write(Reg::S(code + first + k))
                         .is_some_and(|v| self.computed_with(v, 6))
                 });
+                // (A descriptor nothing uses as one gets it whenever the host can tell it, as
+                // a buffer whose address alone is read does.)
                 if first == 0
-                    && computed
+                    && (computed || unused.is_some())
                     && let Some((lo, hi)) = self.view_address(site)
                 {
                     words.extend([(0, lo), (1, hi)]);
@@ -6007,6 +6102,67 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// What [`Self::descriptor_data`] makes of a descriptor load that nothing uses as a
+    /// descriptor but whose dwords the code reads: the first dword, the handle properties,
+    /// the image kind (none for a buffer), whether it is an unordered view, and its
+    /// used-resource entry. An image's eight dwords read as a 2D texture's, a buffer's four
+    /// as a raw view's where the code reads its record count (dword 2); none for anything
+    /// else (a constant buffer, a sampler, a buffer whose address alone is read).
+    // shortcut: an image whose kind nothing tells is taken for a 2D texture (the title's
+    // reads are texel sizes of 2D textures: puddle masks, shadow masks); a host view of
+    // another kind would answer its own sizes.
+    #[allow(clippy::type_complexity)]
+    fn unused_descriptor_kind(
+        &self,
+        inst: &Inst,
+        site: Site,
+        code: u8,
+        count: u32,
+    ) -> Option<(u8, (u32, u32), Option<u32>, bool, Option<&'a UsedResource>)> {
+        // Kept per lane and compared (`Resources::lane_copied`), or a sampler's: the cases
+        // `descriptor_data` handles on their own.
+        if self.x.res.lane_copied.contains(&site)
+            || self.x.res.descriptors.iter().any(|d| {
+                d.role == Role::Sampler
+                    && d.source.leaves().into_iter().any(
+                        |l| matches!(*l, Source::Loaded { load, .. } if load == site),
+                    )
+            })
+        {
+            return None;
+        }
+        let used = self.used_kind(&Source::Loaded {
+            load: site,
+            first: 0,
+        });
+        if used.is_some_and(|u| !matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) {
+            return None;
+        }
+        let read = |k: u32| {
+            inst.write(Reg::S(code + k as u8)).is_some_and(|v| {
+                self.x
+                    .p
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .any(|i| i.reads.iter().any(|r| r.1 == v))
+            })
+        };
+        let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+        let u = if uav { 0x1000 } else { 0 };
+        match count {
+            // width (dwords 1-2), height (2), levels (3), depth (4)
+            8 if (1..5).any(read) && used.is_none_or(|u| u.dwords == 8) => {
+                Some((0, (2 | u, 0x409), Some(2), uav, used))
+            }
+            // the record count
+            4 if read(2) && used.is_none_or(|u| u.dwords == 4) => {
+                Some((0, (11 | u, 0), None, uav, used))
+            }
+            _ => None,
+        }
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -7392,12 +7548,6 @@ impl<'a> Lower<'a> {
                 let r = self.read_lane(x, from);
                 int(self, r)
             }
-            "v_cvt_f32_f64" => {
-                let (lo, hi) = self.f64_pair(inst, 0)?;
-                let bits = self.f64_to_f32_bits(lo, hi);
-                let r = self.as_float(bits);
-                float(self, r)
-            }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
             | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
                 let mut a = s(self, 0)?;
@@ -7413,6 +7563,12 @@ impl<'a> Lower<'a> {
                     Cast::UiToFp
                 };
                 let r = self.s.m.cast(c, op, a, self.s.t.f32);
+                float(self, r)
+            }
+            "v_cvt_f32_f64" => {
+                let (lo, hi) = self.f64_pair(inst, 0)?;
+                let bits = self.f64_to_f32_bits(lo, hi);
+                let r = self.as_float(bits);
                 float(self, r)
             }
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
@@ -9179,7 +9335,26 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
-            return Err("the first half of an interpolation");
+            // The first half of a pair: its second half interpolates the
+            // attribute itself, so nothing needs this half's partial sum.
+            // But an f16 second half that writes the high half of the
+            // register this one wrote keeps the low half as it was (the
+            // console compiler reuses the register; the low half is not
+            // read), so the register needs a value: 0.
+            let name = inst.name();
+            if name == "v_interp_p1_f32" || name == "v_interp_p1ll_f16" {
+                let dst = match &inst.fields {
+                    Fields::Vintrp { dst, .. } => Some(*dst),
+                    Fields::Valu(v) => v.dst,
+                    _ => None,
+                };
+                if let Some(Operand::Vector { reg, .. }) = dst {
+                    let zero = self.s.m.i32(0);
+                    self.write(inst, Reg::V(reg), zero, None);
+                    return Ok(());
+                }
+            }
+            return Err(FIRST_HALF);
         };
         let name = inst.name();
         let (dst, src) = match &inst.fields {
@@ -11395,607 +11570,5 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 #[path = "lane_uniform_tests.rs"]
 mod lane_uniform_tests;
 #[cfg(test)]
-mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
-    use crate::native::{
-        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
-    };
-    use crate::{io, ir, resource, structure};
-
-    const S_ENDPGM: u32 = 0xBF81_0000;
-
-    #[test]
-    fn packed_pixel_inputs_find_their_second_row() {
-        use super::super::container::SigElement;
-        use super::half_input_partners;
-        use crate::native::{PsInput, Usage};
-        let entry = |row, row2, pack2| PsInput {
-            usage: Usage::Generic,
-            row,
-            mask: 0xF,
-            attr: row,
-            flat: false,
-            fp16: true,
-            pack2,
-            row2,
-        };
-        let element = |row| SigElement {
-            name: "TEXCOORD".into(),
-            index: row,
-            kind: 0,
-            comp: 9,
-            interp: 2,
-            row: Some(row),
-            col: 0,
-            cols: 4,
-            usage: 0,
-            half: true,
-        };
-        // Rows 0 and 3 pack and leave their second row out; 5 names its
-        // own (6). Unnamed 16-bit rows: 1, 4, 6, 7.
-        let io = StageIo::Ps {
-            inputs: vec![entry(0, 0, true), entry(3, 3, true), entry(5, 6, true)],
-            input_addr: 0,
-            db_shader_control: 0,
-            patches: vec![],
-        };
-        let sig: Vec<_> = [0, 1, 3, 4, 5, 6, 7].map(element).into();
-        let p = half_input_partners(&io, &sig);
-        assert_eq!(p.get(&0), Some(&1));
-        assert_eq!(p.get(&3), Some(&4));
-        assert_eq!(p.get(&5), None);
-    }
-
-    /// The packed pedestrian layouts of the title: an element
-    /// behind another one in its register follows in the first parameter
-    /// with a dword left, and is not a half of its register's row.
-    #[test]
-    fn packed_elements_behind_another_take_the_first_free_dword() {
-        use super::super::container::SigElement;
-        use super::packed_half;
-        let element = |index, row, col, cols| SigElement {
-            name: "TEXCOORD".into(),
-            index,
-            kind: 0,
-            comp: 9,
-            interp: 2,
-            row: Some(row),
-            col,
-            cols,
-            usage: 0,
-            half: true,
-        };
-        // MS_VS_PedTransformPreSkinD_Packed 005fe88ec1bdc0c7 and its pixel
-        // shader 93667197d3d05e1c: TEXCOORD6 is one value at register 4
-        // column 3; parameter 3 (rows 6 and 7) carries it in dword 3.
-        let sig = vec![
-            element(1, 2, 0, 4),
-            element(2, 3, 0, 4),
-            element(4, 4, 0, 3),
-            element(6, 4, 3, 1),
-            element(3, 5, 0, 4),
-            element(5, 6, 0, 4),
-            element(7, 7, 0, 2),
-            element(9, 9, 0, 3),
-            element(11, 10, 0, 3),
-            element(15, 12, 0, 4),
-        ];
-        let packs = [
-            (2, Some(3)),
-            (4, Some(5)),
-            (6, Some(7)),
-            (9, Some(10)),
-            (12, None),
-        ];
-        let at = |a, h| packed_half(&sig, &packs, a, h);
-        // Parameter 2: TEXCOORD4's three values, a zero half, TEXCOORD3.
-        assert_eq!(at(4, 2), Some((4, 2)));
-        assert_eq!(at(4, 3), None);
-        assert_eq!(at(4, 4), Some((5, 0)));
-        assert_eq!(at(4, 7), Some((5, 3)));
-        // Parameter 3: TEXCOORD5, TEXCOORD7, then TEXCOORD6 alone.
-        assert_eq!(at(6, 3), Some((6, 3)));
-        assert_eq!(at(6, 5), Some((7, 1)));
-        assert_eq!(at(6, 6), Some((4, 3)));
-        assert_eq!(at(6, 7), None);
-        // Parameters without such an element are as before.
-        assert_eq!(at(9, 3), None);
-        assert_eq!(at(9, 4), Some((10, 0)));
-        assert_eq!(at(12, 3), Some((12, 3)));
-        assert_eq!(at(12, 4), None);
-        // The common layout (29805d23a495cdf8): TEXCOORD7 is two values at
-        // register 1 columns 2-3; parameter 0 is TEXCOORD0, TEXCOORD1,
-        // TEXCOORD7.
-        let sig = vec![
-            element(0, 1, 0, 2),
-            element(7, 1, 2, 2),
-            element(1, 2, 0, 4),
-            element(2, 3, 0, 4),
-            element(4, 4, 0, 3),
-        ];
-        let packs = [(3, Some(4)), (1, Some(2))];
-        let at = |a, h| packed_half(&sig, &packs, a, h);
-        assert_eq!(at(1, 1), Some((1, 1)));
-        assert_eq!(at(1, 2), Some((2, 0)));
-        assert_eq!(at(1, 5), Some((2, 3)));
-        assert_eq!(at(1, 6), Some((1, 2)));
-        assert_eq!(at(1, 7), Some((1, 3)));
-        assert_eq!(at(3, 6), Some((4, 2)));
-        assert_eq!(at(3, 7), None);
-        // A row no element holds gives nothing, as before.
-        assert_eq!(packed_half(&sig, &[(8, None)], 8, 0), None);
-    }
-
-    /// Whether a synthetic compute program translates with these input registers.
-    fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let native = NativeProgram {
-            stage: HwStage::Cs,
-            wave64: false,
-            vgprs: 256,
-            layout: vec![],
-            used: vec![],
-            io: StageIo::Cs(ComputeIo {
-                rsrc2,
-                threads: [1, 1, 1],
-            }),
-            code,
-        };
-        let p = ir::build(&native.code, false, 256).unwrap();
-        let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-        let io = io::raise(&p, &native).unwrap();
-        lower(&Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
-        })
-        .map(|_| ())
-    }
-
-    /// Lowers a compute program with the root parameters `layout` (in user
-    /// SGPRs from s0 on) and the used resources `used`.
-    fn lower_with(
-        words: &[u32],
-        layout: Vec<RootParam>,
-        used: Vec<UsedResource>,
-    ) -> Result<Lowered, crate::ShaderError> {
-        lower_wave(words, layout, used, false)
-    }
-
-    /// [`lower_with`] in wave64 if `wave64`.
-    fn lower_wave(
-        words: &[u32],
-        layout: Vec<RootParam>,
-        used: Vec<UsedResource>,
-        wave64: bool,
-    ) -> Result<Lowered, crate::ShaderError> {
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
-        let native = NativeProgram {
-            stage: HwStage::Cs,
-            wave64,
-            vgprs: 256,
-            layout,
-            used,
-            io: StageIo::Cs(ComputeIo {
-                // The layout's user SGPRs (at least two), 512 bytes of LDS.
-                rsrc2: 1 << 15 | sgprs.max(2) << 1,
-                threads: [1, 1, 1],
-            }),
-            code,
-        };
-        let p = ir::build(&native.code, wave64, 256).unwrap();
-        let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-        let io = io::raise(&p, &native).unwrap();
-        lower(&Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
-        })
-    }
-
-    /// Root parameter `slot` in user SGPRs from `user_data` on.
-    fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
-        RootParam {
-            root,
-            table_offset_dwords: 0,
-            sgprs: if root == RootType::Descriptor { 2 } else { 1 },
-            base_register: 0,
-            user_data,
-            slot,
-        }
-    }
-
-    #[test]
-    fn buffer_cache_invalidations_lower_as_no_ops() {
-        // MUBUF opcode 0x071/0x072 with no data operand: the title asks the
-        // host to invalidate its cached view of a buffer.
-        assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl0_inv");
-        assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
-    }
-
-    #[test]
-    fn a_scalar_carry_chain_reaches_the_select() {
-        // The high dword of a 64-bit add or subtract, then a select on the
-        // carry (borrow) the high half leaves in SCC, and a branch on it
-        // (only code with an effect needs its operands).
-        let add = [
-            0xBE80_03C1, // s_mov_b32 s0, -1
-            0xBE81_0380, // s_mov_b32 s1, 0
-            0x8000_8100, // s_add_u32 s0, s0, 1
-            0x8201_8001, // s_addc_u32 s1, s1, 0
-            0x8502_0001, // s_cselect_b32 s2, s1, s0
-            0xBF07_8002, // s_cmp_lg_u32 s2, 0
-            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
-            0xBE83_0380, // s_mov_b32 s3, 0
-            S_ENDPGM,
-        ];
-        let sub = [
-            0xBE80_0380, // s_mov_b32 s0, 0
-            0xBE81_0380, // s_mov_b32 s1, 0
-            0x8080_8100, // s_sub_u32 s0, s0, 1
-            0x8281_8001, // s_subb_u32 s1, s1, 0
-            0x8502_0001, // s_cselect_b32 s2, s1, s0
-            0xBF07_8002, // s_cmp_lg_u32 s2, 0
-            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
-            0xBE83_0380, // s_mov_b32 s3, 0
-            S_ENDPGM,
-        ];
-
-        for words in [add, sub] {
-            lowers(&words, 0).unwrap();
-        }
-    }
-
-    fn perm_features(selector: u32) -> u64 {
-        // Synthetic compute shader:
-        // v0 is the thread ID and can supply a dynamic selector.
-        // Store the result in LDS to keep the permutation live.
-        let words = [
-            0x7E02_02FFu32,
-            0x817F_34AB,
-            0x7E04_02FF,
-            0xFE01_56CD,
-            0xD744_0003,
-            257 | (258 << 9) | (selector << 18),
-            0x3408_0082,
-            0xD834_0000,
-            0x0000_0304,
-            S_ENDPGM,
-        ];
-
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
-
-        let native = NativeProgram {
-            stage: HwStage::Cs,
-            wave64: false,
-            vgprs: 256,
-            layout: vec![],
-            used: vec![],
-            io: StageIo::Cs(ComputeIo {
-                rsrc2: 1 << 15,
-                threads: [64, 1, 1],
-            }),
-            code,
-        };
-
-        let p = ir::build(&native.code, false, 256).unwrap();
-
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
-
-        let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-
-        let io = io::raise(&p, &native).unwrap();
-
-        let emitted = lower(&Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
-        }).unwrap();
-
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
-
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
-
-        u64::from_le_bytes(features.data.try_into().unwrap())
-    }
-
-    #[test]
-    fn perm_constant_selector_needs_no_int64() {
-        assert_eq!(perm_features(128) & 0x8000, 0);
-    }
-
-    #[test]
-    fn perm_dynamic_selector_needs_no_int64() {
-        assert_eq!(
-            perm_features(256) & 0x8000,
-            0,
-            "dynamic v_perm_b32 must not require INT64"
-        );
-    }
-
-    #[test]
-    fn a_descriptor_selected_by_scc_picks_its_heap_index() {
-        // Two buffer descriptors loaded from the table at s0, one picked by
-        // a root constant (s1) with s_cselect_b64 per half, and loaded
-        // through by index and stored to LDS so the load is needed.
-        let words = [
-            0xBE84_0300, // s_mov_b32 s4, s0
-            0xBE85_0380, // s_mov_b32 s5, 0
-            0xF408_0202,
-            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
-            0xF408_0302,
-            0xFA00_0010, // s_load_dwordx4 s[12:15], s[4:5], 0x10
-            0xBF06_8001, // s_cmp_eq_u32 s1, 0
-            0x8590_0C08, // s_cselect_b64 s[16:17], s[8:9], s[12:13]
-            0x8592_0E0A, // s_cselect_b64 s[18:19], s[10:11], s[14:15]
-            0xE030_2000,
-            0x8004_0100, // buffer_load_dword v1, v0, s[16:19], 0 idxen
-            0xD834_0000,
-            0x0000_0100, // ds_write_b32 v0, v1
-            S_ENDPGM,
-        ];
-        let layout = || vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
-        // Both are structured buffers of dwords in the table's range.
-        let used = || {
-            vec![UsedResource {
-                kind: ResourceType::Srv,
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                lower_bound: 0,
-                stride: 4,
-                dwords: 4,
-                user_data: 0,
-                slot: 0,
-            }]
-        };
-        lower_with(&words, layout(), used()).unwrap();
-    }
-
-    /// Tables of 2D textures at s0 and samplers at s1.
-    fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
-        let range = |kind, user_data, slot| UsedResource {
-            kind,
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            lower_bound: 0,
-            stride: 0,
-            dwords: if kind == ResourceType::Sampler { 4 } else { 8 },
-            user_data,
-            slot,
-        };
-        (
-            vec![root(RootType::Table, 0, 0), root(RootType::Table, 1, 1)],
-            vec![
-                range(ResourceType::Srv, 0, 0),
-                range(ResourceType::Sampler, 1, 1),
-            ],
-        )
-    }
-
-    #[test]
-    fn waterfall_loops_over_per_lane_descriptors_sample_with_each_lanes_own() {
-        use crate::resource::tests::{
-            WATERFALL_FETCHED_WAVE32, WATERFALL_FETCHED_WAVE64, WATERFALL_PICKED_WAVE32,
-        };
-        for (words, wave64) in [
-            (WATERFALL_FETCHED_WAVE32, false),
-            (WATERFALL_FETCHED_WAVE64, true),
-            (WATERFALL_PICKED_WAVE32, false),
-        ] {
-            let (layout, used) = texture_tables();
-            let l = lower_wave(words, layout, used, wave64).unwrap();
-            // The loop's reads of the first lane became each lane's own
-            // dwords: no wave operation is left.
-            assert_eq!(l.nonuniform_handles, 1);
-            assert!(!l.wave_ops);
-        }
-    }
-
-    /// [`texture_tables`] with a raw buffer UAV at dword 16 of the first.
-    pub(crate) fn texture_and_uav_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
-        let (layout, mut used) = texture_tables();
-        used.push(UsedResource {
-            kind: ResourceType::Uav,
-            root: RootType::Table,
-            table_offset_dwords: 16,
-            lower_bound: 0,
-            stride: 0,
-            dwords: 4,
-            user_data: 0,
-            slot: 0,
-        });
-        (layout, used)
-    }
-
-    #[test]
-    fn waterfall_loops_over_descriptors_joined_per_lane_sample_with_each_lanes_own() {
-        use crate::resource::tests::{WATERFALL_JOINED_MIXED_WAVE32, WATERFALL_JOINED_WAVE32};
-        for words in [WATERFALL_JOINED_WAVE32, WATERFALL_JOINED_MIXED_WAVE32] {
-            let (layout, used) = texture_and_uav_tables();
-            let l = lower_wave(words, layout, used, false).unwrap();
-            // One image handle, from the join's per-lane heap index.
-            assert_eq!(l.nonuniform_handles, 1);
-            assert!(!l.wave_ops);
-        }
-    }
-
-    #[test]
-    fn scalar_bit_tests_lower() {
-        // Each tests one bit of a constant into SCC and branches on it (only
-        // code with an effect needs its operands).
-        let tail = [
-            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
-            0xBE84_0380, // s_mov_b32 s4, 0
-            S_ENDPGM,
-        ];
-        let bit_tests: [&[u32]; 4] = [
-            &[0xBE81_0387, 0xBF0C_8301], // s_mov_b32 s1, 7; s_bitcmp0_b32 s1, 3
-            &[0xBE81_0387, 0xBF0D_8301], // s_mov_b32 s1, 7; s_bitcmp1_b32 s1, 3
-            &[
-                0xBE80_0387, // s_mov_b32 s0, 7
-                0xBE81_0380, // s_mov_b32 s1, 0
-                0xBF0E_8300, // s_bitcmp0_b64 s[0:1], 3
-            ],
-            &[
-                0xBE80_0387, // s_mov_b32 s0, 7
-                0xBE81_0380, // s_mov_b32 s1, 0
-                0xBF0F_8300, // s_bitcmp1_b64 s[0:1], 3
-            ],
-        ];
-        for head in bit_tests {
-            let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
-            lowers(&words, 0).unwrap();
-        }
-    }
-
-    #[test]
-    #[ignore = "ours marks joins read through joins only with VICTORY_STRICT_JOINS (40 programs stop otherwise)"]
-    fn a_missing_value_stays_missing_through_two_live_joins() {
-        let mut words = [
-            0xF490_0180,
-            0,           // s_memtime s[6:7]
-            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
-            0xBF85_0001, // skip the first overwrite
-            0xBE86_0380, // s_mov_b32 s6, 0
-            0xBF06_8101, // s_cmp_eq_u32 s1, 1 (s1 = group id Y)
-            0xBF85_0001, // skip the second overwrite
-            0xBE86_0381, // s_mov_b32 s6, 1
-            0xBF07_8006, // s_cmp_lg_u32 s6, 0
-            0xBF85_0001, // use the result to branch
-            0xBE83_0380,
-            S_ENDPGM,
-        ];
-        let group_ids_xy = 3 << 7;
-        // Compare to a direct read so future timestamp support works in both cases.
-        let refusal = |code: &[u32]| match lowers(code, group_ids_xy) {
-            Ok(()) => None,
-            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
-            Err(error) => panic!("{error}"),
-        };
-        let direct = [&words[..2], &words[8..]].concat();
-        assert_eq!(refusal(&words), refusal(&direct));
-        words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
-        lowers(&words, group_ids_xy).expect("dead timestamp");
-    }
-
-    #[test]
-    fn buffer_formats_by_number() {
-        // The numbers the disassembler names 8_8_8_8_UNORM, 16_16_SNORM,
-        // 2_10_10_10_UNORM, 16_FLOAT, 32_32_32_32_FLOAT.
-        assert_eq!(buffer_format(56), Some((&[8, 8, 8, 8][..], Numeric::Unorm)));
-        assert_eq!(buffer_format(24), Some((&[16, 16][..], Numeric::Snorm)));
-        assert_eq!(
-            buffer_format(50),
-            Some((&[10, 10, 10, 2][..], Numeric::Unorm))
-        );
-        assert_eq!(buffer_format(13), Some((&[16][..], Numeric::Float)));
-        assert_eq!(
-            buffer_format(77),
-            Some((&[32, 32, 32, 32][..], Numeric::Float))
-        );
-        // Invalid, past the table.
-        assert_eq!(buffer_format(0), None);
-        assert_eq!(buffer_format(78), None);
-    }
-
-    #[test]
-    fn packed_buffer_formats_by_number() {
-        // LLVM's `UfmtGFX10`: 10_11_11 is 30-36, 11_11_10 37-43,
-        // 10_10_10_2 44-49. Channels from the lowest bits: R11G11B10_FLOAT
-        // is 10_11_11 (Mesa), 10_10_10_2 has the 2-bit channel first.
-        assert_eq!(buffer_format(30), Some((&[11, 11, 10][..], Numeric::Unorm)));
-        assert_eq!(buffer_format(36), Some((&[11, 11, 10][..], Numeric::Float)));
-        assert_eq!(buffer_format(37), Some((&[10, 11, 11][..], Numeric::Unorm)));
-        assert_eq!(buffer_format(43), Some((&[10, 11, 11][..], Numeric::Float)));
-        assert_eq!(
-            buffer_format(44),
-            Some((&[2, 10, 10, 10][..], Numeric::Unorm))
-        );
-        assert_eq!(
-            buffer_format(45),
-            Some((&[2, 10, 10, 10][..], Numeric::Snorm))
-        );
-        assert_eq!(
-            buffer_format(46),
-            Some((&[2, 10, 10, 10][..], Numeric::Uscaled))
-        );
-        assert_eq!(
-            buffer_format(47),
-            Some((&[2, 10, 10, 10][..], Numeric::Sscaled))
-        );
-        assert_eq!(
-            buffer_format(48),
-            Some((&[2, 10, 10, 10][..], Numeric::Uint))
-        );
-        assert_eq!(
-            buffer_format(49),
-            Some((&[2, 10, 10, 10][..], Numeric::Sint))
-        );
-    }
-
-    /// A half's value (sign, 5-bit exponent biased 15, 10-bit mantissa), as
-    /// `legacyF16ToF32` widens it.
-    fn half(h: u32) -> f32 {
-        let (s, e, m) = ((h >> 15) & 1, (h >> 10) & 31, h & 1023);
-        let v = match e {
-            0 => m as f32 * 2f32.powi(-24),
-            31 if m == 0 => f32::INFINITY,
-            31 => f32::NAN,
-            _ => (1024 + m) as f32 * 2f32.powi(e as i32 - 25),
-        };
-        if s == 1 { -v } else { v }
-    }
-
-    #[test]
-    fn small_floats_widen_as_halves() {
-        // Unsigned 11- and 10-bit floats: a 5-bit exponent biased 15 over a
-        // 6- or 5-bit mantissa, no sign; values from the D3D/GL spec.
-        let f11 = |x: u32| half(x << half_shift(11));
-        let f10 = |x: u32| half(x << half_shift(10));
-        assert_eq!(f11(0), 0.0);
-        assert_eq!(f11(0x001), 2f32.powi(-20)); // smallest denormal
-        assert_eq!(f11(0x03F), 63.0 * 2f32.powi(-20)); // largest denormal
-        assert_eq!(f11(0x040), 2f32.powi(-14)); // smallest normal
-        assert_eq!(f11(0x3C0), 1.0);
-        assert_eq!(f11(0x3E0), 1.5);
-        assert_eq!(f11(0x7BF), 65024.0); // largest
-        assert_eq!(f11(0x7C0), f32::INFINITY);
-        assert!(f11(0x7C1).is_nan());
-        assert_eq!(f10(0x001), 2f32.powi(-19));
-        assert_eq!(f10(0x020), 2f32.powi(-14));
-        assert_eq!(f10(0x1E0), 1.0);
-        assert_eq!(f10(0x3DF), 64512.0);
-        assert_eq!(f10(0x3E0), f32::INFINITY);
-        assert!(f10(0x3FF).is_nan());
-        // A 16-bit float is a half already, sign included.
-        assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
-    }
-}
+#[path = "lower_tests.rs"]
+mod tests;
