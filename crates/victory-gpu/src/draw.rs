@@ -3296,6 +3296,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             let a = crate::resource::host_copy(object).unwrap();
             let b = crate::resource::host_copy(placed as This).unwrap();
+            // A cross-family cast only shares storage if the device accepted
+            // this format in the source texture's cast list. The copy path
+            // must produce the same sampled values on legacy devices.
+            let shared = shared && a.castable.contains(&format);
             assert_eq!(std::sync::Arc::ptr_eq(&a, &b), shared, "round {round}: one host texture");
             let unordered = View::Unordered(object as usize, 0, Some([written, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
             slots.make(0, &unordered);
