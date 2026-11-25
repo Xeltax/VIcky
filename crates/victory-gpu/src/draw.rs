@@ -1139,6 +1139,25 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_ADDRESSES {
+                        // Ours: the title addresses of the heap's buffer
+                        // views, for a shader that reads one out of a
+                        // descriptor it picks by an index it computes.
+                        let Some(gpu) = self.heap_addresses(list) else {
+                            once!("a shader reads view addresses of a view heap that is not set: the draw is dropped");
+                            return false;
+                        };
+                        // SAFETY: an open list; the table lives as long as
+                        // the heap the list holds.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, gpu);
+                            }
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -1417,6 +1436,26 @@ impl State {
             }
         }
         true
+    }
+
+    /// For a shader that reads the address out of a buffer descriptor it
+    /// picks from the view heap by an index it computes: the GPU address of
+    /// the heap's table of view addresses by title slot, which the heap
+    /// keeps up to date as the title writes its slots.
+    fn heap_addresses(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let (buffer, gpu) = heap.host()?.addresses()?;
+        // The list may outlive the title's heap object, which owns the
+        // table: held once per list and table.
+        if list.first_use(buffer.as_raw() as usize) {
+            list.keep(buffer);
+        }
+        Some(gpu)
     }
 
     /// For a shader that picks buffers from the view heap by an index it

@@ -80,6 +80,13 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps: the title address of the buffer view at each title slot
+    /// (0 for a slot without one), for shaders that read the address out of
+    /// a buffer descriptor they pick by an index they compute
+    /// (`victory_shader::emit::SLOT_VIEW_ADDRESSES`): an upload buffer of
+    /// `SLOT_STRIDES_COUNT` addresses of 8 bytes, its GPU address and its
+    /// mapping.
+    addresses: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -1206,6 +1213,19 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let addresses = (!sampler)
+            .then(|| {
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 8;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "view addresses by view heap slot".to_owned());
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
         // Title-keyed state covers the title's slots past the window too.
         let (pool, dynamic_first, titled) = match layout {
             Some(l) => (l.pool, l.dynamic_first(), title_count),
@@ -1235,6 +1255,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            addresses,
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -1546,6 +1567,21 @@ impl HostHeap {
     /// The table's buffer, for a list to hold.
     pub(crate) fn strides_buffer(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|s| &s.0)
+    }
+
+    /// The table of view addresses by title slot (view heaps): its buffer,
+    /// for a list to hold, and its GPU address.
+    pub(crate) fn addresses(&self) -> Option<(&ID3D12Resource, u64)> {
+        self.addresses.as_ref().map(|s| (&s.0, s.1))
+    }
+
+    /// The address the table of view addresses holds for title slot
+    /// `index`.
+    #[cfg(test)]
+    fn address_at(&self, index: u32) -> Option<u64> {
+        let (_, _, data) = self.addresses.as_ref()?;
+        // SAFETY: inside the mapping.
+        Some(unsafe { (*data as *const u64).add(index as usize).read_volatile() })
     }
 
     /// Up to `max` title slots whose texture view is due at `frame`, each
@@ -1970,8 +2006,8 @@ impl HostHeap {
     }
 
     /// Records what title slot `index` now holds for shaders that pick
-    /// buffers from the heap: its element stride in the table, and whether
-    /// it is a buffer view at all.
+    /// buffers from the heap: its element stride and its title address in
+    /// the tables, and whether it is a buffer view at all.
     /// `seen`: the slot was not written now, a draw or a pass made its
     /// host slot from what it held.
     /// Returns the title slots whose placed texture view the write made
@@ -2047,6 +2083,14 @@ impl HostHeap {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+        }
+        if let Some((_, _, data)) = &self.addresses
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            let address = view.and_then(buffer_range).map_or(0, |(address, _)| address);
+            // SAFETY: inside the mapping, 8-byte aligned; one store, so a
+            // shader reading the slot meanwhile sees an address it had.
+            unsafe { (*data as *mut u64).add(index as usize).write_volatile(address) };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
@@ -3937,6 +3981,33 @@ mod tests {
         assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
         assert_eq!(slots(61), []);
         assert_eq!(slots(62), [1]);
+    }
+
+    /// The table of view addresses holds the title address of each slot's
+    /// buffer view (its first byte, as the console's descriptor holds it),
+    /// and 0 once the slot holds no buffer view.
+    #[test]
+    fn the_view_address_table_follows_the_slots() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // A structured view from element 2, ten elements of 16 bytes, of
+        // a buffer of 4 KiB at an address no test and no title uses.
+        let at = 0x7fee_0000_0000u64;
+        let mut desc = [0u32; 16];
+        (desc[1], desc[4], desc[6], desc[7]) = (1, 2, 10, 16);
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let buffer = View::Placed(false, [1, 0, 0, 0, 0x1000, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0], desc);
+        assert_eq!(heap.address_at(5), Some(0));
+        let _ = heap.note_buffer(5, Some(&buffer), false);
+        assert_eq!(heap.address_at(5), Some(at + 32));
+        assert_eq!(heap.address_at(4), Some(0), "the other slots keep theirs");
+        let _ = heap.note_buffer(5, None, false);
+        assert_eq!(heap.address_at(5), Some(0), "emptied");
+        let texture = View::Placed(false, [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0], desc);
+        let _ = heap.note_buffer(5, Some(&buffer), false);
+        let _ = heap.note_buffer(5, Some(&texture), false);
+        assert_eq!(heap.address_at(5), Some(0), "a texture view has no buffer address");
     }
 
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that

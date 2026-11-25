@@ -89,6 +89,8 @@
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
+mod descriptor_words_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
@@ -124,7 +126,7 @@ pub use per_program::{deep_skips_allowed, for_program, wave64_retried};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_MARKS, MEMORY_NOTES, MEMORY_PAGE_MARKS, MEMORY_PAGES, MEMORY_TOUCHED, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY,
-    SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_THREADS, USER_MEMORY_BASE,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES, USER_DATA_SPACE, USER_DISPATCH_THREADS, USER_MEMORY_BASE,
     USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, set_view_heap_map, view_heap_limit, view_heap_map,
 };
 
