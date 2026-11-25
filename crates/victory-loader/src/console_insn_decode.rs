@@ -11,8 +11,6 @@ pub enum ConsoleOnly {
     Clwb,
     /// `clzero`: zero the 64-byte cache line at rAX
     Clzero,
-    /// `clzero` loop: `clzero; add rax, 0x40; cmp rax, <reg>; jb -12` – zero `[rax..reg)`
-    ClzeroLoop { end_reg: u8 },
     /// `rdpru`: ecx = 0 MPERF / 1 APERF → edx:eax (a counter)
     Rdpru,
     /// `monitorx` / `mwaitx`: a wait the emulation skips
@@ -113,25 +111,7 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
         return None;
     }
     match (*code.get(i + 1)?, code.get(i + 2).copied()) {
-        (0x01, Some(0xFC)) => {
-            // clzero (0F 01 FC); add rax, 0x40 (48 83 C0 40); cmp rax, <reg> ([48|4C] 39 modrm); jb -12 (72 F4)
-            // (not after an 0x67: that CLZERO is at EAX, and the jb goes back to the 0F, past the
-            // prefix – it is stepped alone, the loop is taken from the next one)
-            if code.len() >= i + 12
-                && !code[..i].contains(&0x67)
-                && code[i + 3..i + 7] == [0x48, 0x83, 0xC0, 0x40]
-                && (code[i + 7] == 0x48 || code[i + 7] == 0x4C)
-                && code[i + 8] == 0x39
-                && code[i + 10..i + 12] == [0x72, 0xF4]
-            {
-                let rex_r = code[i + 7] == 0x4C;
-                let modrm = code[i + 9];
-                let reg_idx = ((modrm >> 3) & 7) | if rex_r { 8 } else { 0 };
-                Some((ConsoleOnly::ClzeroLoop { end_reg: reg_idx }, i + 12))
-            } else {
-                Some((ConsoleOnly::Clzero, i + 3))
-            }
-        }
+        (0x01, Some(0xFC)) => Some((ConsoleOnly::Clzero, i + 3)),
         (0x01, Some(0xFD)) => Some((ConsoleOnly::Rdpru, i + 3)),
         (0x01, Some(0xFA)) => Some((ConsoleOnly::Monitorx, i + 3)),
         (0x01, Some(0xFB)) => Some((ConsoleOnly::Mwaitx, i + 3)),
@@ -184,12 +164,12 @@ mod tests {
         // clzero loop against r10 (4C 39 D0 = cmp rax, r10)
         assert_eq!(
             decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C, 0x39, 0xD0, 0x72, 0xF4]),
-            Some((ConsoleOnly::ClzeroLoop { end_reg: 10 }, 12))
+            Some((ConsoleOnly::Clzero, 3))
         );
         // clzero loop against rdx (48 39 D0 = cmp rax, rdx)
         assert_eq!(
             decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4]),
-            Some((ConsoleOnly::ClzeroLoop { end_reg: 2 }, 12))
+            Some((ConsoleOnly::Clzero, 3))
         );
         // the same loop after an address-size prefix: that one CLZERO alone
         assert_eq!(decode(&[0x67, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4]), Some((ConsoleOnly::Clzero, 4)));

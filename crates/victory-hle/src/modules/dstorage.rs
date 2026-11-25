@@ -26,6 +26,8 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
+use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
@@ -965,14 +967,24 @@ fn into_destination(
         return fill(out).map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
+    let count = (offset + len).div_ceil(PAGE);
+    let mut small = [0; 64];
+    let mut large;
+    let pages = if count <= small.len() {
+        &mut small[..count]
+    } else {
+        large = vec![0; count];
+        &mut large
     };
+    if !read_page_list(request.destination, pages) {
+        tracing::warn!(
+            offset,
+            len,
+            count,
+            "dstorage: unable to read destination page list"
+        );
+        return Err(E_INVALIDARG);
+    }
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
@@ -981,21 +993,67 @@ fn into_destination(
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
-        Ok(())
-    } else {
-        // Said aloud: Grand Theft Auto VI never reads a request's result
-        // (it only polls for completion), so a destination left unwritten
-        // is a model or texture that silently holds whatever its pages
-        // held before.
-        tracing::warn!(
-            offset,
-            len,
-            pages = pages.len(),
-            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
-        );
-        Err(E_INVALIDARG)
+        return Ok(());
     }
+    // Page number 0 is no page (numbers start at 0x10_0000): a list naming
+    // it is one the title has not filled yet. The title writes a request's
+    // page list after enqueueing it, and a queue half full is submitted on
+    // its own, so a read can start first. Read the list again for a few
+    // milliseconds before failing: the title never looks at a request's
+    // result, so a failed one is a model or texture left unwritten.
+    if pages.contains(&0) {
+        for _ in 0..LATE_LIST_TRIES {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            if read_page_list(request.destination, pages)
+                && !pages.contains(&0)
+                && super::xmem::write_physical(pages, offset, &data[..n])
+            {
+                let late = LATE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
+                if late.is_power_of_two() {
+                    tracing::info!(
+                        late,
+                        "dstorage: a page list filled after its request started: written late"
+                    );
+                }
+                return Ok(());
+            }
+        }
+    }
+    tracing::warn!(
+        offset,
+        len,
+        pages = pages.len(),
+        "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
+    );
+    Err(E_INVALIDARG)
 }
+
+/// Copy the guest list through Windows because the title can still be filling it.
+/// A Rust slice into the title's memory would require it to stay immutable.
+fn read_page_list(source: *const c_void, pages: &mut [usize]) -> bool {
+    if pages.is_empty() {
+        return true;
+    }
+    let size = std::mem::size_of_val(pages);
+    let mut read = 0;
+    // SAFETY: the output holds exactly size bytes. Windows checks the
+    // source range in our process before copying from it.
+    let ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            source,
+            pages.as_mut_ptr().cast(),
+            size,
+            &mut read,
+        )
+    };
+    ok != 0 && read == size
+}
+
+/// Retries, one millisecond apart, for a page list naming page 0.
+const LATE_LIST_TRIES: u32 = 8;
+/// Page lists filled after their request started (written late).
+static LATE_LISTS: AtomicU32 = AtomicU32::new(0);
 
 /// Slots by the 2020 order, which the argument shapes at Grand Theft Auto
 /// VI's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
@@ -1500,6 +1558,48 @@ mod tests {
         assert_eq!(wait(array, 0), S_OK);
         // SAFETY: both pages are mapped read-write.
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
+        assert_eq!(seen, plain);
+    }
+    #[test]
+    fn a_page_list_filled_after_its_request_starts() {
+        use crate::modules::xmem;
+        let (mut given, mut page) = (1usize, [0usize; 1]);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, page.as_mut_ptr()),
+            1
+        );
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, page.as_ptr()), mapped);
+
+        // The title's list is empty when the worker starts. Publish its
+        // page during the read so this always exercises the retry path.
+        let list = [std::cell::Cell::new(0usize)];
+        let plain = pattern(4096);
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list[0].as_ptr().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        assert_eq!(
+            into_destination(&r, plain.len(), |out| {
+                read_into(&r, out)?;
+                list[0].set(page[0]);
+                Ok(out.len())
+            }),
+            Ok(())
+        );
+        // SAFETY: the page is mapped read-write.
+        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
         assert_eq!(seen, plain);
     }
     #[test]

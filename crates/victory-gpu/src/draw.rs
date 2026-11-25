@@ -2634,6 +2634,7 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
+            why("no host pipeline");
             return false;
         };
         // Indirect rectangles (Grand Theft Auto VI's tiled lighting, 256
@@ -3608,7 +3609,12 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(shown.upgrade().is_some_and(|s| std::sync::Arc::ptr_eq(&s, &found)), "the slot's copy");
         drop(found);
         slots.make_null(0);
-        assert!(shown.upgrade().is_none(), "released with the slot");
+        // Rewriting a descriptor retires its previous view through the next
+        // submission so a previously recorded list can still use the resource.
+        let list = host.new_list().unwrap();
+        list.close();
+        host.execute(&[&list]);
+        assert!(shown.upgrade().is_none(), "released after the submission finishes");
     }
 
     /// With a heap map, a table whose entries lie below the identity window

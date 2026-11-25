@@ -925,9 +925,10 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
             .insert(page, pages.iter().copied().filter(|&p| p != page).collect());
     }
     if pages.iter().any(|page| g.protected.contains(page)) {
-        let armed = pages
-            .iter()
-            .fold(true, |all, &p| guard_alias(&mut g, p) && all);
+        let mut armed = true;
+        for &page in &pages {
+            armed &= guard_alias(&mut g, page);
+        }
         if !armed {
             for page in pages {
                 g.clean.remove(&page);

@@ -16,7 +16,6 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-
 /// The DLL whose `ffxDispatch` is taken.
 pub const LOADER: &str = "amd_fidelityfx_loader_xbox.dll";
 
@@ -125,6 +124,12 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
     }
 }
 
+/// What the title's import of `ffxDispatch` is bound to. The DLL is an
+/// ordinary title import for its other entry points and forwarded dispatches.
+pub fn dispatch_address() -> usize {
+    dispatch as *const () as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,11 +166,4 @@ mod tests {
         assert_eq!(dispatch(std::ptr::null_mut(), std::ptr::null()), ERROR);
         REAL.store(before, Ordering::Relaxed);
     }
-}
-
-/// What the title's import of `ffxDispatch` is bound to. The DLL is not an
-/// HLE module: the title's own must load, for its other entry points and
-/// for the dispatches passed on.
-pub fn dispatch_address() -> usize {
-    dispatch as *const () as usize
 }

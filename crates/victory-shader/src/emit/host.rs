@@ -62,8 +62,42 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// The first adapter that is a GPU: not flagged software, and with video
+/// memory of its own. A machine without one (GitHub's Windows runner has only
+/// `Microsoft Basic Render Driver`) has nothing to run the hardware-only
+/// checks on, and CI proved that the flag of adapter 0 alone is not enough:
+/// the runner's default adapter is not flagged software and its device still
+/// refuses a wave of 32
+/// (`permutes_read_the_lane_named_and_zero_from_lanes_left_out`). WARP and the
+/// basic render driver report no dedicated video memory, which is what this
+/// asks for as well.
+fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapter1> {
+    // SAFETY: plain DXGI adapter enumeration.
+    unsafe {
+        for index in 0.. {
+            let Ok(adapter) = factory.EnumAdapters1(index) else {
+                break;
+            };
+            let desc = adapter.GetDesc1()?;
+            // The basic render driver (vendor 0x1414, device 0x8c) is
+            // software whatever its flags say.
+            let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c);
+            if !software && desc.DedicatedVideoMemory > 0 {
+                return Ok(adapter);
+            }
+        }
+    }
+    Err(windows::core::Error::new(
+        windows::Win32::Foundation::E_FAIL,
+        "no hardware adapter",
+    ))
+}
+
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The first hardware adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// A software default adapter (a machine without a GPU, as CI) is
+    /// refused, so hardware-only checks never run on WARP.
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
@@ -79,29 +113,18 @@ impl Host {
                 }
             }
             let mut device: Option<ID3D12Device> = None;
-            if warp {
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            let factory: IDXGIFactory4 =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+            let adapter: IDXGIAdapter1 = if warp {
+                factory.EnumWarpAdapter().map_err(err)?
             } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-                // A machine without a graphics card gives the software
-                // adapter as its default device (a hosted test runner,
-                // whose first adapter is a display stub that cannot make a
-                // device): that is no hardware device, and the tests that
-                // ask for one skip it, as they do where there is none.
-                if let Some(made) = &device {
-                    let factory: IDXGIFactory4 =
-                        CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                    if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
-                        && let Ok(desc) = adapter.GetDesc1()
-                        && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
-                    {
-                        return Err("the default device is the software adapter".to_owned());
-                    }
-                }
-            }
+                // A machine without a graphics card (a hosted test runner,
+                // whose default adapter is a display stub or the software
+                // adapter) has no hardware device: the tests that ask for
+                // one skip it, as they do where there is none.
+                hardware_adapter(&factory).map_err(err)?
+            };
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             let device = device.ok_or("no device")?;
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
@@ -185,12 +208,24 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        // Older runtimes may not recognize OPTIONS19; that means no support.
+        let aniso_point_mip_supported = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool();
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
                 let [u, v, w] = d.address.map(|a| D3D12_TEXTURE_ADDRESS_MODE(a as i32));
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(d.filter as i32),
+                    Filter: D3D12_FILTER(d.filter_for_host(aniso_point_mip_supported) as i32),
                     AddressU: u,
                     AddressV: v,
                     AddressW: w,

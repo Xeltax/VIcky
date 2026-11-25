@@ -56,16 +56,6 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
-    /// Slot pairs kept for host copies' views (`crate::memory`), past the
-    /// dynamic slots and below the null buffer views: the next never
-    /// taken, those given back, and where they end.
-    pairs: Mutex<(u32, Vec<u32>)>,
-    pairs_end: u32,
-    /// Per title slot, the title address of the buffer view it holds, as a
-    /// buffer descriptor's dwords 0 and 1 (shaders reading a descriptor's
-    /// address as data, `crate::memory`): the buffer, its mapping and host
-    /// address, made on first use.
-    addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
     /// How many dynamic slots are free (changed under `next`'s lock): with
@@ -902,9 +892,6 @@ impl HostHeap {
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
-            pairs: Mutex::new((dynamic_first + extra, Vec::new())),
-            pairs_end: total.saturating_sub(3),
-            addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
             strides,
             buffers: Mutex::default(),
@@ -1020,12 +1007,18 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
+        // Search from `next` on, then from the start (extending past cursor by
+        // n - 1 so contiguous runs crossing the cursor are not missed).
+        let cursor = *next as usize;
+        let end = self.dynamic as usize;
+        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+        let starts = (cursor..end).chain(0..second_end);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
+        // Not capped at `DYNAMIC`: that would stop the scan at the cursor
+        // again and miss the runs crossing it.
+        for at in starts.take(if enough { usize::MAX } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
@@ -1057,36 +1050,6 @@ impl HostHeap {
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % DYNAMIC as usize) as u32;
         Some(self.dynamic_first + first as u32)
-    }
-
-    /// Two consecutive slots (view heaps only) kept until
-    /// [`HostHeap::free_pair`]: past the dynamic slots where the heap has
-    /// room (a host copy's views, `crate::memory`, for as long as it
-    /// lives), else dynamic ones.
-    pub(crate) fn pair(&self) -> Option<u32> {
-        if self.sampler {
-            return None;
-        }
-        {
-            let mut pairs = self.pairs.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(index) = pairs.1.pop() {
-                return Some(index);
-            }
-            if pairs.0 + 2 <= self.pairs_end {
-                pairs.0 += 2;
-                return Some(pairs.0 - 2);
-            }
-        }
-        self.dynamic(2)
-    }
-
-    /// Gives back a pair [`HostHeap::pair`] returned.
-    pub(crate) fn free_pair(&self, index: u32) {
-        if index >= self.dynamic_first + self.dynamic {
-            self.pairs.lock().unwrap_or_else(|e| e.into_inner()).1.push(index);
-        } else {
-            self.release(index, 2);
-        }
     }
 
     /// The title slots this heap mirrors at their own index (tables read in
@@ -1171,7 +1134,6 @@ impl HostHeap {
     /// the fork did), and a pool slot is given back. `for_draw`: the slot
     /// leaves the sets even if its host slot was never made.
     fn empty_slot(&self, made: &mut Made, title: u32, for_draw: bool) {
-        self.note_address(title, None);
         if !self.sampler { self.viewed.set(title, None, false); }
         match made.host(title) {
             Some(host) if made.keys[host as usize] != 0 => {
@@ -1334,7 +1296,6 @@ impl HostHeap {
     /// Makes title slot `index`'s host slot null again, as it is before its
     /// view is made: a null view of the kind it held.
     fn unmake(&self, made: &mut Made, index: u32) {
-        self.note_address(index, None);
         if !self.sampler { self.viewed.set(index, None, false); }
         let Some(host) = made.host(index) else {
             return;
@@ -1746,11 +1707,6 @@ impl HostHeap {
         unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride) };
     }
 
-    /// The view-stride table, for root SRV `VIEW_STRIDES`.
-    pub(crate) fn strides(&self) -> Option<&ID3D12Resource> {
-        self.strides_buffer()
-    }
-
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Kept) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
@@ -1777,83 +1733,8 @@ impl HostHeap {
         }
     }
 
-    /// The host address of the slots' view addresses (see the field), made
-    /// on first use from the slots made so far.
-    pub(crate) fn view_addresses(&self) -> Option<u64> {
-        if let Some(table) = self.addresses.get() {
-            return table.as_ref().map(|m| m.2);
-        }
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        let made = self.addresses.get_or_init(|| {
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.title_count.max(1)) * 8)?;
-            crate::host::name(&buffer, || "view addresses".into());
-            let data = data as usize;
-            for i in 0..self.title_count {
-                let key = made.host(i).and_then(|slot| made.keys.get(slot as usize)).copied().unwrap_or(0);
-                let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
-                write_address(data, i as usize, view.as_ref());
-            }
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            Some((buffer, data, gpu))
-        });
-        made.as_ref().map(|m| m.2)
-    }
-
-    /// Slot `index` now holds `view` (or no view): its view address.
-    fn note_address(&self, index: u32, view: Option<&View>) {
-        if index < self.title_count && let Some(Some((_, data, _))) = self.addresses.get() {
-            write_address(*data, index as usize, view);
-        }
-    }
-
-    /// Makes slots `index` and `index + 1` (dynamic ones) a raw shader
-    /// resource view and a raw unordered access view of the first `bytes`
-    /// (a multiple of 4) of `buffer`, which they hold; null views for no
-    /// buffer.
-    pub(crate) fn raw_pair_at(&self, index: u32, buffer: Option<&ID3D12Resource>, bytes: u64) {
-        let Some(host) = host() else { return };
-        // shortcut: a buffer view holds at most 2^27 elements (512 MiB raw);
-        // a longer copy's rest reads 0 through it.
-        let elements = (bytes / 4).min(1 << 27) as u32;
-        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_TYPELESS,
-            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: 0,
-                    NumElements: elements,
-                    StructureByteStride: 0,
-                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-                },
-            },
-        };
-        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_TYPELESS,
-            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                Buffer: D3D12_BUFFER_UAV {
-                    NumElements: elements,
-                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
-                    ..Default::default()
-                },
-            },
-        };
-        // SAFETY: slots of our heap; the buffer is live (or none: null views).
-        unsafe {
-            host.device
-                .CreateShaderResourceView(buffer, Some(&srv), self.cpu(index));
-            host.device
-                .CreateUnorderedAccessView(buffer, None, Some(&uav), self.cpu(index + 1));
-        }
-        self.keep(index, buffer.map(|b| (b.clone(), None)));
-        self.keep(index + 1, buffer.map(|b| (b.clone(), None)));
-        self.write_stride(index, 4);
-        self.write_stride(index + 1, 4);
-    }
-
     /// The shader-visible handle of slot `index`.
+    #[cfg(test)]
     pub(crate) fn gpu(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
         // SAFETY: a live shader-visible heap.
         let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
@@ -1928,7 +1809,6 @@ impl HostHeap {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
-            self.note_address(index, Some(&view));
             for stale in self.note_buffer(index, Some(&view), for_draw) {
                 if stale != index {
                     self.unmake(&mut made, stale);
@@ -2108,16 +1988,6 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     }
-}
-
-/// Writes slot `index`'s view address into the view addresses at `data`:
-/// a buffer view's title address (dword 0 low, dword 1 bits 0-15 high);
-/// zeros for anything else.
-fn write_address(data: usize, index: usize, view: Option<&View>) {
-    let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
-    let words = [address as u32, (address >> 32) as u32 & 0xFFFF];
-    // SAFETY: the mapped view addresses hold 8 bytes per title slot.
-    unsafe { ((data + 8 * index) as *mut [u32; 2]).write_unaligned(words) };
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
@@ -3528,7 +3398,7 @@ mod tests {
         unsafe { ((start + 17 * TITLE_SLOT_BYTES) as *mut u8).write_bytes(0, 32) };
         title_cbv(start, 30, 0x9_0000);
         assert_eq!(entry(heap, 17), (0, None), "given back");
-        assert_eq!(entry(heap, 16).1.is_some() && entry(heap, 19).1.is_some(), true);
+        assert!(entry(heap, 16).1.is_some() && entry(heap, 19).1.is_some());
         // Handed out once the submissions running when it was given back
         // have finished (other tests' may be).
         let (running, _) = crate::host::submissions();
@@ -3542,5 +3412,32 @@ mod tests {
         }
         assert_eq!(entry(heap, 30), (!freed, Some(freed)));
         assert_eq!(release(title), 0);
+    }
+
+    #[test]
+    fn dynamic_search_can_find_a_run_across_the_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            eprintln!("no host descriptor heap; skipped");
+            return;
+        };
+        let first = heap.dynamic(1).unwrap();
+        let left = heap.dynamic(2).unwrap();
+        let right = heap.dynamic(2).unwrap();
+        let rest = heap.dynamic(heap.dynamic - 5).unwrap();
+        assert_eq!((first, left, right, rest), (4, 5, 7, 9));
+
+        // Reallocating the left half puts the cursor back in the middle.
+        heap.release(left, 2);
+        assert_eq!(heap.dynamic(2), Some(left));
+        heap.release(left, 2);
+        heap.release(right, 2);
+        assert_eq!(heap.dynamic(4), Some(left));
+        assert_eq!(heap.dynamic(1), None);
+
+        // A free slot at each physical end does not form a two-slot range.
+        heap.release(first, 1);
+        let last = first + heap.dynamic - 1;
+        heap.release(last, 1);
+        assert_eq!(heap.dynamic(2), None);
     }
 }

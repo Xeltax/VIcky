@@ -750,10 +750,8 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
-///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// Shows the first plane's first resource in our window, with the Series S
+/// scene and the interface plane when available.
 extern "system" fn present(
     _: This,
     planes: u32,
@@ -824,7 +822,7 @@ extern "system" fn present(
         && !plane.resources.is_null()
         // SAFETY: the plane lists `count` resources.
         && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && let Some(base) = crate::resource::host_copy(resource)
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
@@ -836,12 +834,18 @@ extern "system" fn present(
         const READABLE: u32 = 0x80;
         // SAFETY: the title passes `planes` plane descriptions.
         let second = unsafe { second_plane(planes, plane_parameters, resource) }
-            .and_then(|r| Some((r, crate::resource::host_resource(r)?)));
-        let over = second.map(|(r, t)| {
-            let was = crate::resource::host_transition(r, READABLE).map_or(READABLE, |(_, before)| before);
-            (r, t, was)
+            .and_then(|r| {
+                let copy = crate::resource::host_copy(r)?;
+                (copy.texture != base.texture).then_some((r, copy))
+            });
+        let over = second.as_ref().map(|(r, copy)| {
+            let was = crate::resource::host_transition(*r, READABLE)
+                .map_or(READABLE, |(_, before)| before);
+            (*r, &copy.texture, was)
         });
-        let shown = host.present(texture, state, frame, over.map(|(_, t, was)| (t, was)), scene.as_deref());
+        let shown = host.present(
+            &base.texture, state, frame, over.map(|(_, t, was)| (t, was)), scene.as_deref(),
+        );
         if let Some((r, _, was)) = over {
             crate::resource::host_transition(r, was);
         }

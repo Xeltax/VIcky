@@ -2,8 +2,8 @@
 //! code raises STATUS_ILLEGAL_INSTRUCTION on them (GTA VI zeroes memory with a `clzero` loop at
 //! its first frames), and the vectored handler steps over them here.
 //!
-//! Ported from XCL (github.com/ivall/xcl, GPL-2.0-only): `insn.rs` (decoder, as
-//! `console_insn_decode.rs`, unchanged) and `eh.rs` `emulate_console_only`.
+//! Ported from XCL (github.com/ivall/xcl, GPL-2.0-only): `insn.rs` (the decoder in
+//! `console_insn_decode.rs`) and `eh.rs` `emulate_console_only`.
 
 #[path = "console_insn_decode.rs"]
 mod decode;
@@ -12,8 +12,6 @@ use decode::ConsoleOnly;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
-
-const CONTINUE_EXECUTION: i32 = -1;
 
 /// Whether what Windows said about memory is remembered per thread (the regions it found
 /// writable, the code bytes it found readable) and not asked again at every emulated
@@ -56,10 +54,6 @@ fn readable(va: usize, bytes: usize) -> bool {
     found && m.State == MEM_COMMIT && m.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && m.BaseAddress as usize + m.RegionSize >= va + bytes
 }
 
-fn writable(va: usize, bytes: usize) -> bool {
-    writable_to(va, va + bytes) == Some(va + bytes)
-}
-
 /// Where the committed, writable memory that `va` lies in ends, at most `end`; None if `va`
 /// is not in such memory. A region found is remembered ([`remembers`]).
 /// shortcut: a remembered region that was freed or protected since is written all the same
@@ -97,13 +91,57 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
     Some(to.min(end))
 }
 
+/// Clears the cache line containing the title address.
+///
+/// # Safety
+/// The title owns the line and has asked for it to be cleared.
+pub(super) unsafe fn clear_line(address: u64) -> bool {
+    let line = address as usize & !63;
+    if line.checked_add(64).is_none_or(|end| writable_to(line, end) != Some(end)) {
+        return false;
+    }
+    // SAFETY: the caller owns this line and it is committed and writable.
+    unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
+    true
+}
+
+/// Clears the consecutive cache lines a post-tested CLZERO loop would
+/// touch. Returns the next register value, or None if no line was cleared.
+///
+/// # Safety
+/// The title owns the lines the loop clears.
+pub(super) unsafe fn clear_loop(start: u64, limit: u64) -> Option<u64> {
+    let bytes = limit.saturating_sub(start).max(1).div_ceil(64).checked_mul(64)?;
+    // Leave unusually large or wrapping loops to single-step emulation.
+    if bytes >= 2 << 30 {
+        return None;
+    }
+    start.checked_add(bytes)?;
+    let first = (start & !63) as usize;
+    let end = first + bytes as usize;
+    let mut at = first;
+    while at < end {
+        let Some(to) = writable_to(at, end).map(|to| to & !63) else {
+            break;
+        };
+        if to <= at {
+            break;
+        }
+        // SAFETY: the caller owns this range and it is committed and writable.
+        unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
+        at = to;
+    }
+    let cleared = (at - first) as u64;
+    ZEROED.fetch_add(cleared, Relaxed);
+    (cleared != 0).then_some(start + cleared)
+}
+
 /// An illegal instruction at `ctx.Rip`: a console-only one is emulated and stepped over
-/// (`CONTINUE_EXECUTION`); anything else returns 0 (the crash report and the title's handlers
-/// see it).
+/// (returns true); anything else goes to the crash report and the title's handlers.
 ///
 /// # Safety
 /// `ctx` is the faulting thread's context, from the exception being dispatched.
-pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
+pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> bool {
     let rip = ctx.Rip as usize;
     // The same few instructions fault again and again: their bytes are asked about once.
     let known = if remembers() { CODE.with(Cell::get) } else { [(0, 0); 8] };
@@ -111,7 +149,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         Some(&(_, n)) => n,
         None => {
             if !readable(rip, 1) {
-                return 0;
+                return false;
             }
             let n = (1..=16).rev().find(|&n| readable(rip, n)).unwrap_or(0);
             if remembers() {
@@ -123,9 +161,11 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             n
         }
     };
-    // SAFETY: `n` bytes at `rip` are readable.
-    let code = unsafe { std::slice::from_raw_parts(rip as *const u8, n) };
-    let Some((what, len)) = decode::decode(code) else { return 0 };
+    let mut bytes = [0; 16];
+    // SAFETY: n bytes at rip are readable and fit in the destination.
+    unsafe { std::ptr::copy_nonoverlapping(rip as *const u8, bytes.as_mut_ptr(), n) };
+    let code = &bytes[..n];
+    let Some((what, mut len)) = decode::decode(code) else { return false };
     static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
     if let Ok(mut seen) = SEEN.lock()
         && !seen.contains(&std::mem::discriminant(&what))
@@ -136,61 +176,45 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         }
     }
     match what {
-        ConsoleOnly::Ud2 => return 0,
+        ConsoleOnly::Ud2 => return false,
         ConsoleOnly::Clwb => {
-            // nothing to write back on the PC: patched to NOPs, no exception next time
-            use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
-            let mut old = 0u32;
-            // SAFETY: the instruction's own bytes, made writable for the patch and restored.
-            unsafe {
-                if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
-                    std::slice::from_raw_parts_mut(rip as *mut u8, len).fill(0x90);
-                    VirtualProtect(rip as *const _, len, old, &mut old);
+            if let Some(skip) = crate::crash::emulate_clwb_loop(ctx, code) {
+                len = skip;
+            } else if len <= 0x1000 - (rip & 0xfff) {
+                // A cache hint on the PC: patch to NOPs to avoid future exceptions.
+                use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+                use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+                use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                let mut old = 0u32;
+                // SAFETY: the instruction's bytes, within one page, made
+                // writable for the patch and restored to their protection.
+                unsafe {
+                    if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+                        std::ptr::write_bytes(rip as *mut u8, 0x90, len);
+                        VirtualProtect(rip as *const _, len, old, &mut old);
+                        FlushInstructionCache(GetCurrentProcess(), rip as *const _, len);
+                    }
                 }
             }
         }
         ConsoleOnly::Monitorx => {}
-        ConsoleOnly::Mwaitx => std::hint::spin_loop(),
+        ConsoleOnly::Mwaitx => std::thread::yield_now(),
         ConsoleOnly::Clzero => {
-            // with an address-size prefix (0x67) the line is at EAX, zero-extended
-            let a32 = code[..len - 3].contains(&0x67);
-            let line = (if a32 { ctx.Rax & 0xFFFF_FFFF } else { ctx.Rax } as usize) & !63;
-            if !writable(line, 64) {
-                return 0; // the real instruction faults there too
-            }
-            // SAFETY: the 64-byte line is committed and writable.
-            unsafe { std::ptr::write_bytes(line as *mut u8, 0, 64) };
-        }
-        ConsoleOnly::ClzeroLoop { end_reg } => {
-            // the whole `clzero; add rax,40h; cmp rax,end; jb` loop at once
-            let regs: [u64; 16] = [
-                ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.Rbp, ctx.Rsi, ctx.Rdi, ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15,
-            ];
-            let end = regs[end_reg as usize & 15] as usize;
-            let start = ctx.Rax as usize;
-            if end > start && end - start < 2 << 30 {
-                // Region by region: a block may lie across several (the title's pages are
-                // mapped one view each), and one answer for all of it was a refusal, after
-                // which every 64-byte line took an exception of its own.
-                let mut at = start;
-                while at < end {
-                    let Some(to) = writable_to(at, end) else { break };
-                    // SAFETY: committed and writable from `at` to `to`.
-                    unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
-                    at = to;
-                }
-                if at == start {
-                    return 0;
-                }
-                ZEROED.fetch_add((at - start) as u64, Relaxed);
-                if at < end {
-                    // What follows is not writable: the loop goes on there (the same
-                    // instruction again), where the real one faults too.
-                    ctx.Rax = at as u64;
-                    return CONTINUE_EXECUTION;
+            // SAFETY: the decoded instruction is CLZERO on the title's memory.
+            if unsafe { crate::crash::emulate_clzero_loop(ctx, code) } {
+                len = 0; // the loop already updated RIP
+            } else {
+                // With an address-size prefix (0x67), use EAX zero-extended.
+                let address = if code[..len - 3].contains(&0x67) {
+                    ctx.Rax & 0xffff_ffff
+                } else {
+                    ctx.Rax
+                };
+                // SAFETY: the title asked to clear this line.
+                if !unsafe { clear_line(address) } {
+                    return false;
                 }
             }
-            ctx.Rax = end as u64;
         }
         ConsoleOnly::Rdpru => {
             let mut v = 0i64;
@@ -245,5 +269,5 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             "console CPU instructions emulated so far, the times Windows was asked about memory for them, and what clzero loops zeroed"
         );
     }
-    CONTINUE_EXECUTION
+    true
 }

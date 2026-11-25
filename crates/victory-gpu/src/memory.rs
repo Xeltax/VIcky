@@ -229,7 +229,7 @@ pub(crate) fn log_frame() {
 /// entry excluded: addresses past the directory read it).
 fn whole_pages(first: u64, len: u64) -> std::ops::Range<u64> {
     let last = u64::from(MEMORY_PAGES) - 1;
-    let from = first.next_multiple_of(PAGE) / PAGE;
+    let from = first.div_ceil(PAGE);
     let to = ((first + len) / PAGE).min(last);
     from.min(to)..to
 }

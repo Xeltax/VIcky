@@ -87,7 +87,8 @@ pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
     let what = what();
     let mut file = FILE.lock().unwrap_or_else(|e| e.into_inner());
     if file.as_ref().is_none_or(|f| f.0 != frame) {
-        let Ok(made) = std::fs::File::create(folder.join(format!("frame-{frame}-ops.txt"))) else {
+        let path = folder.join(format!("frame-{frame}-ops.txt"));
+        let Ok(made) = std::fs::create_dir_all(folder).and_then(|()| std::fs::File::create(path)) else {
             return;
         };
         *file = Some((frame, 0, made));
@@ -127,8 +128,9 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
         #[cfg(feature = "diagnostics")]
         if let Some(folder) = folder() {
             let lines: Vec<String> = std::mem::take(&mut *RING.lock().unwrap_or_else(|e| e.into_inner())).into();
-            let _ = std::fs::write(folder.join("before-world-ops.txt"), lines.join("
-"));
+            let _ = std::fs::create_dir_all(folder).and_then(|()| {
+                std::fs::write(folder.join("before-world-ops.txt"), lines.join("\n"))
+            });
         }
     }
 }
@@ -332,10 +334,26 @@ pub(crate) fn save_read_back(
 /// (`-by-<pipeline>` in the name; `-black` when its colour is all zeros).
 /// `VICTORY_DUMP_WRITERS` (shader hashes) adds, in any frame, the textures
 /// a pipeline with one of them writes, the first frame it runs.
-#[allow(clippy::type_complexity)]
-static TARGETS: std::sync::Mutex<
-    Vec<(usize, std::sync::Arc<crate::resource::HostTexture>, String)>,
-> = std::sync::Mutex::new(Vec::new());
+static TARGETS: std::sync::Mutex<Vec<Target>> = std::sync::Mutex::new(Vec::new());
+
+/// The title pointer is only a label. The captured host copy can outlive it.
+#[derive(Clone)]
+pub(crate) struct Target {
+    resource: usize,
+    copy: std::sync::Arc<crate::resource::HostTexture>,
+    by: String,
+}
+
+impl Target {
+    fn new(resource: crate::object::This, by: String) -> Option<Self> {
+        let copy = crate::resource::existing_copy(resource)?;
+        Some(Self { resource: resource as usize, copy, by })
+    }
+
+    pub(crate) fn same_texture(&self, other: &Self) -> bool {
+        self.resource == other.resource && std::sync::Arc::ptr_eq(&self.copy, &other.copy)
+    }
+}
 
 thread_local! {
     /// The pipeline whose draw or dispatch this thread is binding.
@@ -351,7 +369,7 @@ pub(crate) fn binding(pipeline: &str) {
 
 pub(crate) fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
+    *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
 
 /// `VICTORY_DUMP_WRITERS`' hashes not dumped yet.
@@ -372,8 +390,15 @@ pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object:
     }
     let by = WRITER.with(|w| w.borrow().clone());
     // Lists are recorded ahead of the frame that submits them.
-    list.note_target(resource as usize, &by);
-    if !listed(crate::queue::presented() + 1) {
+    let target = Target::new(resource, by.clone());
+    if let Some(target) = &target {
+        list.note_target(target.clone());
+    }
+    if listed(crate::queue::presented() + 1) {
+        // These frames get targets from the lists that actually submit.
+        return;
+    }
+    {
         let mut writers = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
         let writers = writers.get_or_insert_with(|| {
             let list = std::env::var("VICTORY_DUMP_WRITERS").unwrap_or_default();
@@ -393,27 +418,38 @@ pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object:
             return;
         }
     }
-    keep_target(resource, by);
-}
-
-/// Capture just the two upscale resources at present, without reading back
-/// every render target. The operation trace identifies each resource's role.
-pub(crate) fn note_upscale(colour: crate::object::This, output: crate::object::This) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_UPSCALE").is_some_and(|v| v == "1"))
-        && listed(crate::queue::presented() + 1)
-    {
-        keep_target(colour, "upscale input".to_owned());
-        keep_target(output, "upscale output".to_owned());
+    if let Some(target) = target {
+        keep_target(target);
     }
 }
 
-fn keep_target(resource: crate::object::This, by: String) {
+/// Capture the two upscale resources at present when this list submits.
+pub(crate) fn note_upscale(
+    list: &crate::host::HostList,
+    colour: crate::object::This,
+    output: crate::object::This,
+) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_UPSCALE")) {
+        return;
+    }
+    let targets = [
+        Target::new(colour, "upscale input".to_owned()),
+        Target::new(output, "upscale output".to_owned()),
+    ];
+    list.defer_host(move || {
+        if listed(crate::queue::presented() + 1) {
+            for target in targets.iter().flatten() {
+                keep_target(target.clone());
+            }
+        }
+    });
+}
+
+pub(crate) fn keep_target(target: Target) {
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    if !targets.iter().any(|(r, _, _)| *r == resource as usize)
-        && let Some(copy) = crate::resource::host_copy(resource)
-    {
-        targets.push((resource as usize, copy, by));
+    if !targets.iter().any(|seen| seen.same_texture(&target)) {
+        targets.push(target);
     }
 }
 
@@ -431,7 +467,7 @@ pub(crate) fn dump_targets(frame: u64) {
     // Writers dumped once.
     if let Some(writers) = WRITERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         writers.retain(|h| {
-            !targets.iter().any(|t| t.2.contains(h.as_str()))
+            !targets.iter().any(|t| t.by.contains(h.as_str()))
                 && !buffers.iter().any(|b| b.2.contains(h.as_str()))
         });
     }
@@ -457,7 +493,7 @@ pub(crate) fn dump_targets(frame: u64) {
         );
     }
     let Some(host) = crate::host::host() else { return };
-    for (i, (resource, copy, by)) in targets.iter().enumerate() {
+    for (i, Target { resource, copy, by }) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
@@ -474,15 +510,12 @@ pub(crate) fn dump_targets(frame: u64) {
 /// After submission `sub` of a listed frame has run: the textures its lists
 /// rendered to or wrote, as `frame-<n>-s<sub>-<i>-...` (what each holds
 /// then, to follow a frame pass by pass).
-pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
+pub(crate) fn dump_submission(sub: u64, targets: &[Target]) {
     use std::sync::atomic::Ordering::Relaxed;
     let Some(host) = crate::host::host() else { return };
     let frame = crate::queue::presented() + 1;
     peek(&format!("frame-{frame}-s{sub:04}"));
-    for (i, (resource, by)) in targets.iter().enumerate() {
-        let Some(copy) = crate::resource::host_copy(*resource as crate::object::This) else {
-            continue;
-        };
+    for (i, Target { resource, copy, by }) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };

@@ -143,13 +143,46 @@ impl Tally {
 /// Emitted shaders by label, shared between threads.
 type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
+struct Dumps {
+    emitted: Option<PathBuf>,
+    failed: Option<PathBuf>,
+    matched: Option<(PathBuf, String)>,
+}
+
+impl Dumps {
+    fn checked(
+        emitted: Option<PathBuf>,
+        failed: Option<PathBuf>,
+        matched: Option<String>,
+    ) -> Result<Self> {
+        let matched = matched.and_then(|spec| {
+            let (dir, patterns) = spec.split_once(';')?;
+            Some((PathBuf::from(dir), patterns.to_owned()))
+        });
+        // Every dump and validator report is game-derived (rule #1).
+        for dir in emitted
+            .iter()
+            .chain(&failed)
+            .chain(matched.iter().map(|(dir, _)| dir))
+        {
+            victory_core::ensure_outside_repo(dir)?;
+        }
+        Ok(Self {
+            emitted,
+            failed,
+            matched,
+        })
+    }
+}
+
 /// The optional checks after emission, one set per thread.
-struct Checks {
+struct Checks<'a> {
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+    dumps: &'a Dumps,
 }
 
 pub fn run(
@@ -159,6 +192,11 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
+    let dumps = Dumps::checked(
+        std::env::var_os("VICTORY_EMIT_DUMP").map(PathBuf::from),
+        std::env::var_os("VICTORY_FAIL_DUMP").map(PathBuf::from),
+        std::env::var("VICTORY_DUMP_MATCH").ok(),
+    )?;
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
@@ -213,6 +251,7 @@ pub fn run(
                                 host: pipelines
                                     .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                     .flatten(),
+                                dumps: &dumps,
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -477,7 +516,7 @@ fn translate(
     path: &Path,
     seen: &Mutex<HashSet<blake3::Hash>>,
     t: &mut Tally,
-    checks: &mut Checks,
+    checks: &mut Checks<'_>,
 ) {
     let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
@@ -505,11 +544,12 @@ fn translate(
     let example = || format!("{} ~{code8}", example());
     // `VICTORY_DUMP_MATCH=<dir>;<text>|<text>...`: the containers whose
     // line holds one of the texts (a name, `#hash`), as the title has them.
-    if let Ok(spec) = std::env::var("VICTORY_DUMP_MATCH")
-        && let Some((dir, texts)) = spec.split_once(';')
-    {
+    if let Some((dir, texts)) = &checks.dumps.matched {
         let line = example();
-        if texts.split('|').any(|text| !text.is_empty() && line.contains(text)) {
+        if texts
+            .split('|')
+            .any(|text| !text.is_empty() && line.contains(text))
+        {
             let name: String = source
                 .label()
                 .chars()
@@ -518,7 +558,7 @@ fn translate(
                 .take(70)
                 .collect();
             let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
+            write_dump(&dir.join(format!("{name}.{hash}.cdxil")), &bytes);
         }
     }
     if !lock(seen).insert(code) {
@@ -534,22 +574,35 @@ fn translate(
     };
     // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
     // has them (`.cdxil`), to work on a translator gap offline
-    let dump = std::env::var_os("VICTORY_FAIL_DUMP");
-    let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
+    let dumps = checks.dumps;
+    let dump = dumps.failed.as_deref();
+    let before: Option<BTreeMap<String, usize>> =
+        dump.map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
     translate_programs(&container, &hash, programs, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
             if *n > was && was < 3 {
-                let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
-                let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
+                let stem: String = reason
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .take(60)
+                    .collect();
+                let _ = std::fs::create_dir_all(dir);
+                write_dump(&dir.join(format!("{stem}_{was}.cdxil")), &bytes);
             }
         }
     }
 }
 
-fn translate_programs(container: &Container, hash: &str, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+fn translate_programs(
+    container: &Container,
+    hash: &str,
+    programs: Vec<NativeProgram>,
+    example: &dyn Fn() -> String,
+    t: &mut Tally,
+    checks: &mut Checks<'_>,
+) {
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build_structured(&p) {
@@ -613,7 +666,9 @@ fn translate_programs(container: &Container, hash: &str, programs: Vec<NativePro
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
                     // (by its hash, as at run time: the per-program switches, `VICTORY_WAVE_WHY`)
-                    match emit::for_program(hash, || emit::emit(container, &p, &program, &s, &i, &r)) {
+                    match emit::for_program(hash, || {
+                        emit::emit(container, &p, &program, &s, &i, &r)
+                    }) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
@@ -641,7 +696,7 @@ fn translate_programs(container: &Container, hash: &str, programs: Vec<NativePro
 fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
-    checks: &mut Checks,
+    checks: &mut Checks<'_>,
     label: impl Fn() -> String,
 ) {
     if let Some(keep) = &checks.keep {
@@ -649,14 +704,14 @@ fn check(
     }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list
-        && let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP")
+        && let Some(dir) = &checks.dumps.emitted
     {
         let name: String = label()
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
-        let _ = std::fs::write(
-            format!("{dir}/{}.dxil", &name[name.len().saturating_sub(100)..]),
+        write_dump(
+            &dir.join(format!("{}.dxil", &name[name.len().saturating_sub(100)..])),
             &shader.dxil,
         );
     }
@@ -678,6 +733,9 @@ fn check(
         }
     }
     let Some(v) = checks.validator.as_mut() else {
+        if t.list && checks.host.is_none() {
+            t.lines.push(format!("{}  emitted", label()));
+        }
         return;
     };
     match v.validate(&mut shader.dxil) {
@@ -693,27 +751,39 @@ fn check(
                 .find(|l| l.contains("error"))
                 .unwrap_or(text.lines().next().unwrap_or(""))
                 .to_owned();
-            if let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP") {
+            if let Some(dir) = &checks.dumps.emitted {
                 let n = t
                     .failed
                     .get(&format!("validator: {first}"))
                     .map_or(0, |f| f.0);
                 if n < 3 {
                     let name = format!(
-                        "{dir}/{}_{n}",
+                        "{}_{n}",
                         first
                             .chars()
                             .filter(char::is_ascii_alphanumeric)
                             .take(40)
                             .collect::<String>()
                     );
-                    let _ = std::fs::write(format!("{name}.dxil"), &shader.dxil);
-                    let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
+                    write_dump(&dir.join(format!("{name}.dxil")), &shader.dxil);
+                    write_dump(
+                        &dir.join(format!("{name}.txt")),
+                        format!("{}\n{text}", label()).as_bytes(),
+                    );
                 }
             }
             t.fail(format!("validator: {first}"), label);
         }
     }
+}
+
+/// Also check the file itself in case an existing link points into the repo.
+fn write_dump(path: &Path, bytes: &[u8]) {
+    if let Err(error) = victory_core::ensure_outside_repo(path) {
+        tracing::warn!(%error, "shader dump refused");
+        return;
+    }
+    let _ = std::fs::write(path, bytes);
 }
 
 /// Emission counts of `stage`'s kind: 0 programs, 1 emitted, 2 validated,
@@ -892,4 +962,28 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Dumps, PathBuf};
+
+    #[test]
+    fn shader_dump_directories_inside_the_repo_are_refused() {
+        let inside = env!("CARGO_MANIFEST_DIR");
+        for result in [
+            Dumps::checked(Some(PathBuf::from(inside)), None, None),
+            Dumps::checked(None, Some(PathBuf::from(inside)), None),
+            Dumps::checked(None, None, Some(format!("{inside};shader"))),
+        ] {
+            let err = result.err().expect("repository dump must be refused");
+            assert!(
+                matches!(
+                    err.downcast_ref(),
+                    Some(victory_core::PolicyError::InsideRepo { .. })
+                ),
+                "{err}"
+            );
+        }
+    }
 }

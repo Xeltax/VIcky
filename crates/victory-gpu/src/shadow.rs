@@ -127,7 +127,7 @@ struct Card {
 /// compares each declared range, by 64 KiB piece, with the card side's
 /// bytes from before (`Card::before`), and only the pieces that differ are
 /// fetched and merged into title memory, byte by byte as
-/// [`Shadow::copy_back`] does (`Host::card_back`, [`Shadow::card_merge`]).
+/// [`Shadow::copy_back_with`] does (`Host::card_back`, [`Shadow::card_merge`]).
 /// No snapshot is taken and nothing is compared on the CPU for such a copy.
 ///
 /// What it assumes is what [`keeps`] assumes: shaders write a copy only in
@@ -554,9 +554,9 @@ pub(crate) fn relay_fetched(number: u64) {
     RELAY_FETCHED.fetch_max(number, Ordering::AcqRel);
 }
 
-/// With [`relay`]: how many submissions that are not copied back yet
-/// declared each range shaders may be writing (range, count, the last
-/// submission that declared it).
+/// With submissions sent ahead: how many submissions that are not copied
+/// back yet declared each range shaders may be writing (range, count, the
+/// last submission that declared it).
 ///
 /// Without it a range declared by two flights was one entry, and the end
 /// of the first flight's copy-back removed it while the second was still
@@ -1586,7 +1586,7 @@ impl Drop for Shadow {
 /// 100 MB changed. Kept, a piece of it is taken again only after something
 /// changed the copy there: a refresh from title memory ([`Shadow::copy`]),
 /// shader writes found after a submission, or the bytes put back then
-/// ([`Shadow::copy_back`]).
+/// ([`Shadow::copy_back_with`]).
 ///
 /// What it assumes, and why it is not on by default: that nothing else
 /// writes a copy. A shader that writes a buffer through a view we did not
@@ -2008,9 +2008,9 @@ impl Shadow {
         }
         let range = (self.start as usize + from, self.start as usize + to);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        // With the copy-back on its own thread: counted for this submission
-        // (once), whether or not an earlier one still holds the range.
-        if relay() {
+        // A range declared by this submission can be refreshed until it
+        // runs, unless an earlier flight still holds it.
+        if relay() || crate::host::late() {
             self.flights
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -2068,6 +2068,8 @@ impl Shadow {
             if kept.0.is_empty() {
                 kept.0 = vec![false; self.pieces(0, total.max(1)).end];
             }
+            #[cfg(feature = "diagnostics")]
+            let mut copied = 0;
             for (from, to) in parts {
                 if from >= to {
                     continue;
@@ -2087,11 +2089,19 @@ impl Shadow {
                             hi - lo,
                         );
                     }
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        copied += (hi - lo) as u64;
+                    }
                     kept.0[piece] = whole;
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::snapshot(self.start, self.len, copied);
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::snapshot(self.start, self.len, taken as u64);
         if wide_back() {
             // Noted, and taken with the submission's other snapshots when
             // its refreshes are done (`take_snapshots`): the range is
@@ -2133,12 +2143,8 @@ impl Shadow {
     /// [`Shadow::writing`] and not yet done: `Host::execute` passes the
     /// union of a submission's ranges, each byte once, then calls
     /// [`Shadow::copy_back_done`].
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        self.copy_back_with(address, len, None)
-    }
-
-    /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
-    /// that differ from the snapshot, found beforehand ([`find_all`]).
+    /// When given, `found` restricts comparisons to pieces already found to
+    /// differ from the snapshot by [`find_all`].
     pub(crate) fn copy_back_with(
         &self,
         address: usize,
@@ -2379,7 +2385,7 @@ impl Shadow {
         })
     }
 
-    /// After [`Shadow::copy_back`] of a submission's ranges: every submitted
+    /// After [`Shadow::copy_back_with`] of a submission's ranges: every submitted
     /// step that declared one of `ranges` (`(address, end)`, as declared) is
     /// done with it (one submission runs at a time), and the snapshot with
     /// the last range.
@@ -2401,6 +2407,14 @@ impl Shadow {
             pending.retain(|r| !free.contains(r));
         } else {
             pending.retain(|r| !ranges.contains(r));
+            if crate::host::late() {
+                // With no relay, the host settles all of these flights together.
+                self.flights
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0
+                    .retain(|(range, _, _)| !ranges.contains(range));
+            }
         }
         if !pending.is_empty() || self.card.is_some() {
             return;
@@ -2668,23 +2682,50 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
+        let (mut busy, flights) = {
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let busy = pending
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .map(|(a, e)| (a.max(from), e.min(to)))
+                .collect::<Vec<_>>();
+            let flights: Vec<_> = if !busy.is_empty() && (relay() || crate::host::late()) {
+                let current = PREPARED.load(Ordering::Relaxed);
+                self.flights
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0
+                    .iter()
+                    .filter(|&&((a, e), count, last)| {
+                        a < to && e > from && (count > 1 || last != current)
+                    })
+                    .map(|&(range, _, _)| range)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (busy, flights)
+        };
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
+            // gaps whole cost ~1 s per frame). Under them, what the title
+            // wrote since it was taken (`update_busy`).
             busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 if a > at {
                     bytes += self.update_free(at, a);
+                }
+                if e > a.max(at) {
+                    if flights.is_empty() {
+                        bytes += self.update_busy(a.max(at), e);
+                    } else {
+                        for (lo, hi) in outside(a.max(at), e, flights.clone()) {
+                            bytes += self.update_busy(lo, hi);
+                        }
+                    }
                 }
                 at = at.max(e);
             }
@@ -2696,13 +2737,42 @@ impl Shadow {
         self.update_free(from, to)
     }
 
+    /// Refreshes title writes under a declaration made by a list of the
+    /// submission being prepared. Older flights are excluded by [`Self::update`]
+    /// and handled by [`Self::merge_under_writes`].
+    fn update_busy(&self, from: usize, to: usize) -> usize {
+        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return 0;
+        }
+        let Some((now, written)) = crate::watch::writes(from, to, true) else {
+            return 0;
+        };
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        self.copy_stale(from, to, now, &written, |a, b| {
+            let copied = self.copy(a, b);
+            if let Some(snapshot) = before.as_mut() {
+                let offset = a - self.start as usize;
+                // SAFETY: both buffers cover the refreshed range, which
+                // becomes the baseline for this submission's shaders.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.data.add(offset),
+                        snapshot.as_mut_ptr().add(offset),
+                        copied,
+                    );
+                }
+            }
+            copied
+        })
+    }
+
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(from, to, now, &written, |a, b| self.copy(a, b));
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -2726,7 +2796,14 @@ impl Shadow {
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    fn copy_stale(
+        &self,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        mut copy: impl FnMut(usize, usize) -> usize,
+    ) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
@@ -2750,12 +2827,12 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                bytes += copy((first * PAGE).max(from), (page * PAGE).min(to));
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            bytes += copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
         }
         bytes
     }
@@ -2856,7 +2933,7 @@ impl Shadow {
     /// found differing. The bytes shaders wrote (those that differ from the
     /// CPU's side, which is what the card's side held when they started)
     /// go into title memory, from the first to the last of them, as
-    /// [`Shadow::copy_back`] puts them; the CPU's side takes the result and
+    /// [`Shadow::copy_back_with`] puts them; the CPU's side takes the result and
     /// sends it up before the next submission. `title` is scratch memory.
     /// Returns the bytes written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
@@ -3684,6 +3761,48 @@ pub(crate) fn near(va: u64) -> String {
 mod declared_copy_tests {
     use super::*;
 
+    /// The title writes a constant under a range an earlier list of the
+    /// submission declared as written by shaders: the refresh before the
+    /// submission runs still brings it to the copy, a shader's write still
+    /// goes back, and a title write made after the refresh is not undone.
+    #[test]
+    fn title_writes_under_a_busy_range_are_copied() {
+        let Some(host) = host() else { return };
+        let len = 2 * PAGE;
+        let Some((buffer, data)) = host.shared_buffer(len as u64) else {
+            return;
+        };
+        let p = crate::watch::tests::pool(2);
+        // SAFETY: the fresh, live buffer's address is a plain query.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let copy = Shadow::new(buffer, data, gpu, p as u64, len as u64);
+        let title = |at: usize| (p + at) as *mut u8;
+        copy.update(p, len);
+        copy.writing(p, len);
+        // SAFETY: the test owns both buffers and has no GPU work in flight.
+        unsafe { title(PAGE + 20).write_volatile(0x55) };
+        assert!(copy.update(p + PAGE + 16, 16) > 0, "the title's write is copied");
+        take_snapshots();
+        // SAFETY: as above. Simulate a shader write and a later title write.
+        unsafe {
+            assert_eq!(data.add(PAGE + 20).read(), 0x55, "the title's constant reaches the copy");
+            data.add(10).write(0xaa);
+            title(PAGE + 20).write_volatile(0x66);
+        }
+        copy.copy_back_with(p, len, None);
+        // SAFETY: bytes of our pool.
+        unsafe {
+            assert_eq!(title(10).read_volatile(), 0xaa, "the shader's write goes back");
+            assert_eq!(title(PAGE + 20).read_volatile(), 0x66, "the title's later write stays");
+        }
+        copy.copy_back_done(&[(p, p + len)]);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// Ranges shaders write far apart are kept apart (not the copy between
+    /// them); what the GPU wrote goes back once, whichever overlapping
+    /// ranges declared it, and nothing else does.
     #[test]
     fn copy_back_is_bounded_by_declarations_and_withheld_ranges() {
         let Some(host) = host() else { return };
@@ -3711,7 +3830,7 @@ mod declared_copy_tests {
         // between the GPU's bytes survives the merge.
         unsafe { (p as *mut u8).add(14).write(5) };
         copy.keep_writes(p + 40, 8);
-        assert_ne!(copy.copy_back(p + 8, 12), 0);
+        assert_ne!(copy.copy_back_with(p + 8, 12, None), 0);
         copy.copy_back_done(&ranges);
         assert!(!copy.writes_pending());
         // SAFETY: the test still holds the title allocation.

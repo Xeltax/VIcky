@@ -35,9 +35,6 @@ macro_rules! once {
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
-    /// Its bytes.
-    #[cfg(feature = "diagnostics")]
-    size: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
@@ -524,7 +521,7 @@ fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &S
                         d.Format.0,
                         d.MipLevels,
                         staging.footprints.len(),
-                        staging.size,
+                        staging.bytes,
                         footprint.Offset,
                         f.Width,
                         f.Height,
@@ -740,8 +737,14 @@ impl Staging {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
-            // SAFETY: the subresource's part of the mapped staging buffer.
+            if footprint.Offset >= self.bytes {
+                tracing::warn!(mip, slice, "texture footprint outside the staging buffer");
+                return;
+            }
+            let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.bytes);
+            // SAFETY: `subresource_len` clamps `len` to `self.bytes - footprint.Offset`,
+            // keeping the slice strictly inside the mapped staging buffer even when
+            // GetCopyableFootprints does not pad the final row of the last subresource.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
@@ -755,6 +758,18 @@ impl Staging {
         }
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// Bytes available in the staging buffer for a subresource at `offset`.
+/// D3D12's `GetCopyableFootprints` omits trailing row-pitch padding on the
+/// final row of the final subresource, so `pitch * rows * depth` can exceed
+/// `total - offset`.
+fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64) -> usize {
+    let padded = pitch
+        .saturating_mul(rows as usize)
+        .saturating_mul(depth as usize);
+    let remaining = usize::try_from(total.saturating_sub(offset)).unwrap_or(usize::MAX);
+    padded.min(remaining)
 }
 
 /// Drops a transient upload's shared staging. A recorded list keeps its
@@ -789,14 +804,17 @@ fn staged_copy(resource: This) -> Option<Arc<Staging>> {
         .clone()
 }
 
-/// Whether `[at, at + len)` is committed memory (streamed textures may be
-/// unmapped until their pages arrive).
+/// Whether `[at, at + len)` is committed and readable. Streamed textures
+/// may be unmapped until their pages arrive.
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
-    if by_query() {
-        return committed_by_query(at, len);
+    if (at as usize).checked_add(len).is_none() {
+        return false;
     }
     if len == 0 {
         return true;
+    }
+    if by_query() {
+        return committed_by_query(at, len);
     }
     let (there, of) = readable(at as usize, len, true);
     there == of
@@ -820,8 +838,8 @@ fn by_query() -> bool {
 /// can be read, and how many there are; with `all`, it stops at the first
 /// that cannot. One question to the kernel for up to 256 pages at once
 /// (`QueryWorkingSetEx`: the state of each page asked about, no walk); a
-/// page not in the working set may still be there (never touched, or
-/// trimmed), and a one-byte read through the kernel says.
+/// page not in the working set may still be committed (never touched, or
+/// trimmed). Query that region's protection before any read.
 /// A page that is committed and may not be read counts as not there, which
 /// is what the callers ask for: they read or write the memory next.
 fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
@@ -836,6 +854,7 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     // SAFETY: plain data.
     let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
     let mut page = first;
+    let (mut queried_end, mut queried_readable) = (0, false);
     while page <= last {
         let n = (last - page + 1).min(info.len());
         for (i, entry) in info[..n].iter_mut().enumerate() {
@@ -850,11 +869,19 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
             )
         } != 0;
         for (i, entry) in info[..n].iter().enumerate() {
-            // Bit 0 of the answer: the page is in the working set.
-            // SAFETY: plain data the query filled in.
-            let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
-            let mut byte = [0u8];
-            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
+            // SAFETY: plain data returned by the query. For valid entries
+            // bit 0 is set and bits 4..=14 are Win32Protection.
+            let flags = if asked { unsafe { entry.VirtualAttributes.Flags } } else { 0 };
+            let at = (page + i) * KERNEL_PAGE;
+            let readable = if flags & 1 != 0 {
+                readable_protection(((flags >> 4) & 0x7ff) as u32)
+            } else {
+                if at >= queried_end {
+                    (queried_end, queried_readable) = query_region(at);
+                }
+                queried_readable
+            };
+            if readable {
                 there += 1;
             } else if all {
                 return (there, of);
@@ -865,19 +892,34 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     (there, of)
 }
 
-fn committed_by_query(at: *const u8, len: usize) -> bool {
+fn readable_protection(protection: u32) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE, PAGE_GUARD, PAGE_NOACCESS};
+    protection != 0 && protection & (PAGE_EXECUTE | PAGE_GUARD | PAGE_NOACCESS) == 0
+}
+
+/// The first address past `at`'s region, and whether the region is readable.
+fn query_region(at: usize) -> (usize, bool) {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: the query fills an out structure and never reads the address.
+    unsafe {
+        let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        let n = VirtualQuery(at as *const _, &mut info, size_of_val(&info));
+        let end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        (end, n != 0 && end > at && info.State == MEM_COMMIT && readable_protection(info.Protect))
+    }
+}
+
+fn committed_by_query(at: *const u8, len: usize) -> bool {
     let mut p = at as usize;
-    let end = p + len;
+    let Some(end) = p.checked_add(len) else {
+        return false;
+    };
     while p < end {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
+        let (next, readable) = query_region(p);
+        if !readable {
             return false;
         }
-        p = info.BaseAddress as usize + info.RegionSize;
+        p = next;
     }
     true
 }
@@ -889,12 +931,13 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
 /// answer is none without a look at the pages between (two queries for the
 /// slots whose texture is away, which are asked again and again).
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     if len == 0 {
         return 0;
     }
     let start = at as usize;
-    let end = start.saturating_add(len);
+    let Some(end) = start.checked_add(len) else {
+        return 0;
+    };
     if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
         return 0;
     }
@@ -929,17 +972,12 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     }
     let (mut p, mut there) = (start, 0u64);
     while p < end {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        let next = (info.BaseAddress as usize)
-            .saturating_add(info.RegionSize)
-            .min(end);
-        if n == 0 || next <= p {
+        let (next, readable) = query_region(p);
+        let next = next.min(end);
+        if next <= p {
             break;
         }
-        if info.State == MEM_COMMIT {
+        if readable {
             there += (next - p) as u64;
         }
         p = next;
@@ -1005,8 +1043,6 @@ fn staging(resource: This, copy: &Arc<HostTexture>) -> Option<Arc<Staging>> {
         *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"));
     let s = Arc::new(Staging {
         buffer,
-        #[cfg(feature = "diagnostics")]
-        size: total,
         data,
         footprints,
         rows,
@@ -1138,8 +1174,9 @@ mod title_memory_tests {
                 let staged = (height as usize - 1) * pitch + row;
                 assert_eq!(staged, if height == 4 { 896 } else { 1920 });
                 let detile = |tiled: &[u8]| {
-                    // The slice `Staging::detile` hands over: whole rows.
-                    let mut linear = vec![0xeeu8; pitch * height as usize];
+                    // The slice `Staging::detile` hands over, without final padding.
+                    let len = super::subresource_len(0, pitch, height, 1, staged as u64);
+                    let mut linear = vec![0xeeu8; len];
                     layout
                         .detile(tiled, 0, 0, &mut linear, pitch, pitch * height as usize)
                         .expect("detiled");
@@ -1154,7 +1191,7 @@ mod title_memory_tests {
                         "row {y} written"
                     );
                     assert!(
-                        direct[y * pitch + row..(y + 1) * pitch]
+                        direct[y * pitch + row..((y + 1) * pitch).min(staged)]
                             .iter()
                             .all(|&b| b == 0xee),
                         "nothing past row {y}"
@@ -1167,6 +1204,51 @@ mod title_memory_tests {
                     .expect("the staging buffer's bytes are enough");
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subresource_len_stays_inside_staging_total() {
+        // A 4x4 RGBA8 texture has RowPitch=256, rows=4, last_row=16 -> total=784.
+        // Padded size (1024) must be clamped to 784 so from_raw_parts_mut stays in bounds.
+        assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
+        assert_eq!(subresource_len(512, 256, 4, 1, 784), 272);
+        assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
+    }
+
+    #[test]
+    fn committed_rejects_overflow_and_noaccess_pages() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree, VirtualProtect,
+        };
+        assert!(!committed(usize::MAX as *const u8, 16));
+        // SAFETY: reserving and committing one private page for the test, freed below.
+        let noaccess =
+            unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS) };
+        assert!(!noaccess.is_null());
+        assert!(!committed(noaccess.cast::<u8>(), 4096));
+        // SAFETY: freeing the allocation above.
+        unsafe { VirtualFree(noaccess, 0, MEM_RELEASE) };
+
+        // Negative control: a readable committed page still passes.
+        // SAFETY: reserving and committing one private page for the test, freed below.
+        let rw =
+            unsafe { VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!rw.is_null());
+        assert!(committed(rw.cast::<u8>(), 4096));
+        // SAFETY: our own page. The queries must leave its guard in place.
+        unsafe {
+            let mut old = 0;
+            assert_ne!(VirtualProtect(rw, 4096, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+            assert!(!committed(rw.cast::<u8>(), 4096));
+            assert!(!committed(rw.cast::<u8>(), 4096));
+            assert_ne!(VirtualFree(rw, 0, MEM_RELEASE), 0);
         }
     }
 }

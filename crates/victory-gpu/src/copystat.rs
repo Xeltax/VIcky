@@ -317,6 +317,10 @@ static SNAPSHOTS: Mutex<Option<HashMap<(u64, u64), u64>>> = Mutex::new(None);
 
 /// A snapshot of `bytes` of the copy of `[start, start + len)`.
 pub(crate) fn snapshot(start: u64, len: u64, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    add(C::SnapshotBytes, bytes);
     *SNAPSHOTS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
