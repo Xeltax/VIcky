@@ -5,7 +5,7 @@
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{
-    HostShader, MEMORY_FAULTS, MEMORY_MARKS, MEMORY_NOTES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE, lower,
+    HostShader, MEMORY_FAULTS, MEMORY_MARKS, MEMORY_NOTES, MEMORY_PAGE_MARKS, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE, lower,
     validator,
 };
 use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
@@ -181,7 +181,8 @@ fn a_store_by_address_lands_in_its_copy_and_marks_it_on_the_card() {
             "{label}: nothing at the base slot"
         );
         let (faults, rest) = notes.split_at(MEMORY_FAULTS as usize);
-        let (marks, touched) = rest.split_at(MEMORY_MARKS as usize);
+        let (marks, rest) = rest.split_at(MEMORY_MARKS as usize);
+        let touched = &rest[..MEMORY_MARKS as usize];
         // Dword 0 is the sink of the lanes that do not run.
         assert!(
             faults[1..].iter().all(|&d| d == 0),
@@ -192,10 +193,13 @@ fn a_store_by_address_lands_in_its_copy_and_marks_it_on_the_card() {
             touched.iter().enumerate().all(|(n, &d)| n == 1 || d == 0),
             "{label}: no other copy touched"
         );
-        assert_eq!(marks[1], 1, "{label}: copy 1 is marked");
+        // The copies' own marks are unused: the page is marked.
+        assert!(marks.iter().all(|&d| d == 0), "{label}: no copy mark");
+        let pages = &notes[MEMORY_PAGE_MARKS as usize..];
+        assert_eq!(pages[(ADDRESS >> 16) as usize], 1, "{label}: the stored page is marked");
         assert!(
-            marks.iter().enumerate().all(|(n, &d)| n == 1 || d == 0),
-            "{label}: no other mark"
+            pages.iter().enumerate().all(|(p, &d)| p == (ADDRESS >> 16) as usize || d == 0),
+            "{label}: no other page marked"
         );
 
         // Page 2 has no copy: the stores are dropped at the base slot, the
@@ -204,7 +208,8 @@ fn a_store_by_address_lands_in_its_copy_and_marks_it_on_the_card() {
         let (copy, notes) = (&out[1], &out[2]);
         assert!(copy.iter().all(|&d| d == 0), "{label}: copy 1 untouched");
         let (faults, rest) = notes.split_at(MEMORY_FAULTS as usize);
-        let (marks, touched) = rest.split_at(MEMORY_MARKS as usize);
+        let (marks, rest) = rest.split_at(MEMORY_MARKS as usize);
+        let touched = &rest[..MEMORY_MARKS as usize];
         assert!(touched.iter().all(|&d| d == 0), "{label}: no copy touched");
         let page = ADDRESS >> 16;
         let place = (page % (MEMORY_FAULTS - 1) + 1) as usize;

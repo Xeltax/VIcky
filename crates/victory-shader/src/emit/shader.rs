@@ -66,8 +66,15 @@ pub const MEMORY_MARKS: u32 = 1024;
 /// the sink, so it costs no store of its own. The host reads and clears
 /// them to learn which copies shaders read (`VICTORY_MEMORY_REFRESH`).
 pub const MEMORY_TOUCHED: u32 = MEMORY_FAULTS + MEMORY_MARKS;
-/// Dwords of the whole [`SLOT_FAULTS`] buffer: notes, marks and touches.
-pub const MEMORY_NOTES: u32 = MEMORY_TOUCHED + MEMORY_MARKS;
+/// After the touches: one dword per directory page (title address >> 16,
+/// [`MEMORY_PAGES`] of them), set to 1 by every store and atomic a running
+/// lane makes to that page. It replaces the copy's own mark (the dwords at
+/// [`MEMORY_MARKS`] stay unused): the host finds a copy's marks among its
+/// pages', and so knows which pages of it shaders wrote.
+pub const MEMORY_PAGE_MARKS: u32 = MEMORY_TOUCHED + MEMORY_MARKS;
+/// Dwords of the whole [`SLOT_FAULTS`] buffer: notes, the unused copy
+/// marks, touches and page marks.
+pub const MEMORY_NOTES: u32 = MEMORY_PAGE_MARKS + MEMORY_PAGES;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;

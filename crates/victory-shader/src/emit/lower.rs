@@ -2773,7 +2773,9 @@ impl<'a> Lower<'a> {
     /// access that writes (`store`) also marks its copy for the host
     /// (`shader.rs` `MEMORY_MARKS`), for lanes that run.
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>, store: bool) -> (V, V) {
-        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_TOUCHED, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+        use super::shader::{
+            MEMORY_FAULTS, MEMORY_PAGE_MARKS, MEMORY_PAGES, MEMORY_TOUCHED, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE,
+        };
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -2839,11 +2841,11 @@ impl<'a> Lower<'a> {
             &[faults, place, iu, page, iu, iu, iu, mask, align],
         );
         if store {
-            // The copy's mark: every lane writes the same 1, so no atomic
-            // is needed. Lanes that do not run write the sink; a page
-            // without a copy marks number 0, which is no copy.
-            let first = k(self, MEMORY_FAULTS);
-            let mark = self.s.m.bin(c, Bin::Add, first, copy);
+            // The page's mark (`MEMORY_PAGE_MARKS`): every lane writes the
+            // same 1, so no atomic is needed. Lanes that do not run write
+            // the sink. The host finds the copy's mark among its pages'.
+            let first = k(self, MEMORY_PAGE_MARKS);
+            let mark = self.s.m.bin(c, Bin::Add, first, page);
             let mark = self.s.m.bin(c, Bin::Shl, mark, k2);
             let mark = match guard {
                 Some(g) => self.s.m.select(c, g, mark, zero),

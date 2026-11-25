@@ -64,7 +64,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use victory_shader::emit::{MEMORY_FAULTS, MEMORY_MARKS, MEMORY_NOTES, MEMORY_PAGES, MEMORY_TOUCHED};
+use victory_shader::emit::{MEMORY_FAULTS, MEMORY_MARKS, MEMORY_NOTES, MEMORY_PAGE_MARKS, MEMORY_PAGES, MEMORY_TOUCHED};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
@@ -106,6 +106,76 @@ fn named_writes() -> bool {
 /// See [`named_writes`].
 const NAMED_FRAMES: u32 = 3;
 
+/// `VICTORY_MEMORY_PAGE_MARKS=1`: a copy declared written because shaders
+/// marked it lately is declared written only on the 64 KiB pages they
+/// marked lately, not whole (named and new copies: see
+/// [`named_write_most`]). Unset: whole copies, as #346 does. The marks are
+/// the pages' either way (`MEMORY_PAGE_MARKS`).
+///
+/// Why: the title's 174 MB heap is one copy. Some shader stores into it
+/// every frame, so all of it was declared written: snapshotted and compared
+/// whole (365 MB a frame), and a fill of upload memory that reads 480
+/// bytes of it waited for the flight that wrote it to land, 77-114 ms a
+/// frame with the relay on (RTX 4080, structure builder on).
+///
+/// shortcut: a store to a page no shader marked within [`MARK_FRAMES`] is
+/// not copied back until its mark is read (the next frame), as #346
+/// already does for a copy no list declared.
+fn page_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_PAGE_MARKS").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_NAMED_WRITE_MB=<n>`: a copy a dispatch names (a root view or a
+/// constant taken for an address) is declared written from the named
+/// address to n MB after it, with the pages shaders marked lately
+/// ([`page_marks`]), instead of whole. Unset: whole.
+///
+/// shortcut: a root view's shader that writes further than n MB past its
+/// address is not copied back there.
+fn named_write_most() -> Option<u64> {
+    static MOST: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_NAMED_WRITE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|mb| mb << 20)
+    })
+}
+
+/// The runs of pages in `[start, start + len)` marked within
+/// [`MARK_FRAMES`] of `frame`, as (title address, bytes), cut to the range.
+fn marked_runs(marked: &HashMap<u64, u64>, start: u64, len: u64, frame: u64) -> Vec<(u64, u64)> {
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let end = start + len;
+    let mut page = start / PAGE;
+    while page * PAGE < end {
+        if marked.get(&page).is_some_and(|&f| frame.wrapping_sub(f) <= MARK_FRAMES) {
+            let (a, e) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
+            match runs.last_mut() {
+                Some(last) if last.0 + last.1 == a => last.1 += e - a,
+                _ => runs.push((a, e - a)),
+            }
+        }
+        page += 1;
+    }
+    runs
+}
+
+/// `runs` and `[at, at + bytes)` joined, in order.
+fn with_run(mut runs: Vec<(u64, u64)>, at: u64, bytes: u64) -> Vec<(u64, u64)> {
+    if bytes == 0 {
+        return runs;
+    }
+    runs.push((at, bytes));
+    runs.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (a, n) in runs {
+        match out.last_mut() {
+            Some(last) if a <= last.0 + last.1 => last.1 = last.1.max(a + n - last.0),
+            _ => out.push((a, n)),
+        }
+    }
+    out
+}
+
 /// `VICTORY_MEMORY_REFRESH=touched`: on a list's first dispatch, only the
 /// copies a shader touched lately (`MEMORY_TOUCHED`, within
 /// [`MARK_FRAMES`]) are brought up to date, with the named, the new and
@@ -146,6 +216,9 @@ struct Memory {
     /// Per copy: the frame its mark was last found set in (`u64::MAX`:
     /// never), and the frame a list last declared it written in.
     marked: Vec<(u64, u64)>,
+    /// Per directory page shaders stored to, the frame its mark
+    /// (`MEMORY_PAGE_MARKS`) was last found set in.
+    page_marked: HashMap<u64, u64>,
     /// Per copy: the last frame a dispatch's name alone declared it written,
     /// and in how many frames that happened while it was never marked
     /// ([`named_writes`]).
@@ -234,6 +307,7 @@ impl Memory {
             frame: u64::MAX,
             refused: Default::default(),
             marked: Vec::new(),
+            page_marked: HashMap::new(),
             named: Vec::new(),
             touched: Vec::new(),
         })
@@ -357,20 +431,35 @@ impl Memory {
         // were not copied back.
         let mut late = 0;
         for n in 0..self.copies.len() {
-            // SAFETY: inside the mapping, past the fault notes; the GPU may
-            // be writing: a mark set after this read is found next frame.
-            let at = unsafe { self.faults.1.add(MEMORY_FAULTS as usize + n + 1) };
-            // SAFETY: as above.
-            if unsafe { at.read_volatile() } == 0 {
+            // The copy's pages' marks (`MEMORY_PAGE_MARKS`): the copy is
+            // marked if any of them is. Read and cleared; the GPU may be
+            // writing: a mark set after this read is found next frame.
+            let (start, len) = self.copies[n].span();
+            let (first, last) = (start / PAGE, (start + len).div_ceil(PAGE).min(u64::from(MEMORY_PAGES)));
+            let mut any = false;
+            for page in first..last {
+                // SAFETY: inside the mapping (`MEMORY_NOTES` dwords).
+                let d = unsafe { self.faults.1.add(MEMORY_PAGE_MARKS as usize + page as usize) };
+                // SAFETY: as above.
+                if unsafe { d.read_volatile() } != 0 {
+                    // SAFETY: as above.
+                    unsafe { d.write_volatile(0) };
+                    self.page_marked.insert(page, frame);
+                    any = true;
+                }
+            }
+            if !any {
                 continue;
             }
-            // SAFETY: as above.
-            unsafe { at.write_volatile(0) };
             let (_, declared) = self.marked[n];
             if declared == u64::MAX || frame.wrapping_sub(declared) > MARK_FRAMES {
                 late += 1;
             }
             self.marked[n].0 = frame;
+        }
+        // Pages not marked for long are forgotten.
+        if frame % 64 == 0 {
+            self.page_marked.retain(|_, &mut f| frame.wrapping_sub(f) <= MARK_FRAMES);
         }
         if late != 0 {
             static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -446,9 +535,16 @@ impl Memory {
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
     /// after it. Their indices go to `named`.
-    fn name(&mut self, address: u64, named: &mut Vec<usize>) {
-        named.extend(self.map(address));
-        named.extend(self.map((address & !(CELL - 1)) + CELL));
+    fn name(&mut self, address: u64, named: &mut Vec<usize>, at: &mut Vec<(usize, u64)>) {
+        if let Some(n) = self.map(address) {
+            named.push(n);
+            at.push((n, address));
+        }
+        let next = (address & !(CELL - 1)) + CELL;
+        if let Some(n) = self.map(next) {
+            named.push(n);
+            at.push((n, next));
+        }
     }
 }
 
@@ -482,8 +578,10 @@ pub(crate) fn ready(
     }
     let numbered = m.copies.len();
     let mut named = Vec::new();
+    // And where each named copy was named ([`named_write_most`]).
+    let mut named_at: Vec<(usize, u64)> = Vec::new();
     for &address in addresses {
-        m.name(address, &mut named);
+        m.name(address, &mut named, &mut named_at);
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
@@ -493,10 +591,10 @@ pub(crate) fn ready(
             && (1..=0xFF).contains(&high)
             && c >= 0x1_0000
         {
-            m.name(u64::from(c) | u64::from(high) << 32, &mut named);
+            m.name(u64::from(c) | u64::from(high) << 32, &mut named, &mut named_at);
         }
         if c >= 0x0100_0000 {
-            m.name(u64::from(c) << 8, &mut named);
+            m.name(u64::from(c) << 8, &mut named, &mut named_at);
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
@@ -567,7 +665,31 @@ pub(crate) fn ready(
             tally(9, 1);
         }
         if declaring {
-            shadow.gpu_writes(list, start, len);
+            // Not new: only what is known to be written, if the switches
+            // ask for it ([`page_marks`], [`named_write_most`]).
+            let mut runs = if !is_new && (page_marks() || (is_named && named_write_most().is_some())) {
+                marked_runs(&m.page_marked, start, len, frame)
+            } else {
+                Vec::new()
+            };
+            let whole = is_new
+                || (is_named && named_write_most().is_none())
+                || (!is_named && !page_marks());
+            if !whole && is_named {
+                let most = named_write_most().unwrap_or(u64::MAX);
+                for &(i, at) in &named_at {
+                    if i == n && at >= start && at < start + len {
+                        runs = with_run(runs, at, most.min(start + len - at));
+                    }
+                }
+            }
+            if whole || runs.is_empty() {
+                shadow.gpu_writes(list, start, len);
+            } else {
+                for &(at, bytes) in &runs {
+                    shadow.gpu_writes(list, at, bytes);
+                }
+            }
             #[cfg(feature = "diagnostics")]
             {
                 tally(if is_new { 3 } else if is_named { 4 } else { 5 }, 1);
