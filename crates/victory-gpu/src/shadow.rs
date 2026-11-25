@@ -1051,6 +1051,33 @@ fn give_back(v: Vec<u8>) {
     });
 }
 
+/// `VICTORY_BACK_JOIN=<bytes>`: when shader writes are put back into title
+/// memory, runs of the GPU's bytes no further apart than that are written
+/// with one kernel call, the gap between them included (title bytes read
+/// a moment before). 0 or unset: each run alone, as upstream #2009 wants.
+///
+/// Why: each run is one `NtWriteVirtualMemory`. Structure-builder output
+/// changes a few bytes here and there in each node, so a 64 KiB piece can
+/// hold hundreds of runs: putting back 341 pieces took 248 ms a frame on
+/// an RTX 4080 (0.73 ms a piece).
+///
+/// shortcut: a title write landing in a gap between the read and the write
+/// (microseconds) is overwritten with the byte read before it. The gaps are
+/// at most this many bytes, and only between bytes the GPU wrote.
+fn back_join() -> usize {
+    static JOIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *JOIN.get_or_init(|| {
+        std::env::var("VICTORY_BACK_JOIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    })
+}
+
+/// Of putting shader writes back, since the last frame-rate line: pieces
+/// looked at, runs of GPU bytes, kernel writes; microseconds reading title
+/// memory and merging, opening guards (`watch::writing`), writing.
+/// Then, of the relay's merges ([`Shadow::relay_merge`]): stretches
+/// written and microseconds in all.
+static BACK_PUT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
 /// `VICTORY_REFRESH_STAMP=1`: a refresh of a copy's range that the
 /// journal answered alone (the range lies in one asked ahead) is noted with
 /// the asking's number; a refresh of a range inside it under the same
@@ -1591,6 +1618,23 @@ pub(crate) fn back_line(frames: f64) {
         mb(c[1]),
         mb(c[4]),
     );
+    {
+        let b: Vec<f64> = BACK_PUT.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        if b[0] > 0.0 || b[6] > 0.0 {
+            tracing::info!(
+                relay_stretches = b[6],
+                relay_ms = b[7] / 1000.0,
+                pieces = b[0],
+                runs = b[1],
+                writes = b[2],
+                read_merge_ms = b[3] / 1000.0,
+                open_ms = b[4] / 1000.0,
+                write_ms = b[5] / 1000.0,
+                join = back_join(),
+                "putting shader writes back, per frame"
+            );
+        }
+    }
     if stamp_on() {
         let (n, bytes) = (STAMP_SKIPS[0].swap(0, Ordering::Relaxed), STAMP_SKIPS[1].swap(0, Ordering::Relaxed));
         tracing::info!(
@@ -2515,18 +2559,40 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
-                let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
+                let timed = std::time::Instant::now();
+                let piece = back_piece(host, old, &mut title, &mut mask, &mut runs, read);
+                BACK_PUT[0].fetch_add(1, Ordering::Relaxed);
+                BACK_PUT[3].fetch_add(timed.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let Some((first, n)) = piece else {
                     continue;
                 };
                 let at = at + first;
+                let timed = std::time::Instant::now();
                 crate::watch::writing(start + at, n);
+                BACK_PUT[4].fetch_add(timed.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let timed = std::time::Instant::now();
                 // Only the GPU's bytes (upstream #2009): the rest of the
                 // stretch is the title's as read, and a title write landing
-                // there since stays.
-                for &(off, len) in &runs {
-                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
-                    written += len;
+                // there since stays. With [`back_join`], runs closer than
+                // that many bytes are written as one, gaps included (the
+                // title's bytes as read just now).
+                let join = back_join();
+                let mut i = 0;
+                while i < runs.len() {
+                    let (off, mut end) = (runs[i].0, runs[i].0 + runs[i].1);
+                    written += runs[i].1;
+                    let mut j = i + 1;
+                    while j < runs.len() && runs[j].0 - end <= join {
+                        end = runs[j].0 + runs[j].1;
+                        written += runs[j].1;
+                        j += 1;
+                    }
+                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), end - off);
+                    BACK_PUT[2].fetch_add(1, Ordering::Relaxed);
+                    i = j;
                 }
+                BACK_PUT[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                BACK_PUT[5].fetch_add(timed.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
@@ -2574,6 +2640,17 @@ impl Shadow {
     /// never see each other half done. `now` and `title` are scratch
     /// memory. Returns the bytes written to title memory.
     pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
+        let timed = std::time::Instant::now();
+        let written = self.relay_merge_timed(at, n, now, title);
+        BACK_PUT[7].fetch_add(timed.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if written != 0 {
+            BACK_PUT[6].fetch_add(1, Ordering::Relaxed);
+        }
+        written
+    }
+
+    /// [`Shadow::relay_merge`], untimed.
+    fn relay_merge_timed(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
