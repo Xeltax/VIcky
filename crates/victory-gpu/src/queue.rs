@@ -1236,23 +1236,37 @@ const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
 pub(crate) enum Written {
     Value(u64),
     /// The GPU clock: [`TIMESTAMP_FREQUENCY`] ticks per second since the
-    /// process started (our GPU work is done on the CPU's timeline).
+    /// process started (our GPU work is done on the CPU's timeline); the
+    /// title's slowed clock when its time is scaled (`victory_core::timescale`).
     GpuTimestamp,
-    /// The CPU's performance counter.
+    /// The CPU's performance counter (the title's, when scaled).
     SystemTimestamp,
 }
 
 impl Written {
     /// Stores the low `bytes` (4 or 8) of the value at `at`.
     pub(crate) fn write(self, at: *mut u8, bytes: usize) {
+        use victory_core::timescale;
         let value = match self {
             Written::Value(v) => v,
             Written::GpuTimestamp => {
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-                let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
+                let ns = match timescale::title_ns() {
+                    Some(ns) => {
+                        timescale::count(timescale::Source::GpuTimestamp);
+                        ns
+                    }
+                    None => START.get_or_init(std::time::Instant::now).elapsed().as_nanos(),
+                };
+                (ns / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
             }
-            Written::SystemTimestamp => system_timestamp(),
+            Written::SystemTimestamp => match timescale::counter() {
+                Some(now) => {
+                    timescale::count(timescale::Source::SystemTimestamp);
+                    now as u64
+                }
+                None => system_timestamp(),
+            },
         };
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {

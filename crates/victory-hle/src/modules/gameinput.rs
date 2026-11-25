@@ -350,8 +350,13 @@ unsafe impl Sync for Hub {}
 
 static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-/// Microseconds, the clock of every timestamp we hand out.
+/// Microseconds, the clock of every timestamp we hand out: the title's slowed clock when
+/// its time is scaled (`victory_core::timescale`).
 fn now() -> u64 {
+    if let Some(us) = victory_core::timescale::title_us() {
+        victory_core::timescale::count(victory_core::timescale::Source::InputTimestamp);
+        return us;
+    }
     START.elapsed().as_micros() as u64
 }
 

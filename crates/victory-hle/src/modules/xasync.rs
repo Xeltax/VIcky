@@ -218,6 +218,8 @@ impl Queue {
             self.deliver(port, task);
         } else {
             let queue = self.clone();
+            // The title's time (`VICTORY_TIME_SCALE`).
+            let delay_ms = victory_core::timescale::real_wait_ms(delay_ms);
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(delay_ms.into()));
                 queue.deliver(port, task);
@@ -347,6 +349,8 @@ pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> b
     if port.mode != Mode::Manual {
         return false;
     }
+    // The title's time (`VICTORY_TIME_SCALE`); `INFINITE` stays.
+    let timeout_ms = victory_core::timescale::real_wait_ms(timeout_ms);
     match port.take(timeout_ms, || queue.terminated.load(Ordering::Acquire)) {
         Some(task) => {
             task.run(false);

@@ -23,3 +23,7 @@ diagnostics = []
 
 [lints]
 workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# The host's clocks, for the title's (`timescale`).
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Performance", "Win32_System_SystemInformation"] }

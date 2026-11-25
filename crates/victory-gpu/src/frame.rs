@@ -6,12 +6,17 @@
 //! with "token on time-out" (starting its next frame at once) and is paced
 //! by a blocking wait for the flip before each present.
 //!
+//! The clock is the title's: with `VICTORY_TIME_SCALE` it runs slowed like
+//! every clock the title reads (`victory_core::timescale`), so an interval
+//! of 33 ms is 33 ms of the title's time, and a wait sleeps that span
+//! converted to real time.
+//!
 //! shortcut: event offsets are ignored (every event is at the tick); tie
 //! the clock to presentation if a title paces by them.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::object::{HRESULT, S_FALSE, S_OK, This};
@@ -26,7 +31,8 @@ const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
 
 struct Clock {
-    start: Instant,
+    /// On the title's clock ([`now_ns`]).
+    start: u128,
     interval: Duration,
     /// The tick number at `start` (ticks go on across interval changes).
     first: u64,
@@ -37,6 +43,13 @@ static FRAME: AtomicU64 = AtomicU64::new(0);
 
 fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Nanoseconds on the title's clock: real time from the first reading, or
+/// the slowed time of `VICTORY_TIME_SCALE`.
+fn now_ns() -> u128 {
+    static ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
+    victory_core::timescale::title_ns().unwrap_or_else(|| ORIGIN.elapsed().as_nanos())
 }
 
 /// Device method: a frame every `length` microseconds. The period is how
@@ -61,7 +74,7 @@ pub(crate) extern "system" fn set_interval(
         .max()
         .unwrap_or(0);
     *clock() = Some(Clock {
-        start: Instant::now(),
+        start: now_ns(),
         interval,
         first,
     });
@@ -98,11 +111,11 @@ fn last(kind: u32) -> &'static AtomicU64 {
 fn next_tick(kind: u32) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
-        start: Instant::now(),
+        start: now_ns(),
         interval: SIXTIETH,
         first: 0,
     });
-    let elapsed = c.start.elapsed().as_nanos();
+    let elapsed = now_ns().saturating_sub(c.start);
     let interval = c.interval.as_nanos().max(1);
     let tick =
         (c.first + (elapsed / interval + 1) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
@@ -142,17 +155,18 @@ pub(crate) extern "system" fn wait(
         tick -= 1;
         wait = Duration::ZERO;
     }
+    // The title's time, slept in real time (the same span when not scaled).
+    let slept = victory_core::timescale::real_duration(wait.min(limit));
+    std::thread::sleep(slept);
     let hr = if wait > limit {
-        std::thread::sleep(limit);
         TIMEOUT
     } else {
-        std::thread::sleep(wait);
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
     #[cfg(windows)]
     {
-        let us = wait.min(limit).as_micros() as u64;
+        let us = slept.as_micros() as u64;
         crate::framelog::add(crate::framelog::T::PaceUs, us);
         crate::framelog::here(crate::framelog::H::PaceUs, us);
     }
@@ -160,7 +174,7 @@ pub(crate) extern "system" fn wait(
     {
         use crate::copystat::{C, add};
         add(C::PaceWaits, 1);
-        add(C::PaceUs, wait.min(limit).as_micros() as u64);
+        add(C::PaceUs, slept.as_micros() as u64);
     }
     // A frame begun on a time-out takes no tick: its flip still does.
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {

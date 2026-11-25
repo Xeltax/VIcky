@@ -29,6 +29,8 @@ pub mod media;
 pub mod net;
 pub mod speech;
 pub mod storage;
+#[cfg(windows)]
+pub mod time;
 pub mod xasync;
 pub mod xg;
 pub mod xgame;
@@ -71,5 +73,11 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    // The title's clocks and waits, only while its time is slowed: otherwise its imports
+    // stay bound to the host's own functions.
+    #[cfg(windows)]
+    if time::active() {
+        all.push(time::module());
+    }
     all
 }
