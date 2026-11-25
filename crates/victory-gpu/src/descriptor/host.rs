@@ -683,8 +683,8 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
-/// Asks the host, once, whether it caps view heaps at [`PORTABLE_VIEWS`],
-/// and if so tells the translator now (`set_view_heap_limit`) instead of
+/// Checks whether the host can allocate the full view heap addressed by
+/// the translator. If that fails, selects the portable layout now instead of
 /// when the title's heap is made: a shader keeps the limit it was
 /// translated with, and the title makes 25 pipelines (their
 /// shaders translated at once) before it makes its view heap. Those would
@@ -710,13 +710,16 @@ pub(crate) fn probe_view_limit() {
             host.device
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: PORTABLE_VIEWS + 1,
+                    // An RTX 4060 Laptop accepts 1,000,001 slots but refuses
+                    // the larger title heap. Probe the full indexing range
+                    // before choosing a layout that compiled shaders retain.
+                    NumDescriptors: victory_shader::emit::SLOT_STRIDES_COUNT,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     NodeMask: 0,
                 })
         };
         if made.is_err() {
-            tracing::info!("the host caps view heaps at {PORTABLE_VIEWS}: view indices are clamped from the first shader on");
+            tracing::info!("the full view heap is unavailable: using {PORTABLE_VIEWS} slots from the first shader on");
             victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
             if heap_map_on() {
                 let window = window();
