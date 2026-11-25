@@ -51,8 +51,9 @@ enum Held {
     /// A submission: the lists' host sides, taken from the title's lists
     /// (which it may reset meanwhile), and the order they run in.
     Run(Vec<crate::list::Detached>, Vec<usize>),
-    /// A signal of the queue's, due after what it holds before it.
-    Signal(usize, u64),
+    /// A signal of the queue's, due after what it holds before it; whether
+    /// it begins a frame (`crate::fence::sent`: published when sent).
+    Signal(usize, u64, bool),
     /// With [`behind`]: the submission at the head of the line is being
     /// prepared and sent by our thread, with the line unlocked, so the
     /// title can add to its end meanwhile; whatever is added stays behind
@@ -628,8 +629,9 @@ struct Joined {
     lists: Vec<crate::list::Detached>,
     order: Vec<usize>,
     parts: usize,
-    /// Signals met behind those parts: delivered when the parts are sent.
-    signals: Vec<(usize, u64)>,
+    /// Signals met behind those parts: delivered when the parts are sent
+    /// (fence, value, whether it begins a frame).
+    signals: Vec<(usize, u64, bool)>,
     /// The queues with a part here: each has [`Held::Running`] at the
     /// head of its line.
     marked: Vec<usize>,
@@ -706,10 +708,8 @@ fn send_joined(joined: &mut Joined) {
         joined.parts = 0;
     }
     // Behind what was just sent, in the order they were met.
-    for (fence, value) in joined.signals.drain(..) {
-        if !crate::host::late_signal(fence, value) {
-            crate::fence::set(fence as This, value);
-        }
+    for (fence, value, begins) in joined.signals.drain(..) {
+        deliver(fence, value, begins);
     }
     for q in joined.marked.drain(..) {
         // SAFETY: a live queue, as in the loop that marked it.
@@ -721,6 +721,23 @@ fn send_joined(joined: &mut Joined) {
         if held.is_empty() {
             lock(&WAITING).retain(|&w| w != q);
         }
+    }
+}
+
+/// Delivers a queue's signal whose turn has come, everything the queue was
+/// given before it having been sent: behind the flights in the air if there
+/// are any (`crate::host::late_signal`), else set now. The signal that
+/// begins a frame (`begins`, with `crate::fence::sent`) goes behind them
+/// too and has its value published now (`crate::host::sent_signal`).
+#[cfg(windows)]
+fn deliver(fence: usize, value: u64, begins: bool) {
+    let behind = if begins { crate::host::sent_signal(fence, value) } else { crate::host::late_signal(fence, value) };
+    if !behind {
+        #[cfg(feature = "diagnostics")]
+        if begins {
+            crate::fence::pace::sent_at_once();
+        }
+        crate::fence::set(fence as This, value);
     }
 }
 
@@ -767,8 +784,10 @@ fn release_held_now(all: bool) {
                 let base = usize::from(joined.marked.contains(&q));
                 match held.get(base) {
                     None | Some(Held::Running) => break,
+                    // (The landed value: one published ahead of its
+                    // landing, `crate::fence::sent`, does not pass it.)
                     Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
+                        if !all && crate::fence::landed(fence as This) < value =>
                     {
                         break;
                     }
@@ -918,12 +937,12 @@ fn release_held_now(all: bool) {
                     }
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
-                    Held::Signal(fence, value) => {
+                    Held::Signal(fence, value, begins) => {
                         if !joined.is_empty() {
                             // Behind parts not sent yet: with them.
-                            joined.signals.push((fence, value));
-                        } else if !crate::host::late_signal(fence, value) {
-                            crate::fence::set(fence as This, value);
+                            joined.signals.push((fence, value, begins));
+                        } else {
+                            deliver(fence, value, begins);
                         }
                     }
                 }
@@ -1149,16 +1168,32 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::fence::pace::signal_called(fence as usize, value);
+    // VIcky: whether it begins a frame (`crate::fence::sent`; never without
+    // the switch).
+    #[cfg(windows)]
+    let begins = crate::fence::sent::signalled(this as usize, fence as usize);
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
-    if hold(this, || Held::Signal(fence as usize, value)) {
+    if hold(this, || Held::Signal(fence as usize, value, begins)) {
         return S_OK;
     }
     // Behind the submissions sent to the card and not waited for: the
-    // fence is set when they are settled.
+    // fence is set when they are settled (and the frame-begin signal's
+    // value is published now: everything before it was sent).
     #[cfg(windows)]
-    if crate::host::late_signal(fence as usize, value) {
-        return S_OK;
+    {
+        let behind = if begins {
+            crate::host::sent_signal(fence as usize, value)
+        } else {
+            crate::host::late_signal(fence as usize, value)
+        };
+        if behind {
+            return S_OK;
+        }
+        #[cfg(feature = "diagnostics")]
+        if begins {
+            crate::fence::pace::sent_at_once();
+        }
     }
     let _ = this;
     crate::fence::signal(fence, value)
@@ -1176,7 +1211,9 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     }
     #[cfg(windows)]
     if !this.is_null() {
-        let now = crate::fence::completed(fence);
+        // The landed value: one published ahead of its landing
+        // (`crate::fence::sent`) does not let the queue's work go earlier.
+        let now = crate::fence::landed(fence);
         // Whether the title uses this at all (the first calls).
         {
             static CALLS: AtomicU64 = AtomicU64::new(0);
@@ -1298,6 +1335,8 @@ extern "system" fn present(
     #[cfg(windows)]
     let presenting = std::time::Instant::now();
     let hr = present_now(this, planes, plane_parameters);
+    // VIcky: the next signal may begin the next frame (`crate::fence::sent`).
+    crate::fence::sent::presented();
     #[cfg(windows)]
     {
         crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);

@@ -752,6 +752,32 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     differs != 0
 }
 
+/// VIcky (`crate::fence::sent`; diagnostics, `VICTORY_FENCE_SENT_CHECK=1`):
+/// before a relay merge, while a fence's value is published ahead of its
+/// landing, the bytes the card changed (`now` differs from `held`) that the
+/// title changed too since the reference was taken (`title`, as just read,
+/// differs from both). The merge puts the card's over them: the title's
+/// writes lost, as a title that reuses memory the frame before's shaders
+/// write would lose them once told early that those are done.
+#[cfg(feature = "diagnostics")]
+fn lost_under_published(now: &[u8], held: &[u8], title: &[u8]) {
+    if !crate::fence::sent::check() || !crate::fence::ahead() {
+        return;
+    }
+    let lost = title_bytes_lost(now, held, title);
+    if lost > 0 {
+        crate::fence::pace::lost_ahead(lost as u64);
+    }
+}
+
+/// [`lost_under_published`]'s count: the bytes where the card and the title
+/// both changed `held`, to different values ([`merge_piece`] keeps the
+/// card's there).
+#[cfg(any(test, feature = "diagnostics"))]
+fn title_bytes_lost(now: &[u8], held: &[u8], title: &[u8]) -> usize {
+    now.iter().zip(held).zip(title).filter(|&((n, h), t)| n != h && t != h && t != n).count()
+}
+
 /// `[from, to)` without the ranges of `skip`, in order.
 pub(crate) fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
@@ -926,7 +952,7 @@ fn merge_race(read: Option<&[u8]>, copy: (u64, u64), address: usize, merged: &[u
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, changed_runs, merge_piece, outside};
+    use super::{Flights, changed_runs, merge_piece, outside, title_bytes_lost};
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
@@ -983,6 +1009,20 @@ mod relay_tests {
         let (title1, held1) = (title.clone(), held.clone());
         assert!(!merge_piece(&now, &mut held, &mut title));
         assert_eq!((title, held), (title1, held1));
+    }
+
+    /// VIcky (`crate::fence::sent`): the title's bytes a merge puts the
+    /// card's over are those both changed, to different values.
+    #[test]
+    fn title_bytes_lost_are_those_both_changed_differently() {
+        let held = [1u8, 2, 3, 4, 5, 6];
+        let now = [1u8, 20, 30, 40, 5, 6]; // the card wrote bytes 1, 2, 3
+        let title = [1u8, 2, 33, 40, 55, 6]; // the title wrote bytes 2, 3, 4
+        // 2: both, to different values (lost); 3: both, the same value; 1:
+        // the card alone; 4: the title alone.
+        assert_eq!(title_bytes_lost(&now, &held, &title), 1);
+        assert_eq!(title_bytes_lost(&now, &held, &held), 0, "the title wrote nothing");
+        assert_eq!(title_bytes_lost(&held, &held, &title), 0, "the card wrote nothing");
     }
 
     #[test]
@@ -2867,6 +2907,8 @@ impl Shadow {
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
         let as_read = merge_race_on().then(|| title.clone());
+        #[cfg(feature = "diagnostics")]
+        lost_under_published(now, held, title);
         if !merge_piece(now, held, title) {
             return 0;
         }
@@ -3668,6 +3710,10 @@ impl Shadow {
             let (a, b) = (a - at, b - at);
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
+            #[cfg(feature = "diagnostics")]
+            if mapped {
+                lost_under_published(&gpu[a..b], &held[a..b], &title[a..b]);
+            }
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
         }
         if !mapped || !changed {

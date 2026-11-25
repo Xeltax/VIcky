@@ -376,6 +376,23 @@ fn preparing(i: usize, n: u64) {
 fn copy_back(i: usize, n: u64) {
     COPY_BACK[i].fetch_add(n, Ordering::Relaxed);
     crate::framelog::add([crate::framelog::T::CopyBackUs, crate::framelog::T::CopyBackBytes][i], n);
+    // VIcky (`crate::fence::sent`): bytes the title could have read stale,
+    // told that the frame was done before they were back.
+    #[cfg(feature = "diagnostics")]
+    if i == 1 && n > 0 && crate::fence::ahead() {
+        crate::fence::pace::landed_ahead(n, 0);
+    }
+}
+
+/// A bottom-of-pipe write of a flight that has landed. VIcky
+/// (`crate::fence::sent`): counted if a fence's value was published ahead
+/// meanwhile (the title could have read the value before it).
+fn landed_write(at: usize, what: crate::queue::Written, bytes: usize) {
+    #[cfg(feature = "diagnostics")]
+    if crate::fence::ahead() {
+        crate::fence::pace::landed_ahead(0, 1);
+    }
+    what.write(at as *mut u8, bytes);
 }
 
 /// Adds to [`CARD_CLOCK_US`] and, for the card's idle times, to the frame
@@ -3062,13 +3079,27 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
 /// air, if there are any, and is set when they are settled. Whether it
 /// did; if not the caller sets the fence now.
 pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
+    signal_behind(fence, value, false).is_some()
+}
+
+/// [`late_signal`]; `count`: with what is ahead of the signal in the line
+/// (flights; bottom-of-pipe writes, those being landed too), else zeros.
+/// None if nothing is in the air.
+fn signal_behind(fence: usize, value: u64, count: bool) -> Option<(usize, usize)> {
     if !late() {
-        return false;
+        return None;
     }
     let mut line = line();
     if line.line.is_empty() && !line.settling {
-        return false;
+        return None;
     }
+    let ahead = if count {
+        let flights = line.line.iter().filter(|l| matches!(l, Late::Run(_))).count();
+        let writes = line.line.iter().filter(|l| matches!(l, Late::Write(..))).count() + line.in_hand.len();
+        (flights, writes)
+    } else {
+        (0, 0)
+    };
     line.line.push(Late::Signal(fence, value));
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
     drop(line);
@@ -3076,6 +3107,27 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     // the helper thread for it.
     LINE_MOVED.notify_one();
     RELAY_MOVED.notify_one();
+    Some(ahead)
+}
+
+/// VIcky, [`late_signal`] for the signal that begins a frame
+/// (`VICTORY_FENCE_SENT=1`, `crate::fence::sent`), called when everything
+/// its queue was given before it has been sent: it goes behind the flights
+/// in the air and lands with them in order, as any signal does, and its
+/// value is published to the title now (`crate::fence::set_early`). After
+/// it is in the line: a landing that comes first leaves nothing to publish
+/// (the fence is there already), and a value published always has its
+/// landing still to come, which ends it. Whether it went behind flights;
+/// if not the caller sets the fence now, as for any signal.
+pub(crate) fn sent_signal(fence: usize, value: u64) -> bool {
+    let Some(ahead) = signal_behind(fence, value, cfg!(feature = "diagnostics")) else {
+        return false;
+    };
+    let early = crate::fence::set_early(fence as crate::object::This, value);
+    #[cfg(feature = "diagnostics")]
+    crate::fence::pace::sent(early, ahead.0, ahead.1);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (early, ahead);
     true
 }
 
@@ -4919,7 +4971,7 @@ impl Host {
                     }
                     landed.push((flight.lists, flight.order));
                 }
-                Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
+                Late::Write(at, what, bytes) => landed_write(at, what, bytes),
                 Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
             }
         }
@@ -5345,7 +5397,7 @@ impl Host {
                         }
                         landed.push((flight.lists, flight.order));
                     }
-                    Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
+                    Late::Write(at, what, bytes) => landed_write(at, what, bytes),
                     Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
                 }
             }
