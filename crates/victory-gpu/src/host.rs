@@ -5399,8 +5399,14 @@ impl Host {
             }
         }
         // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted.
-        crate::descriptor::sync_heaps();
+        // command lists that index those slots are submitted. VIcky
+        // (`VICTORY_HEAP_SYNC_BESIDE=1`): on a thread of its own from the
+        // start of the refreshes to the snapshots' end, below
+        // (`crate::descriptor::beside` says why that order holds).
+        let beside = crate::descriptor::beside::on();
+        if !beside {
+            crate::descriptor::sync_heaps();
+        }
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -5424,6 +5430,10 @@ impl Host {
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
+        // VIcky: the heap sync starts here, after the sweep, and this
+        // thread goes on once it has asked for the heaps' pages (ahead of
+        // the submission's own asking).
+        let beside = beside.then(crate::descriptor::beside::start);
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
@@ -5499,6 +5509,15 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
+        // VIcky: the heap sync started beside the refreshes ends before
+        // anything reads the host heaps (the lists, when they run), and the
+        // slots it left waiting for a texture made since are made now. The
+        // wait is the sync's, on its line, not the preparing's.
+        let mut joined = std::time::Duration::ZERO;
+        if let Some(beside) = beside {
+            joined = beside.join();
+            crate::descriptor::make_waiting();
+        }
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
@@ -5526,7 +5545,7 @@ impl Host {
             }
             let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
-            submission_us(0, (prepared - started).saturating_sub(settled).as_micros() as u64);
+            submission_us(0, (prepared - started).saturating_sub(settled + joined).as_micros() as u64);
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
             crate::copystat::submission_ends(lock);
@@ -5604,7 +5623,7 @@ impl Host {
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
-        submission_us(0, (prepared - started).as_micros() as u64);
+        submission_us(0, (prepared - started).saturating_sub(joined).as_micros() as u64);
         submission_us(1, gpu.as_micros() as u64);
         #[cfg(feature = "diagnostics")]
         crate::copystat::card_waited(gpu.as_micros() as u64, || {
