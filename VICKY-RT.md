@@ -3,7 +3,7 @@
 This branch is for making the title's compute ray tracing (the BVH structure builder plus traversal) usable on PC.
 
 - **Base:** `fx-heapmap-8d` (fxceless/victory-fork `8dd30ab` + VIcky's heap map + fork PR #188, Series S), **merged with fork main up to `465b94f`** (2026-11-25 evening: its own submit thread, copy queue, draw windows, `VICTORY_JOIN_PARTS`, `VICTORY_BACK_OWN_VIEW`, `VICTORY_INDIRECT_GATHER`, and its descriptor fix: 1 untranslated program left in our scene instead of 5).
-- **Status:** research. It builds, and the gpu, shader, hle and loader suites and `cargo xtask policy` pass. Game measurements are below.
+- **Status:** research. It builds, and the gpu, shader, hle and loader suites and `cargo xtask policy` pass, except one test that fails on fork main too (`indirect::tests::warp_budget_saturates_without_wraparound_and_preserves_draw_fields`, always when run alone). Game measurements are below.
 
 ## What is merged on top of `fx-heapmap-8d`
 
