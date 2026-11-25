@@ -21,8 +21,11 @@ This branch is for making the title's compute ray tracing (the BVH structure bui
 - `VICTORY_MEMORY_NAMED_WRITES=0`: a copy that is only named by a constant and never marked stops being snapshotted.
 - `VICTORY_SNAPSHOT_POOL_MB=<n>` keeps snapshot buffers by size for reuse.
 - `VICTORY_REFRESH_STAMP=1`: measured 0 skips; useless, will go.
+- `VICTORY_BVH_COPY=skip`: the builder's copies of a structure onto itself are not recorded (RT32, below). `native` also runs a pass of ours for any other copy, and `check` compares that pass with the program (diagnostics).
 
-**Recommended with the builder on:** `VICTORY_BACK_JOIN=256 VICTORY_MEMORY_REFRESH=touched VICTORY_MEMORY_NAMED_WRITES=0 VICTORY_SNAPSHOT_POOL_MB=2048`.
+**VIcky PRs merged:** #23 (g0shtj0sh): main's opt-in `VICTORY_NO_WATCHDOG=1` hook (upstream #454, fork #364), for slower PCs whose runs the title's watchdog kills at the world's entry. Nothing changes when it is unset.
+
+**Recommended with the builder on:** `VICTORY_BVH_COPY=skip VICTORY_BACK_JOIN=256 VICTORY_MEMORY_REFRESH=touched VICTORY_MEMORY_NAMED_WRITES=0 VICTORY_SNAPSHOT_POOL_MB=2048`.
 
 ## Run
 
@@ -135,6 +138,21 @@ GPU profiles come from `VICTORY_GPU_TIMING=1 VICTORY_D3D12_DRED=1`.
 - stage 0 of hardware ray tracing (an inventory of the traversal programs).
 
 The page-mark switches (`VICTORY_MEMORY_PAGE_MARKS`, `VICTORY_NAMED_WRITE_MB`) are on this branch for experiments; don't turn them on for normal runs.
+
+### RT31–RT32: the builder's copy writes each structure onto itself, so it is skipped
+
+- **RT31** (`VICTORY_BVH_COPY=check`): in every `CopyForBVHUpdate` dispatch the source and the destination, two root parameters, held one title address, and constant 1 was unset. The title refits its structures in place, so the program reads each 16 bytes and writes them back where they were.
+- **`VICTORY_BVH_COPY=skip`** records nothing for such a dispatch, about 63 a frame. That also removes the notes and page marks that made the host copy those pages back.
+- Same window shot as RT28 (no input, RT10's switches, this branch's base):
+
+| run | ms/frame | fps | GPU | copying back | draws |
+|---|---|---|---|---|---|
+| RT28, baseline | 353–418 | 2.4–2.8 | 166–204 | 228–287 | ~5,060 |
+| RT32, skip (two agents building during the run) | 279–389 | 2.6–3.6 | 53–82 | 132–193 | ~5,000 |
+| RT32b, skip | **210–273** | **3.7–4.8** | 41–79 | 127–158 | 4,750–4,930 |
+
+- The picture is as in RT28: lit, same colours, the left fifth of the window shot at 27–28 mean blue.
+- **The GPU is no longer the limit.** What is left is on the CPU: "preparing" (134–164 ms, mostly checking which title memory the CPU wrote) and the copy-back.
 
 ## Roadmap: from about 3.5 fps toward 15–20
 
