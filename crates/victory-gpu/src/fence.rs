@@ -4,10 +4,12 @@
 
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
+
+pub(crate) mod sent;
 
 pub(crate) const FENCE_IIDS: [Iid; 4] = [
     guid(
@@ -30,6 +32,9 @@ struct Fence {
     flags: u32,
     /// Events to set once the value reaches theirs (handles as integers).
     waiters: Mutex<Vec<(u64, usize)>>,
+    /// VIcky ([`sent`]): a value published ahead of its landing, and what
+    /// landed meanwhile. Taken inside `waiters`' lock where both are.
+    ahead: Mutex<sent::Ahead>,
     /// For [`pace`]: when each wait above was asked for.
     #[cfg(all(windows, feature = "diagnostics"))]
     asked: Mutex<Vec<pace::Asked>>,
@@ -53,6 +58,7 @@ pub(crate) extern "system" fn create(
         value: AtomicU64::new(initial),
         flags,
         waiters: Mutex::new(Vec::new()),
+        ahead: Mutex::new(sent::Ahead::default()),
         #[cfg(all(windows, feature = "diagnostics"))]
         asked: Mutex::new(Vec::new()),
     });
@@ -119,12 +125,38 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     S_OK
 }
 /// Moves the fence to `value` and sets the events that waited for it.
+///
+/// VIcky ([`sent`]): on a fence whose value was published ahead of its
+/// landing ([`set_early`]), a value below it is only noted (what our
+/// queues' waits go by, [`landed`]) and the fence stays where it is; at or
+/// above it the fence takes it as before. Without the switch nothing is
+/// ever ahead, and this looks no further than [`AHEAD`].
 pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+    // (Read under the lock `set_early` counts in.)
+    if AHEAD.load(Ordering::Relaxed) > 0 {
+        let mut ahead = fence.ahead.lock().unwrap_or_else(|e| e.into_inner());
+        let was = ahead.is_ahead();
+        let takes = ahead.land(value);
+        if was && !ahead.is_ahead() {
+            AHEAD.fetch_sub(1, Ordering::Relaxed);
+        }
+        if !takes {
+            drop(ahead);
+            #[cfg(all(windows, feature = "diagnostics"))]
+            pace::landed_behind(this, value);
+            return;
+        }
+    }
     fence.value.store(value, Ordering::Release);
     #[cfg(all(windows, feature = "diagnostics"))]
     pace::reached(this, &fence.asked, value);
+    wake(&mut waiters, value);
+}
+
+/// Sets the events of `waiters` waiting for `value` or less, and lets them go.
+fn wake(waiters: &mut Vec<(u64, usize)>, value: u64) {
     waiters.retain(|&(wanted, event)| {
         let reached = wanted <= value;
         if reached {
@@ -132,6 +164,74 @@ pub(crate) fn set(this: This, value: u64) {
         }
         !reached
     });
+}
+
+/// Fences whose value is published ahead of its landing now ([`set_early`]):
+/// counted up before the value is stored and down when a landing reaches
+/// it, each under that fence's `waiters` lock.
+static AHEAD: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a fence's value is published ahead of its landing now
+/// ([`set_early`]): for the pace meter.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn ahead() -> bool {
+    AHEAD.load(Ordering::Relaxed) > 0
+}
+
+/// VIcky ([`sent`]): the stretches of time in which a value is published
+/// ahead of its landing, numbered: counted up each time a fence goes ahead
+/// (before [`AHEAD`] is), so that what is noted in one stretch can be told
+/// from what was noted in an earlier one (`crate::shadow`'s title bytes put
+/// into a copy while a value was ahead).
+static PERIOD: AtomicU64 = AtomicU64::new(0);
+
+/// VIcky ([`sent`]): whether a fence's value is published ahead of its
+/// landing now, and if so the number of that stretch ([`PERIOD`]). The
+/// relay's merges ask it after they read title memory: a title write they
+/// saw that was made after the title read the published value finds the
+/// count up (it went up before the value was stored).
+pub(crate) fn ahead_period() -> Option<u64> {
+    (AHEAD.load(Ordering::Acquire) > 0).then(|| PERIOD.load(Ordering::Acquire))
+}
+
+/// VIcky ([`sent`]): publishes `value` to the title now (the fence's memory,
+/// its events), ahead of the landing of the signal that carries it, which
+/// still comes ([`set`]). Whether it went ahead; false if the fence is
+/// there already.
+pub(crate) fn set_early(this: This, value: u64) -> bool {
+    let fence = fence(this);
+    let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let mut ahead = fence.ahead.lock().unwrap_or_else(|e| e.into_inner());
+        let was = ahead.is_ahead();
+        if !ahead.publish(fence.value.load(Ordering::Acquire), value) {
+            return false;
+        }
+        if !was {
+            PERIOD.fetch_add(1, Ordering::AcqRel);
+            AHEAD.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    fence.value.store(value, Ordering::Release);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pace::published(this, &fence.asked, value);
+    wake(&mut waiters, value);
+    true
+}
+
+/// The value the fence's signals have landed at: [`completed`], unless a
+/// value was published ahead of its landing ([`set_early`]). Our queues'
+/// waits for fences go by it, so that they pass when they did without
+/// [`sent`].
+pub(crate) fn landed(this: This) -> u64 {
+    let fence = fence(this);
+    let now = fence.value.load(Ordering::Acquire);
+    // A value published is stored after the count went up: read here, it
+    // finds the count up (or its landing done).
+    if AHEAD.load(Ordering::Relaxed) == 0 {
+        return now;
+    }
+    fence.ahead.lock().unwrap_or_else(|e| e.into_inner()).landed(now)
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     set(this, value);
@@ -184,6 +284,46 @@ pub(crate) mod pace {
     static SAID: AtomicU64 = AtomicU64::new(0);
     static LINE_AT: AtomicU64 = AtomicU64::new(0);
 
+    /// VIcky (`super::sent`), since the last line: frame-begin signals
+    /// taken; first signals after a present not taken; presents whose frame
+    /// had none taken; values published when sent; their microseconds since
+    /// the title's call, and how many of them had the call at hand; flights
+    /// and bottom-of-pipe writes still ahead of them in the line; frame-begin
+    /// signals set at once (nothing in the air); those that landed before
+    /// they could be published; landings of published values and their
+    /// microseconds since the publishing; landings below a published value
+    /// (not stored); bytes copied back into title memory and bottom-of-pipe
+    /// writes done while a published value was ahead of its landing; and
+    /// with `VICTORY_FENCE_SENT_CHECK=1`, of the relay's merges meanwhile
+    /// (`super::sent`, "The title's writes after a value is published"):
+    /// bytes both the card and the title changed since the copy's reference
+    /// (kept as the title's), title bytes the card did not change whose
+    /// newer value a merge's store put back to an older one, and bytes the
+    /// card changed that a merge's store put over a title write made after
+    /// the merge read title memory.
+    static SENT: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
+    const S_TAKEN: usize = 0;
+    const S_FIRST: usize = 1;
+    const S_NONE: usize = 2;
+    const S_PUBLISHED: usize = 3;
+    const S_CALL_US: usize = 4;
+    const S_CALLS: usize = 5;
+    const S_FLIGHTS: usize = 6;
+    const S_WRITES: usize = 7;
+    const S_AT_ONCE: usize = 8;
+    const S_LANDED_FIRST: usize = 9;
+    const S_LANDINGS: usize = 10;
+    const S_AHEAD_US: usize = 11;
+    const S_BEHIND: usize = 12;
+    const S_BACK_BYTES: usize = 13;
+    const S_BACK_WRITES: usize = 14;
+    const S_BOTH: usize = 15;
+    const S_TITLE_ONLY: usize = 16;
+    const S_BOTH_LATE: usize = 17;
+
+    /// Values published when sent and not landed yet: fence, value, when.
+    static EARLY: Mutex<Vec<(usize, u64, Instant)>> = Mutex::new(Vec::new());
+
     /// Whether events are said one by one now: four seconds of every two
     /// minutes of the wall clock, the same seconds in which the loader says
     /// the title's `mwaitx` waits (`console_insn`), to lay the two side by side.
@@ -228,9 +368,34 @@ pub(crate) mod pace {
         }
     }
 
+    /// The fence was set to `value`: the title's signals up to it have
+    /// landed, and its waits up to it are met.
     pub(super) fn reached(fence: This, asked: &Mutex<Vec<Asked>>, value: u64) {
+        landed(fence, value);
+        met(fence, asked, value);
+    }
+
+    /// The title's signals on `fence` up to `value` have landed (the signal
+    /// times of the line), and the values published ahead up to it.
+    fn landed(fence: This, value: u64) {
         let frame = crate::queue::presented();
-        let render = RENDER.load(Ordering::Relaxed);
+        {
+            let mut early = EARLY.lock().unwrap_or_else(|e| e.into_inner());
+            early.retain(|&(f, v, at)| {
+                let done = f == fence as usize && v <= value;
+                if done {
+                    SENT[S_LANDINGS].fetch_add(1, Ordering::Relaxed);
+                    SENT[S_AHEAD_US].fetch_add(at.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    if detail_now() || SAID.fetch_add(1, Ordering::Relaxed) < 48 {
+                        tracing::info!(
+                            "pace: fence {fence:?} lands at {v}, {:.1} ms after it was published when sent (VICTORY_FENCE_SENT=1; frame {frame})",
+                            at.elapsed().as_micros() as f64 / 1e3
+                        );
+                    }
+                }
+                !done
+            });
+        }
         {
             let mut queued = QUEUED.lock().unwrap_or_else(|e| e.into_inner());
             queued.retain(|&(f, v, at, called)| {
@@ -249,6 +414,12 @@ pub(crate) mod pace {
                 !done
             });
         }
+    }
+
+    /// The fence reads `value` now: the title's waits up to it are met.
+    fn met(fence: This, asked: &Mutex<Vec<Asked>>, value: u64) {
+        let frame = crate::queue::presented();
+        let render = RENDER.load(Ordering::Relaxed);
         let mut asked = asked.lock().unwrap_or_else(|e| e.into_inner());
         asked.retain(|a| {
             let done = a.value <= value;
@@ -274,6 +445,106 @@ pub(crate) mod pace {
         });
     }
 
+    /// VIcky (`super::sent`): what the title's signal was to the
+    /// recogniser (`super::sent::Begins`); `None`: a present whose frame
+    /// had no frame-begin signal taken.
+    pub(crate) fn begin(begin: Option<super::sent::Begin>) {
+        let i = match begin {
+            Some(super::sent::Begin::Yes) => S_TAKEN,
+            Some(super::sent::Begin::First) => S_FIRST,
+            Some(super::sent::Begin::No) => return,
+            None => S_NONE,
+        };
+        SENT[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `value` was published ahead of its landing (`super::set_early`): the
+    /// title's waits up to it are met now, and its signal's landing is
+    /// still to come (the signal times of the line stay those of landings).
+    pub(super) fn published(fence: This, asked: &Mutex<Vec<Asked>>, value: u64) {
+        let frame = crate::queue::presented();
+        SENT[S_PUBLISHED].fetch_add(1, Ordering::Relaxed);
+        let called = QUEUED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|&&(f, v, ..)| f == fence as usize && v == value)
+            .map(|q| q.2);
+        if let Some(at) = called {
+            SENT[S_CALLS].fetch_add(1, Ordering::Relaxed);
+            SENT[S_CALL_US].fetch_add(at.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+        if detail_now() || SAID.fetch_add(1, Ordering::Relaxed) < 48 {
+            tracing::info!(
+                "pace: fence {fence:?} is published at {value} when sent (the frame-begin signal, VICTORY_FENCE_SENT=1), {} after the title's Signal for it (frame {frame})",
+                called.map_or("?".to_string(), |at| format!("{:.1} ms", at.elapsed().as_micros() as f64 / 1e3))
+            );
+        }
+        {
+            let mut early = EARLY.lock().unwrap_or_else(|e| e.into_inner());
+            if early.len() < 4096 {
+                early.push((fence as usize, value, Instant::now()));
+            }
+        }
+        met(fence, asked, value);
+    }
+
+    /// A frame-begin signal went behind the flights in the air
+    /// (`crate::host::sent_signal`): published ahead (`early`), with
+    /// `flights` and `writes` ahead of it in the line, or landed before it
+    /// could be.
+    pub(crate) fn sent(early: bool, flights: usize, writes: usize) {
+        if early {
+            SENT[S_FLIGHTS].fetch_add(flights as u64, Ordering::Relaxed);
+            SENT[S_WRITES].fetch_add(writes as u64, Ordering::Relaxed);
+        } else {
+            SENT[S_LANDED_FIRST].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A frame-begin signal was set at once: nothing was in the air.
+    pub(crate) fn sent_at_once() {
+        SENT[S_AT_ONCE].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A landing of `value` below the value published on `fence`: noted,
+    /// not stored (`super::set`).
+    pub(super) fn landed_behind(fence: This, value: u64) {
+        SENT[S_BEHIND].fetch_add(1, Ordering::Relaxed);
+        landed(fence, value);
+    }
+
+    /// While a published value is ahead of its landing (`super::ahead`):
+    /// `bytes` copied back into title memory, `writes` bottom-of-pipe
+    /// writes done. What the title could have read stale had it read them
+    /// in between.
+    pub(crate) fn landed_ahead(bytes: u64, writes: u64) {
+        SENT[S_BACK_BYTES].fetch_add(bytes, Ordering::Relaxed);
+        SENT[S_BACK_WRITES].fetch_add(writes, Ordering::Relaxed);
+    }
+
+    /// With `VICTORY_FENCE_SENT_CHECK=1`, while a published value is ahead:
+    /// `bytes` the card and the title both changed since the copy's
+    /// reference, found by a relay merge (`crate::shadow`'s
+    /// `both_under_published`). The merge keeps the title's there now; it
+    /// put the card's over them before (these were the check's "title bytes
+    /// the copy-back put the card's over").
+    pub(crate) fn both_ahead(bytes: u64) {
+        SENT[S_BOTH].fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// With `VICTORY_FENCE_SENT_CHECK=1`, while a published value is ahead:
+    /// of the title writes a relay merge's store met (made between the
+    /// merge's read of title memory and its store, `crate::shadow`'s
+    /// `stored_over`), `title_only` bytes in words the merge took nothing of
+    /// the card's in, put back to an older value (must be 0 with
+    /// `VICTORY_FENCE_SENT_KEEP_TITLE=1`), and `late` bytes in words it took
+    /// the card's bytes in (a race on the word).
+    pub(crate) fn stored_ahead(title_only: u64, late: u64) {
+        SENT[S_TITLE_ONLY].fetch_add(title_only, Ordering::Relaxed);
+        SENT[S_BOTH_LATE].fetch_add(late, Ordering::Relaxed);
+    }
+
     /// Once a frame, on the thread that presents: a line every 256 frames.
     pub(crate) fn frame() {
         RENDER.store(thread(), Ordering::Relaxed);
@@ -284,11 +555,54 @@ pub(crate) mod pace {
         }
         LINE_AT.store(frame, Ordering::Relaxed);
         let n: Vec<f64> = N.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64).collect();
+        let s: Vec<f64> = SENT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64).collect();
         let frames = (frame - last).max(1) as f64;
         let per = |a: f64, b: f64| if b > 0.0 { a / b } else { 0.0 };
+        // VIcky (`super::sent`): only with the switch, so that the line is
+        // as before without it.
+        let sent = if super::sent::on() {
+            format!(
+                "; VICTORY_FENCE_SENT=1 (the signal times above are of landings): frame-begin signals {:.2} a frame (first signals after a present not taken {:.2}, \
+                 frames without one {:.2}), published when sent {:.2} a frame, {:.1} ms after the title's Signal call and {:.1} ms ahead of their landing, with {:.1} flights \
+                 and {:.1} bottom-of-pipe writes still ahead of them; set at once with nothing in the air {:.2}, landed before they could be published {:.2}; \
+                 landings below a published value {:.2}; while a published value was ahead: {:.1} KB copied back into title memory and {:.1} bottom-of-pipe writes done{}",
+                s[S_TAKEN] / frames,
+                s[S_FIRST] / frames,
+                s[S_NONE] / frames,
+                s[S_PUBLISHED] / frames,
+                per(s[S_CALL_US], s[S_CALLS]) / 1e3,
+                per(s[S_AHEAD_US], s[S_LANDINGS]) / 1e3,
+                per(s[S_FLIGHTS], s[S_PUBLISHED]),
+                per(s[S_WRITES], s[S_PUBLISHED]),
+                s[S_AT_ONCE] / frames,
+                s[S_LANDED_FIRST] / frames,
+                s[S_BEHIND] / frames,
+                s[S_BACK_BYTES] / frames / 1024.0,
+                s[S_BACK_WRITES] / frames,
+                if super::sent::check() {
+                    format!(
+                        "; of the relay's merges meanwhile (VICTORY_FENCE_SENT_CHECK=1): bytes the card and the title both changed {:.1} (kept as the title's), \
+                         title-only bytes a merge's store put back to an older value {:.1}, card bytes a merge's store put over a title write made after its read {:.1} \
+                         (stores of {})",
+                        s[S_BOTH] / frames,
+                        s[S_TITLE_ONLY] / frames,
+                        s[S_BOTH_LATE] / frames,
+                        if super::sent::keep_exact() {
+                            "the card's words only, VICTORY_FENCE_SENT_KEEP_TITLE=1"
+                        } else {
+                            "whole stretches, VICTORY_FENCE_SENT_KEEP_TITLE unset"
+                        },
+                    )
+                } else {
+                    String::new()
+                },
+            )
+        } else {
+            String::new()
+        };
         tracing::info!(
             "pace, per frame: fence waits already met {:.2}, not met {:.2} (the render thread's {:.2}); a wait is met {:.1} ms and {:.2} frames after it was asked \
-             (the render thread's: {:.1} ms, {:.1} ms a frame); the title's queue signals: {:.2} a frame, a fence is set {:.1} ms and {:.2} frames after the title's Signal call",
+             (the render thread's: {:.1} ms, {:.1} ms a frame); the title's queue signals: {:.2} a frame, a fence is set {:.1} ms and {:.2} frames after the title's Signal call{sent}",
             n[0] / frames,
             n[1] / frames,
             n[2] / frames,
@@ -353,6 +667,71 @@ mod tests {
         assert_eq!(unsafe { *(at as *const u64) }, 5);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    /// VIcky ([`sent`]): a value published ahead is what the title reads and
+    /// waits on; the landings below it never move the fence back, and our
+    /// queues' waits ([`landed`]) see only what has landed.
+    #[cfg(windows)]
+    #[test]
+    fn a_value_published_ahead_never_goes_back() {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 20, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let completed = slot::<extern "system" fn(This) -> u64>(f, 0x40);
+        let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
+        // SAFETY: plain auto-reset events.
+        let (at_27, at_28) = unsafe {
+            (CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()), CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()))
+        };
+        assert_eq!(wait(f, 27, at_27), S_OK);
+        assert_eq!(wait(f, 28, at_28), S_OK);
+        let is_set = |event| {
+            // SAFETY: a valid event.
+            unsafe { WaitForSingleObject(event, 0) == WAIT_OBJECT_0 }
+        };
+        // The frame-begin value 27 is published while 25 and 26 (the frame
+        // before's) are still behind flights.
+        assert_eq!(ahead_period(), None, "nothing is ahead yet");
+        assert!(set_early(f, 27));
+        let period = ahead_period().expect("a value is ahead");
+        assert_eq!(completed(f), 27, "the title reads the published value");
+        let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
+        // SAFETY: the fence's value.
+        assert_eq!(unsafe { *(at as *const u64) }, 27, "in memory too");
+        assert!(is_set(at_27), "its event is set at once");
+        assert_eq!(landed(f), 20, "our queues' waits still see what landed");
+        // The landings below it: noted, the fence stays at 27.
+        set(f, 25);
+        assert_eq!(completed(f), 27);
+        assert_eq!(landed(f), 25);
+        set(f, 26);
+        assert_eq!(completed(f), 27);
+        assert_eq!(landed(f), 26);
+        assert!(!is_set(at_28));
+        // Publishing what the fence holds already does nothing.
+        assert!(!set_early(f, 27));
+        assert_eq!(ahead_period(), Some(period), "the same stretch while the value is ahead");
+        // Its own landing ends it; the signals after it are as before.
+        set(f, 27);
+        assert_eq!((completed(f), landed(f)), (27, 27));
+        assert_eq!(ahead_period(), None, "the stretch ended with the landing");
+        set(f, 28);
+        assert_eq!((completed(f), landed(f)), (28, 28));
+        assert!(is_set(at_28));
+        // The next value published ahead opens a new stretch.
+        assert!(set_early(f, 30));
+        assert!(ahead_period().is_some_and(|p| p > period));
+        set(f, 30);
+        assert_eq!(ahead_period(), None);
+        // SAFETY: ours.
+        unsafe {
+            CloseHandle(at_27);
+            CloseHandle(at_28);
+        }
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 }
