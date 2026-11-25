@@ -1060,6 +1060,12 @@ impl HostHeap {
         self.count
     }
 
+    /// Title slots whose writes can affect this heap. A mapped heap also
+    /// mirrors slots above its identity window through its pool.
+    pub(crate) fn mirrored_count(&self) -> u32 {
+        if self.map.is_some() { self.title_count } else { self.count }
+    }
+
     /// The host slot title slot `title` is made in (`made` locked): its own
     /// index below `count`; with a heap map past it, its pool slot, taken
     /// now if it has none (then `true`: [`HostHeap::publish`] writes its
@@ -1755,8 +1761,7 @@ impl HostHeap {
     /// there. Buffer slots must exist before a shader picks one by index.
     /// Draws also materialize deferred texture views (`for_draw`).
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
-        let mirrored = if self.map.is_some() { self.title_count } else { self.count };
-        if index >= mirrored {
+        if index >= self.mirrored_count() {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -3282,6 +3287,8 @@ mod tests {
         assert_eq!(unsafe { (*data as *const u32).add(25).read_volatile() }, 4);
         assert_eq!(mapped.dynamic(DYNAMIC), Some(25));
         assert_eq!(mapped.dynamic(1), None);
+        assert_eq!(mapped.mirrored_count(), 64, "include slots translated through the map");
+        assert_eq!(fits.mirrored_count(), 8, "only directly mirrored title slots");
         assert_eq!((fits.count(), fits.dynamic_first), (8, 8));
         assert!(fits.map.is_none() && fits.made.lock().unwrap().map.is_none());
         assert_eq!(fits.dynamic(1), Some(8));

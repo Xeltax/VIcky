@@ -187,17 +187,25 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
-        for (from, to) in written.take(start as usize, usize::MAX) {
+        // Direct tables past a capped heap are made on demand. Scanning
+        // those slots here cannot publish anything and makes the initial
+        // refresh walk hundreds of thousands of unreachable descriptors.
+        let mirrored = u64::from(host.mirrored_count());
+        let mirror_end = start.saturating_add(mirrored * step) as usize;
+        let page_size = crate::watch::PAGE;
+        // The journal advances its cursor for complete pages. Include
+        // the last page, then bound slot indices within it.
+        let watch_end = mirror_end.checked_next_multiple_of(page_size).unwrap_or(usize::MAX);
+        for (from, to) in written.take(start as usize, watch_end) {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
-            let page_size = crate::watch::PAGE;
             for page in (from & !(page_size - 1)..to).step_by(page_size) {
                 let (page, end) = (page.max(from), (page + page_size).min(to));
                 if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
                     continue;
                 }
                 let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-                for index in first..last.min(u64::from(heap.desc.count)) {
+                for index in first..last.min(mirrored) {
                     host.mirror(index as u32, start + index * step, false);
                 }
             }
