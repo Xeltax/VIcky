@@ -15,7 +15,14 @@ This branch is for making the title's compute ray tracing (the BVH structure bui
 | #213 | Pablo-Barros | an absent BVH child is a miss |
 | #346 | Gargalindis | stores through title memory by address mark their copy; only marked copies are snapshotted and compared |
 
-**VIcky's own commit:** `VICTORY_SNAPSHOT_POOL_MB=<n>` (opt-in) keeps snapshot buffers by size for reuse, so they don't page-fault again on every list.
+**VIcky's own commits.** All are opt-in.
+- `VICTORY_BACK_JOIN=<bytes>` writes nearby runs of shader writes back as one kernel call. The builder's output gave about 850,000 runs a frame, one `NtWriteVirtualMemory` each.
+- `VICTORY_MEMORY_REFRESH=touched`: shaders note which copies they read (no extra store), and only those are refreshed, plus every copy once in 8 frames.
+- `VICTORY_MEMORY_NAMED_WRITES=0`: a copy that is only named by a constant and never marked stops being snapshotted.
+- `VICTORY_SNAPSHOT_POOL_MB=<n>` keeps snapshot buffers by size for reuse.
+- `VICTORY_REFRESH_STAMP=1`: measured 0 skips; useless, will go.
+
+**Recommended with the builder on:** `VICTORY_BACK_JOIN=256 VICTORY_MEMORY_REFRESH=touched VICTORY_MEMORY_NAMED_WRITES=0 VICTORY_SNAPSHOT_POOL_MB=2048`.
 
 ## Run
 
@@ -34,8 +41,13 @@ Build and run as for `fx-heapmap-8d` (see `VICKY.md`). The builder is off by def
 | RT3 | on (before #346) | 4,523 | 286 | 1,678 | 2,518 | 16.2 GB snapshotted and compared a frame; 4.17 M page faults |
 | RT4 | on + `VICTORY_INPLACE=1` (before #346) | 3,155–3,330 | 265–278 | 1,295–1,378 | 1,544–1,659 | 311 windows in place; 3,671 refused (page-pool views) |
 
+| RT5b | on + #346 | 849–916 | 264–301 | 237–256 | 327–354 | 515 MB compared; all 1,023 copies (21.5 GB) refreshed |
+| RT7 | on + #346 + touched, named, pool | 652–718 (same shot as RT5b's 790–871) | 214–238 | 151–179 | 264–281 | 6.4–7.8 GB refreshed |
+| RT8 | RT7 + `VICTORY_BACK_JOIN=256` | **502–583** (1.7–2.0 fps) | 282–306 | 149–193 | **58–65** | 1,300 kernel writes instead of ~850,000 |
+
 - Without #346, the CPU found 85 MB of shader writes a frame by comparing about 16 GB, roughly 0.5%.
-- On a 5080, #346 measured 529–577 ms with the builder on. Our 4080 runs with #346 are in progress.
+- With RT8's settings, copying back costs less than with the builder off. The GPU is now the biggest part.
+- These are single runs, and the spread between runs is large.
 - The picture with the builder on: the dark corner of the cell is no brighter yet.
 
 ## Where to help (say on Discord which one you take, to avoid doubling up)
@@ -47,11 +59,8 @@ Build and run as for `fx-heapmap-8d` (see `VICKY.md`). The builder is off by def
 5. **#814 against #346.** #814 (staronthehorizon) has a GPU dirty-page bitmask plus Series S live RT. Who can run both on the same card and scene?
 6. **Page pool in place** (fork #772, `VICTORY_INPLACE_POOL=1`). With the builder on, about 3,700 windows are page-pool views that `INPLACE=1` refuses. Porting #772's pool part onto this branch could remove most of the remaining copies.
 
-## Coming next (being tested locally)
+## Coming next
 
-All are opt-in switches:
-- `VICTORY_MEMORY_REFRESH=touched`: shaders note which copies they read, and only those are refreshed.
-- `VICTORY_MEMORY_NAMED_WRITES=0`: copies named only by a constant and never marked stop being snapshotted.
-- `VICTORY_REFRESH_STAMP=1`: no second check of a copy under the same write-watch asking.
+Title memory in place, so the GPU works on the title's own pages with no copies. This is fork #772 (sirrus98) merged onto this branch: `VICTORY_INPLACE=3 VICTORY_INPLACE_POOL=1`, then `=4` for hot memory in VRAM. It builds and its tests pass; the first runs with the builder on are next.
 
-Ideas from a review by Claude Fable.
+The switches above came partly from a review by Claude Fable.
