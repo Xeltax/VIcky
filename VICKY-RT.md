@@ -2,8 +2,8 @@
 
 This branch is for making the title's compute ray tracing (the BVH structure builder plus traversal) usable on PC.
 
-- **Base:** `fx-heapmap-8d`, which is fxceless/victory-fork `8dd30ab` + VIcky's heap map + fork PR #188 (Series S).
-- **Status:** research. It builds, and the gpu, shader and hle suites and `cargo xtask policy` pass. Game measurements are below.
+- **Base:** `fx-heapmap-8d` (fxceless/victory-fork `8dd30ab` + VIcky's heap map + fork PR #188, Series S), **merged with fork main up to `465b94f`** (2026-11-25 evening: its own submit thread, copy queue, draw windows, `VICTORY_JOIN_PARTS`, `VICTORY_BACK_OWN_VIEW`, `VICTORY_INDIRECT_GATHER`, and its descriptor fix: 1 untranslated program left in our scene instead of 5).
+- **Status:** research. It builds, and the gpu, shader, hle and loader suites and `cargo xtask policy` pass. Game measurements are below.
 
 ## What is merged on top of `fx-heapmap-8d`
 
@@ -14,6 +14,7 @@ This branch is for making the title's compute ray tracing (the BVH structure bui
 | #579 | Revens2 | `VICTORY_BVH_SKIP=<indices>` drops builder stages (diagnostics) |
 | #213 | Pablo-Barros | an absent BVH child is a miss |
 | #346 | Gargalindis | stores through title memory by address mark their copy; only marked copies are snapshotted and compared |
+| #1032 | UwUCammie | with `VICTORY_COPY_PLAIN=1`, shader writes go back into title memory in place, guarded, instead of by kernel call (`VICTORY_WRITE_PLAIN=0` turns it off) |
 
 **VIcky's own commits.** All are opt-in.
 - `VICTORY_BACK_JOIN=<bytes>` writes nearby runs of shader writes back as one kernel call. The builder's output gave about 850,000 runs a frame, one `NtWriteVirtualMemory` each.
@@ -21,8 +22,12 @@ This branch is for making the title's compute ray tracing (the BVH structure bui
 - `VICTORY_MEMORY_NAMED_WRITES=0`: a copy that is only named by a constant and never marked stops being snapshotted.
 - `VICTORY_SNAPSHOT_POOL_MB=<n>` keeps snapshot buffers by size for reuse.
 - `VICTORY_REFRESH_STAMP=1`: measured 0 skips; useless, will go.
+- `VICTORY_NOTES_ON_CARD=1`: the notes of programs reading title memory by address stay in the card's memory and are copied back once a frame (not measured in a run yet).
+- `VICTORY_BVH_COPY=skip`: the builder's copies of a structure onto itself are not recorded (RT32, below). `native` also runs a pass of ours for any other copy, and `check` compares that pass with the program (diagnostics).
 
-**Recommended with the builder on:** `VICTORY_BACK_JOIN=256 VICTORY_MEMORY_REFRESH=touched VICTORY_MEMORY_NAMED_WRITES=0 VICTORY_SNAPSHOT_POOL_MB=2048`.
+**VIcky PRs merged:** #23 (g0shtj0sh): main's opt-in `VICTORY_NO_WATCHDOG=1` hook (upstream #454, fork #364), for slower PCs whose runs the title's watchdog kills at the world's entry. Nothing changes when it is unset.
+
+**Recommended with the builder on:** `VICTORY_BVH_COPY=skip VICTORY_BACK_JOIN=256 VICTORY_MEMORY_REFRESH=touched VICTORY_MEMORY_NAMED_WRITES=0 VICTORY_SNAPSHOT_POOL_MB=2048`, plus the fork's: `VICTORY_ASYNC_SUBMIT=1 VICTORY_QUEUE2=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_TEXTURE_NO_WAIT=1 VICTORY_COPY_PLAIN=1 VICTORY_JOIN_PARTS=1 VICTORY_BACK_OWN_VIEW=1 VICTORY_INDIRECT_GATHER=1 VICTORY_CARD_REHASH_RUNS=1`. Keep the capture harness rare (`VICTORY_CAPTURE_WORLD_EVERY=64`): a saved frame costs about 235 ms.
 
 ## Run
 
@@ -98,10 +103,19 @@ So the answer to "denoiser or reflections" is both and more: the tiled sun shado
 - `frame-<n>-ops.txt` is cut short on some frames: 4–9 MB with a handful of draws and no trace program in it, where a whole frame is 14–22 MB. In the two builder-off runs every frame asked for from the 300th world frame on was (10 of 10). Check the size before comparing two frames.
 - The 64 programs were listed with a local change to `translate --list` that prints each container's count of node tests; it can go into a pull request if wanted.
 
+**Why one builder-on run stayed dark: not found; three causes ruled out** (`1a7eb50`, which differs from `493cc0d` in diagnostics only, plus local test switches that are not in a pull request).
+
+- It is rarer than 1 in 5. Six more unchanged builder-on runs of 340 s, with pictures only (no target dumps), were all lit: 10 of 11 unchanged builder-on runs so far. The five changed runs below were lit too.
+- Not the dynamic descriptor slots running out. All six dark runs log `no free dynamic descriptor slots` and none of the first four lit ones did, but refusing tables on purpose leaves the wall lit: every table of 48 slots or more refused in world frames 35–100 (2,800–5,300 of about 10,000 a frame), and every table refused in world frames 40–48. Two later lit runs ran out by themselves as well.
+- Not the title's water path. The dark run bound the `ShallowWaterSim` programs and the lit runs with dumps did not, but 4 of the 6 pictures-only runs bound them and were lit. Which path the title takes moves with how long the dumps hold a frame.
+- Not the 1,023 copies of title memory by address. Every builder-on run uses all 1,023 numbers by the second world frame (`no number left for another copy; its pages read zeros`). With the limit lowered to 512 (two runs) and to 256 (one run) the wall is still lit, though a page then went without a number more than 500,000 times in 340 s.
+- The builder is only needed at the start for this wall: in the run that refused every table in world frames 40–48 the builder turned itself off there for the rest of the run (`one of its dispatches could not be bound`), and the wall was lit 580 frames later. With the builder off from the start it is dark in 5 of 5.
+- What is left: the dark run differs from the lit ones before world frame 128 (the first picture of the shot), and its log has nothing the 15 lit runs lack except the points above. Catching it again takes about 15 runs.
+
 - Without #346, the CPU found 85 MB of shader writes a frame by comparing about 16 GB, roughly 0.5%.
 - With RT8's settings, copying back costs less than with the builder off. The GPU is now the biggest part.
 - These are single runs, and the spread between runs is large.
-- The picture with the builder on: the dark corner of the cell is no brighter yet.
+- The picture with the builder on: the dark corner of the cell is lit on the 4080 too. Measured as in task 4 (mean blue of the left fifth of the last frame of the window shot; on the RTX 5090 about 10 when lit, 1–2 when dark): RT8 43–45, RT10 30, RT28 (no input) 29, the fork main merge (RT29b) 27–30.
 
 ### What we tried after RT10 (RTX 4080; most worth knowing so nobody repeats them)
 
@@ -126,6 +140,35 @@ GPU profiles come from `VICTORY_GPU_TIMING=1 VICTORY_D3D12_DRED=1`.
 - stage 0 of hardware ray tracing (an inventory of the traversal programs).
 
 The page-mark switches (`VICTORY_MEMORY_PAGE_MARKS`, `VICTORY_NAMED_WRITE_MB`) are on this branch for experiments; don't turn them on for normal runs.
+
+### RT31–RT32: the builder's copy writes each structure onto itself, so it is skipped
+
+- **RT31** (`VICTORY_BVH_COPY=check`): in every `CopyForBVHUpdate` dispatch the source and the destination, two root parameters, held one title address, and constant 1 was unset. The title refits its structures in place, so the program reads each 16 bytes and writes them back where they were.
+- **`VICTORY_BVH_COPY=skip`** records nothing for such a dispatch, about 63 a frame. That also removes the notes and page marks that made the host copy those pages back.
+- Same window shot as RT28 (no input, RT10's switches, this branch's base):
+
+| run | ms/frame | fps | GPU | copying back | draws |
+|---|---|---|---|---|---|
+| RT28, baseline | 353–418 | 2.4–2.8 | 166–204 | 228–287 | ~5,060 |
+| RT32, skip (two agents building during the run) | 279–389 | 2.6–3.6 | 53–82 | 132–193 | ~5,000 |
+| RT32b, skip | **210–273** | **3.7–4.8** | 41–79 | 127–158 | 4,750–4,930 |
+
+- The picture is as in RT28: lit, same colours, the left fifth of the window shot at 27–28 mean blue.
+- **The GPU is no longer the limit.** What is left is on the CPU: "preparing" (134–164 ms, mostly checking which title memory the CPU wrote) and the copy-back.
+
+### RT33–RT35: on fork main `465b94f`, the frame is CPU-bound
+
+Same window shot, builder on, `VICTORY_BVH_COPY=skip` and the recommended switches above:
+
+| run | ms/frame (usual) | submit thread at work | copy-back | card idle | notes |
+|---|---|---|---|---|---|
+| RT33 | 260–265 | 232–240 | 57–59 | 148–152 | without #1032 |
+| RT34, `VICTORY_HEAP_SYNC=0` | 177–185 | 174–182 | 65–68 | 65–73 | **wrong picture**: stale, smeared textures |
+| RT35 / RT35b, with #1032 | **228–234 / 231–239** | 202–217 | 49–53 | 122–131 | picture as RT33 |
+
+- The card is idle more than half the frame: the submit thread is the limit.
+- Its biggest item is `sync_heaps`: 96 ms a frame mirroring about 100,000 descriptor records the title copies into its heaps as bytes, and the heap-buffer passes after it (about 200 ms on their thread). Turning the sync off is 30% faster but loses textures, so it must get cheaper, not go.
+- Next: cheaper heap sync (a cache of made descriptors, pages in parallel), skipping refreshes of memory nothing wrote, and fewer settles (`VICTORY_MERGE_RUNS`).
 
 ## Roadmap: from about 3.5 fps toward 15–20
 
