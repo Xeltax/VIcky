@@ -117,6 +117,45 @@ So the answer to "denoiser or reflections" is both and more: the tiled sun shado
 - These are single runs, and the spread between runs is large.
 - The picture with the builder on: the dark corner of the cell is lit on the 4080 too. Measured as in task 4 (mean blue of the left fifth of the last frame of the window shot; on the RTX 5090 about 10 when lit, 1–2 when dark): RT8 43–45, RT10 30, RT28 (no input) 29, the fork main merge (RT29b) 27–30.
 
+### Task 2 on the RTX 5090: a checker for the structures, and what it counts (`3fbc9cb`)
+
+**The checker.** `VICTORY_BVH_CHECK=<frames>` (diagnostics build): every that many frames, the addresses the dispatches of shaders that read title memory by address named are tried as structures and walked from their root in title memory. It logs counts only (`victory_gpu::bvhcheck`): one line for the structures of instances, one for the structures of triangles, and up to six structures with something wrong. A check of about 50 structures takes 15–25 ms; of 2,000 while the world loads, about 1 s.
+
+**The layout it needed, measured (not from any document).** A structure begins with a header at the address a dispatch names; node pointers count from that address; the dword at byte 48 of the header is the root pointer. Found by looking for box nodes that fit together in 1.3 GB of the copies shaders had touched, without assuming a base (how is in `bvhcheck.rs`).
+
+**What it counts as wrong:** a pointer of kind 7, a pointer to a node of zeros, a triangle with a vertex that is not finite, a child that reaches outside the box its parent holds for it (0.2% of room for 16-bit bounds), a node reached twice. A child whose box no ray can enter (not finite, or minimum above maximum) is not followed and not counted as wrong. "Far" is a structure whose nodes lie more than 256 MB apart: a pointer that leaves it.
+
+**Builder on, the cell scene, one run of 400 s, a check every 64 frames.** The thirteen checks after loading (the fourth check on), range over them:
+
+| | structures | box nodes | triangles | instances | outside | kind 7 | zero node | reached twice | bad triangle |
+|---|---|---|---|---|---|---|---|---|---|
+| of instances | 1–4 | 263–979 | 2–18 | 478–1,610 | 4–84 | 3–27 | 0–1 | 0–3 | 0 |
+| of triangles | 38–58 | 4,060–6,238 | 8,143–12,629 | 84–133 | 1,389–2,502 | 95–155 | 50–69 | 92–167 | 35–113 |
+
+- 36–53 of the 41–62 structures named in a check have something wrong, and 8–20 are far.
+- In the structures of triangles about one child in eight is outside its parent's box (1,389–2,502 of the 12,000–19,000 box nodes and triangles walked), and they hold 84–133 instance pointers, which a structure of triangles should not.
+- While the world loads (the first three checks) 1,021–2,094 structures are named, most of them shipped ones: 438–751 have something wrong and 103–182 are far.
+
+**The shipped structures, for comparison** (one snapshot of that scene, 181 structures by the same rule): 126 have nothing wrong. The larger shipped ones (1,000–10,800 box nodes each, 12–14 deep, 0.3–2.9 MB from first node to last) have no kind 7, no zero node and no node reached twice; the only thing counted is a child outside its box, at most 0.4% of what is walked (92 of 37,500 in the largest), which may be the check's room for rounding being a little tight.
+
+**So, to the question:** yes. With the builder on, the structures the builder makes hold pointers that lead out of the structure, hundreds of megabytes or more away (8–20 structures a check), which is memory a traversal that follows them asks copies for. The larger shipped structures stay within 3 MB each.
+
+**What this does not show.**
+- The check reads title memory at one moment. A structure the builder is rebuilding may be half old and half new there, since its stores come back a submission later. Some of what is counted may be that and not the builder's output.
+- Instance nodes are not followed, so a bottom-level structure is only checked when a dispatch names it.
+- With the builder off no dispatch names an address in a form the check reads (0 named in 15 checks), so there is no builder-off row.
+
+### Task 3 on the RTX 5090: no crash without quarantine (`493cc0d` to `3fbc9cb`)
+
+**It does not crash here.** 27 runs with `VICTORY_BVH_BUILDER=1` and `VICTORY_BVH_QUARANTINE` unset, 3.6 hours in all, on `493cc0d`, `1a7eb50` and `3fbc9cb`: no panic, no device removal, no access violation, and the title never died. Every run was closed by the script and gave exit code 0.
+
+- The longest is 30 minutes on `3fbc9cb` (5,317 frames, the builder whole to the end); the others are 5 to 15 minutes.
+- In 25 of them the builder ran whole to the end (`the ray-tracing structure builder runs`, never turned off).
+- In the other two it turned itself off mid-run (`one of its dispatches could not be bound`, once forced by a local test, once after input in the window), both within the first minute of the world. The title went on to the end of the run in both: a builder that stops between frames did not take the title down.
+- So there was nothing to bisect with `VICTORY_BVH_SKIP`.
+
+**What this does not cover.** All 27 runs are the same scene, the cell cutscene, with no input after the menus. Nothing here says the open world is safe, and task 2 above counts pointers in the builder's structures that lead out of them: the stores that crashed run 98 may still happen where they hit nothing the title reads in this scene.
+
 ### What we tried after RT10 (RTX 4080; most worth knowing so nobody repeats them)
 
 GPU profiles come from `VICTORY_GPU_TIMING=1 VICTORY_D3D12_DRED=1`.

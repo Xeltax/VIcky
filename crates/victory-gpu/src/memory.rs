@@ -596,7 +596,11 @@ pub(crate) fn ready(
         if let Some(at) = m.mapped {
             m.take(&Notes::Shared(at), frame);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::bvhcheck::frame(frame);
     }
+    #[cfg(feature = "diagnostics")]
+    crate::bvhcheck::named(addresses, constants);
     if m.mapped.is_none() && !list.used(READ) {
         // The notes in the card's memory: their last copy once its
         // submission has finished, at the first list's first dispatch after
