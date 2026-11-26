@@ -8375,9 +8375,26 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
+    // A range read around its holes if the copy fails (into host memory,
+    // 64 KiB or more): with `VICTORY_SPARSE_PROBE=1` the kernel's count of
+    // the bytes it copied before failing is kept, and that reading starts
+    // there.
+    let probe = !title_dst && len >= SPARSE_LEAST && sparse_probe();
+    let mut done = 0;
     // Into host memory: in place first, if asked for (`crate::plaincopy`);
     // through the kernel if that is off or met a page that was not there.
-    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len)) || read(src, dst, len);
+    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len))
+        || if probe {
+            match read_counted(src, dst, len) {
+                Ok(()) => true,
+                Err(n) => {
+                    done = n;
+                    false
+                }
+            }
+        } else {
+            read(src, dst, len)
+        };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -8393,59 +8410,223 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
     #[cfg(feature = "diagnostics")]
     let sparse = std::time::Instant::now();
-    if !title_dst && len >= 64 << 10 {
-        read_sparse(src, dst, len);
+    let mut calls = SparseCalls::default();
+    if !title_dst && len >= SPARSE_LEAST {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SparseRanges, 1);
+        if probe {
+            read_probing(src, dst, len, done, &mut calls);
+        } else {
+            read_sparse(src, dst, len, &mut calls);
+        }
     } else {
-        read_pieces(src, dst, len);
+        read_pieces(src, dst, len, &mut calls);
     }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+    {
+        use crate::copystat::{C, add};
+        add(C::SparseUs, sparse.elapsed().as_micros() as u64);
+        add(C::SparseReads, calls.reads);
+        add(C::SparseReadsFailed, calls.failed);
+        add(C::SparseQueries, calls.queries);
+    }
+}
+
+/// The fewest bytes of a host copy read around its holes region by region
+/// ([`read_sparse`], [`read_probing`]); shorter ones go piece by piece
+/// ([`read_pieces`]).
+const SPARSE_LEAST: usize = 64 << 10;
+
+/// Kernel calls made reading around holes after a failed copy (the frame
+/// line's "sparse reads"): reads, the reads among them that failed, and
+/// `VirtualQuery` questions.
+#[derive(Default)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+struct SparseCalls {
+    reads: u64,
+    failed: u64,
+    queries: u64,
+}
+
+/// Whether ranges with holes are read around them without asking Windows
+/// what the pages are ([`read_probing`], `VICTORY_SPARSE_PROBE=1`; off by
+/// default: [`read_sparse`]).
+fn sparse_probe() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_SPARSE_PROBE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "ranges with holes are read around them by the kernel's count and page by page, without asking \
+                 Windows what the pages are (VICTORY_SPARSE_PROBE=1)"
+            );
+        }
+        on
+    })
+}
+
+/// The frame line's words on reading around holes, given its counters per
+/// frame.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn sparse_clause(ranges: f64, reads: f64, failed: f64, queries: f64) -> String {
+    let how = if sparse_probe() { "probed, VICTORY_SPARSE_PROBE=1" } else { "asked" };
+    format!(
+        " ({ranges:.1} ranges of 64 KiB or more read around holes ({how}); in all fallbacks {reads:.0} kernel reads, \
+         {failed:.0} of them failed, and {queries:.1} questions to VirtualQuery)"
+    )
+}
+
+fn unmapped(n: usize) {
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = n;
+}
+
+/// What `VirtualQuery` says of the memory at `at`: its bytes up to the end of
+/// its region (at most `most`), and whether they are committed and not
+/// `PAGE_NOACCESS`; `None` if it cannot say.
+fn region(at: *const u8, most: usize, calls: &mut SparseCalls) -> Option<(usize, bool)> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+    };
+    calls.queries += 1;
+    // SAFETY: the query inspects an address and fills a local structure.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
+    let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
+        .saturating_sub(at as usize).min(most);
+    if size != size_of_val(&info) || n == 0 {
+        return None;
+    }
+    Some((n, info.State == MEM_COMMIT && info.Protect != PAGE_NOACCESS))
 }
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
 /// cache the query across copies: the title may remap the same address.
-fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
-    };
+fn read_sparse(src: *const u8, dst: *mut u8, len: usize, calls: &mut SparseCalls) {
     let mut offset = 0;
     while offset < len {
         let at = src.wrapping_add(offset);
         let to = dst.wrapping_add(offset);
         let remaining = len - offset;
-        // SAFETY: the query inspects an address and fills a local structure.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
-        let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
-            .saturating_sub(at as usize).min(remaining);
-        if size != size_of_val(&info) || n == 0 {
-            read_pieces(at, to, remaining);
+        let Some((n, readable)) = region(at, remaining, calls) else {
+            read_pieces(at, to, remaining, calls);
             break;
-        }
-        if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+        };
+        if !readable {
+            unmapped(n);
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
-        } else if !read(at, to, n) {
-            // A mapping may change between query and read.
-            read_pieces(at, to, n);
+        } else {
+            calls.reads += 1;
+            if !read(at, to, n) {
+                calls.failed += 1;
+                // A mapping may change between query and read.
+                read_pieces(at, to, n, calls);
+            }
         }
         offset += n;
     }
 }
 
-fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
+/// Pages, as [`read_probing`] tries them.
+const PAGE: usize = 4 << 10;
+/// Readable pages [`read_probing`] reads one by one after the kernel's count
+/// before it tries the rest whole again. The count stops at the start of the
+/// kernel's piece that met the hole ([`read_counted`]: 56 KiB, 14 pages), so
+/// the hole is within this many pages of it.
+const WALK_PAGES: usize = 16;
+/// Pages of a hole [`read_probing`] tries one by one before it asks
+/// `VirtualQuery` where the hole ends (a hole of many megabytes would
+/// otherwise cost a failed read a page).
+const HOLE_PAGES: usize = 256;
+
+/// [`read_sparse`] without asking Windows what the pages are
+/// (`VICTORY_SPARSE_PROBE=1`, [`sparse_probe`]). `VirtualQuery` walks the
+/// page tables to the end of the region it is asked about: in the title's
+/// big pools that is about 2 ms a question, and run RT83c's 15-23 fallbacks
+/// a frame took 34-42 ms of the submitting thread. Here the kernel's own
+/// read says how far it got. From there, page by page: the pages that read
+/// (the count may stop short of the hole), the hole's pages (zeroed: a read
+/// that fails costs about a microsecond), and the first page after the hole;
+/// then the rest whole again. Only a hole longer than [`HOLE_PAGES`] is asked
+/// about, as [`read_sparse`] asks.
+///
+/// The bytes are [`read_sparse`]'s: a page's bytes where it reads, zeros
+/// where it does not. `from`: the bytes at the start already read (the
+/// failed copy's count). Nothing is kept from one call to the next: the
+/// title may remap the same address.
+fn read_probing(src: *const u8, dst: *mut u8, len: usize, from: usize, calls: &mut SparseCalls) {
+    let base = src as usize;
+    // The end of the page holding byte `at` of the range, within the range.
+    let page_end = |at: usize| (((base + at) / PAGE + 1) * PAGE - base).min(len);
+    let mut at = from.min(len);
+    while at < len {
+        calls.reads += 1;
+        match read_counted(src.wrapping_add(at), dst.wrapping_add(at), len - at) {
+            Ok(()) => return,
+            Err(n) => {
+                calls.failed += 1;
+                at += n.min(len - at);
+            }
+        }
+        let mut read_pages = 0;
+        let mut hole = 0;
+        while at < len {
+            let next = page_end(at);
+            let n = next - at;
+            let to = dst.wrapping_add(at);
+            calls.reads += 1;
+            if read(src.wrapping_add(at), to, n) {
+                at = next;
+                read_pages += 1;
+                if hole > 0 || read_pages == WALK_PAGES {
+                    break;
+                }
+                continue;
+            }
+            calls.failed += 1;
+            unmapped(n);
+            // SAFETY: inside the destination, writable host memory.
+            unsafe { to.write_bytes(0, n) };
+            at = next;
+            hole += 1;
+            if hole % HOLE_PAGES == 0 && at < len {
+                // A long hole: where does it end?
+                let to = dst.wrapping_add(at);
+                match region(src.wrapping_add(at), len - at, calls) {
+                    None => {
+                        read_pieces(src.wrapping_add(at), to, len - at, calls);
+                        return;
+                    }
+                    Some((n, false)) => {
+                        unmapped(n);
+                        // SAFETY: as above.
+                        unsafe { to.write_bytes(0, n) };
+                        at += n;
+                    }
+                    Some((_, true)) => break,
+                }
+            }
+        }
+    }
+}
+
+fn read_pieces(src: *const u8, dst: *mut u8, len: usize, calls: &mut SparseCalls) {
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
+        calls.reads += 1;
         if !read(at as *const u8, to, n) {
+            calls.failed += 1;
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
+                calls.reads += 1;
                 if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+                    calls.failed += 1;
+                    unmapped(n);
                     // SAFETY: inside the destination, which is mapped.
                     unsafe { to.write_bytes(0, n) };
                 }
@@ -8471,6 +8652,23 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+}
+
+/// As [`read`], with the kernel's count when the read fails: `Err(n)`, the
+/// first `n` bytes are in `dst`. The kernel copies in pieces of 56 KiB from
+/// `src` and counts the pieces it finished (Windows 11, test
+/// `the_kernels_count_stops_at_or_before_the_hole`), so the page that did not
+/// read is at or after byte `n`, within the next piece.
+fn read_counted(src: *const u8, dst: *mut u8, len: usize) -> Result<(), usize> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut done = 0;
+    // SAFETY: as in `read`.
+    if unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) } != 0 {
+        Ok(())
+    } else {
+        Err(done.min(len))
+    }
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]
@@ -8540,6 +8738,235 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
         let next = ((at / step + 1) * step).min(end);
         f(at, next - at);
         at = next;
+    }
+}
+
+#[cfg(test)]
+mod sparse {
+    use super::{HOLE_PAGES, PAGE, SparseCalls, read_counted, read_probing, read_sparse};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+        VirtualAlloc, VirtualFree, VirtualProtect,
+    };
+
+    /// How a page of a test region is left.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum P {
+        Read,
+        ReadOnly,
+        Reserved,
+        NoAccess,
+        Decommitted,
+    }
+
+    /// A reserved region whose pages are left as asked, each written page
+    /// full of bytes of its own (none zero), and what reading it gives: the
+    /// bytes of the pages that read, zeros for the others.
+    struct Region {
+        base: *mut u8,
+        len: usize,
+        expected: Vec<u8>,
+    }
+
+    fn byte(page: usize, at: usize) -> u8 {
+        ((page * 131 + at * 7) % 251 + 1) as u8
+    }
+
+    impl Region {
+        fn new(pages: &[P]) -> Self {
+            let len = pages.len() * PAGE;
+            // SAFETY: a private region of ours; pages are written only while
+            // committed read-write.
+            unsafe {
+                let base = VirtualAlloc(std::ptr::null(), len, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+                assert!(!base.is_null());
+                let mut expected = vec![0; len];
+                for (i, &p) in pages.iter().enumerate() {
+                    if p == P::Reserved {
+                        continue;
+                    }
+                    let at = base.add(i * PAGE);
+                    assert_eq!(VirtualAlloc(at.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), at.cast());
+                    for j in 0..PAGE {
+                        at.add(j).write(byte(i, j));
+                    }
+                    let mut old = 0;
+                    match p {
+                        P::Read => {}
+                        P::ReadOnly => assert_ne!(VirtualProtect(at.cast(), PAGE, PAGE_READONLY, &mut old), 0),
+                        P::NoAccess => assert_ne!(VirtualProtect(at.cast(), PAGE, PAGE_NOACCESS, &mut old), 0),
+                        P::Decommitted => assert_ne!(VirtualFree(at.cast(), PAGE, MEM_DECOMMIT), 0),
+                        P::Reserved => unreachable!(),
+                    }
+                    if matches!(p, P::Read | P::ReadOnly) {
+                        for j in 0..PAGE {
+                            expected[i * PAGE + j] = byte(i, j);
+                        }
+                    }
+                }
+                Region { base, len, expected }
+            }
+        }
+    }
+
+    impl Drop for Region {
+        fn drop(&mut self) {
+            // SAFETY: the region reserved in `new`.
+            unsafe { VirtualFree(self.base.cast(), 0, MEM_RELEASE) };
+        }
+    }
+
+    fn same(what: &str, got: &[u8], want: &[u8]) {
+        assert_eq!(got.len(), want.len());
+        if let Some(i) = got.iter().zip(want).position(|(a, b)| a != b) {
+            panic!("{what}: byte {i} (page {} of the range) is {:#x}, should be {:#x}", i / PAGE, got[i], want[i]);
+        }
+    }
+
+    /// Reads `[from, to)` of the region the old way (`VirtualQuery`), the
+    /// new way from its start, and the new way after a failed bulk read's
+    /// count (as `copy_mapped` does), into buffers full of 0xee; all three
+    /// must give what the pages hold and write nothing outside.
+    fn check(r: &Region, from: usize, to: usize, what: &str) -> (SparseCalls, SparseCalls) {
+        let len = to - from;
+        let src = r.base.wrapping_add(from).cast_const();
+        let want = &r.expected[from..to];
+        let run = |f: &dyn Fn(*mut u8, &mut SparseCalls)| {
+            let mut out = vec![0xeeu8; len + 128];
+            let mut calls = SparseCalls::default();
+            f(out.as_mut_ptr().wrapping_add(64), &mut calls);
+            assert!(out[..64].iter().chain(&out[64 + len..]).all(|&v| v == 0xee), "{what}: written outside");
+            (out[64..64 + len].to_vec(), calls)
+        };
+        let (old, old_calls) = run(&|dst, c| read_sparse(src, dst, len, c));
+        let (new, new_calls) = run(&|dst, c| read_probing(src, dst, len, 0, c));
+        let (counted, _) = run(&|dst, c| {
+            if let Err(done) = read_counted(src, dst, len) {
+                read_probing(src, dst, len, done, c);
+            }
+        });
+        same(&format!("{what} [{from}, {to}) the old way"), &old, want);
+        same(&format!("{what} [{from}, {to}) probing"), &new, want);
+        same(&format!("{what} [{from}, {to}) probing after the count"), &counted, want);
+        (old_calls, new_calls)
+    }
+
+    /// Every range of interest of a layout: whole, cut inside its first and
+    /// last pages, and starting and ending a page in.
+    fn check_layout(pages: &[P], what: &str) -> (SparseCalls, SparseCalls) {
+        let r = Region::new(pages);
+        let len = r.len;
+        let mut whole = None;
+        for (from, to) in [(0, len), (27, len - 27), (PAGE, len - PAGE), (PAGE + 5, len.saturating_sub(2 * PAGE + 9)), (PAGE - 1, PAGE + 1)] {
+            if from < to {
+                let calls = check(&r, from, to, what);
+                whole.get_or_insert(calls);
+            }
+        }
+        whole.unwrap()
+    }
+
+    fn layout(runs: &[(P, usize)]) -> Vec<P> {
+        runs.iter().flat_map(|&(p, n)| std::iter::repeat_n(p, n)).collect()
+    }
+
+    /// The same bytes as the old way for holes at the start, at the end,
+    /// single pages, many holes, every kind of page that does not read, and
+    /// none at all; and no question to `VirtualQuery` for holes shorter than
+    /// `HOLE_PAGES`.
+    #[test]
+    fn probing_reads_the_same_bytes_as_asking() {
+        use P::*;
+        let mut single = vec![Read; 24];
+        for i in [5, 9, 10, 17] {
+            single[i] = Reserved;
+        }
+        let layouts: Vec<(&str, Vec<P>)> = vec![
+            ("hole at the start", layout(&[(Reserved, 3), (Read, 20)])),
+            ("hole at the end", layout(&[(Read, 20), (Reserved, 3)])),
+            ("single-page holes", single),
+            ("every other page", (0..40).map(|i| if i % 2 == 0 { Read } else { Reserved }).collect()),
+            ("every other page, from a hole", (0..41).map(|i| if i % 2 == 1 { Read } else { Reserved }).collect()),
+            ("kinds", layout(&[(Read, 2), (NoAccess, 3), (ReadOnly, 2), (Decommitted, 4), (Read, 1), (Reserved, 2), (ReadOnly, 3), (NoAccess, 1), (Read, 2)])),
+            ("after many pages", layout(&[(Read, 40), (Reserved, 2), (Read, 40), (Decommitted, 1), (Read, 37)])),
+            ("all holes", vec![Reserved; 20]),
+            ("no access", vec![NoAccess; 20]),
+            ("no holes", vec![Read; 20]),
+        ];
+        for (what, pages) in &layouts {
+            let (old, new) = check_layout(pages, what);
+            assert_eq!(new.queries, 0, "{what}: no hole is long enough to ask about");
+            eprintln!(
+                "{what}: asking {} reads ({} failed), {} queries; probing {} reads ({} failed)",
+                old.reads, old.failed, old.queries, new.reads, new.failed
+            );
+        }
+    }
+
+    /// Holes longer than `HOLE_PAGES` are asked about once, and still read
+    /// as zeros, whatever ends them (the range's end, a page that reads).
+    #[test]
+    fn long_holes_are_asked_about_and_read_the_same() {
+        use P::*;
+        for (what, pages) in [
+            ("a long hole", layout(&[(Read, 3), (Reserved, 2 * HOLE_PAGES + 7), (Read, 5), (Reserved, HOLE_PAGES + 3)])),
+            ("a long hole at the start", layout(&[(Reserved, HOLE_PAGES + 1), (Read, 2)])),
+            ("long no access", layout(&[(Read, 1), (NoAccess, HOLE_PAGES + 10), (Read, 1)])),
+            ("a long hole of two kinds", layout(&[(Read, 1), (Reserved, HOLE_PAGES - 2), (Decommitted, 9), (NoAccess, 3), (Read, 2)])),
+        ] {
+            let (old, new) = check_layout(&pages, what);
+            assert!(new.queries >= 1, "{what}: asked about");
+            eprintln!(
+                "{what}: asking {} reads, {} queries; probing {} reads ({} failed), {} queries",
+                old.reads, old.queries, new.reads, new.failed, new.queries
+            );
+        }
+    }
+
+    /// Random layouts of runs of every kind of page.
+    #[test]
+    fn probing_reads_random_layouts_the_same() {
+        use P::*;
+        let kinds = [Read, Read, Read, ReadOnly, Reserved, Reserved, NoAccess, Decommitted];
+        for seed in 1..=12u64 {
+            let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let mut next = move || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as usize
+            };
+            let mut pages = Vec::new();
+            while pages.len() < 120 {
+                let p = kinds[next() % kinds.len()];
+                let n = 1 + next() % 12;
+                pages.extend(std::iter::repeat_n(p, n));
+            }
+            check_layout(&pages, &format!("seed {seed}"));
+        }
+    }
+
+    /// What `read_probing` takes from the kernel: when a read fails, its
+    /// count stops at or before the page that did not read, and the bytes
+    /// it counts are in the destination.
+    #[test]
+    fn the_kernels_count_stops_at_or_before_the_hole() {
+        for hole_page in [0, 1, 7, 13, 14, 15, 16, 17, 30, 64] {
+            let mut pages = vec![P::Read; 80];
+            pages[hole_page] = P::Reserved;
+            let r = Region::new(&pages);
+            for from in [0, 27, 3 * PAGE + 100].into_iter().filter(|&from| from < (hole_page + 1) * PAGE) {
+                let len = r.len - from;
+                let mut out = vec![0xeeu8; len];
+                let Err(n) = read_counted(r.base.wrapping_add(from).cast_const(), out.as_mut_ptr(), len) else {
+                    panic!("read through a hole");
+                };
+                let hole = (hole_page * PAGE).saturating_sub(from);
+                assert!(n <= hole, "hole at byte {hole} of the range, the kernel counted {n}");
+                same("counted bytes", &out[..n], &r.expected[from..from + n]);
+                eprintln!("hole at byte {hole} of the range: the kernel counted {n}");
+            }
+        }
     }
 }
 

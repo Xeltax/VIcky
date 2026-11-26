@@ -45,6 +45,7 @@ This branch is for making the title's compute ray tracing (the BVH structure bui
   - `VICTORY_GUARD_SUMMARY=1` (bits over the clean blocks) and `VICTORY_GUARD_ABSENT_KNOWN=1` (holes of view memory asked about once a frame, not at every asking): the guards' 32 ms a frame were 23 ms of `VirtualQuery` on uncommitted blocks (36,640 a frame); now 15–17 ms. `VICTORY_GUARD_ABSENT_CHECK=1` re-asks one answer in 64 (RT76b: 0 of 372,487 wrong). Also `VICTORY_GUARD_HOT`, `VICTORY_GUARD_VIEWS_BATCH` (no measurable gain).
   - `VICTORY_FILL_LATCH_PIECE=1`: a fill that raced a flight latches only its 64 KiB piece, not every fill for the rest of the run (that run-wide latch cost 27–39 ms a frame when it tripped).
   - `VICTORY_MERGE_RUNS=4096` with the above.
+  - `VICTORY_SPARSE_PROBE=1` (not measured yet): a copy of 64 KiB or more that met a hole is read around it by the kernel's own count and page by page, not by asking `VirtualQuery` region by region (about 2 ms a question in the title's big pools: RT83c's 15–23 fallbacks a frame took 34–42 ms). Same bytes (unit tests against the old way on reserved regions with every kind of hole); a hole longer than 1 MiB is still asked about once. The frame line's "sparse reads" now also says the ranges read around holes, the kernel reads (and failed ones) and the questions.
 
 **VIcky PRs merged:**
 - #23 (g0shtj0sh): main's opt-in `VICTORY_NO_WATCHDOG=1` hook (upstream #454, fork #364), for slower PCs whose runs the title's watchdog kills at the world's entry. Nothing changes when it is unset.

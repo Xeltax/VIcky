@@ -193,6 +193,14 @@ pub(crate) enum C {
     /// that a question found committed (nobody told us of the commit).
     GuardQueriesSaved,
     GuardAbsentFound,
+    /// Fallbacks of 64 KiB or more into host memory, read around their
+    /// holes region by region (`host::read_sparse`, `host::read_probing`);
+    /// and in all fallbacks, the kernel reads (of them, the ones that
+    /// failed) and the `VirtualQuery` questions.
+    SparseRanges,
+    SparseReads,
+    SparseReadsFailed,
+    SparseQueries,
 }
 const COUNTERS: usize = 128;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1189,7 +1197,7 @@ pub(crate) fn log(frames: f64) {
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
          refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
-         {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
+         {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms{}; \
          guards {:.1} ms ({:.0} askings, {:.0} found all clean at once{}, {:.0} blocks walked: \
          {:.0} written ({:.0} of them still read-only), {:.0} absent, {:.0} clean; \
          {:.0} waits for their lock {:.2} ms, held {:.2} ms finding all clean and {:.2} ms \
@@ -1212,6 +1220,12 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::SnapshotUs as usize]),
         mb(c[C::BackCompared as usize]),
         ms(c[C::SparseUs as usize]),
+        crate::host::sparse_clause(
+            c[C::SparseRanges as usize],
+            c[C::SparseReads as usize],
+            c[C::SparseReadsFailed as usize],
+            c[C::SparseQueries as usize]
+        ),
         ms(c[C::GuardUs as usize]),
         c[C::GuardAsked as usize],
         c[C::GuardAllClean as usize],
