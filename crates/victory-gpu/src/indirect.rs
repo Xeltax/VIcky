@@ -56,6 +56,8 @@ cbuffer Record : register(b0) {
     // groups in x as asked, up to what PARTS parts of 65,535 run, written
     // as PARTS records of four words (the number of the part's first group
     // in x, then its groups) and after them the number of parts to run.
+    // Bit 4, with bit 3: one part at most (x cut as without bit 3), the
+    // program noted as below (`bound_split_one`).
     // From bit 8 on: the number of the dispatch's program (`bound_noted`),
     // noted when a record asks for more groups in x than one dispatch runs.
     uint has_count;
@@ -89,12 +91,27 @@ groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
 groupshared uint all_asked;
+// Notes the dispatch's program (`has_count` from bit 8 on), if given, when
+// its record asked for `asked` groups in x, more than one dispatch runs and
+// no more than the parts run: its dispatches run in parts from then on
+// (VICTORY_DISPATCH_PARTS=seen).
+void note_program(uint asked) {
+    uint program = has_count >> 8;
+    if (program != 0 && asked > PART && asked <= PARTS * PART) {
+        uint slot;
+        budget.InterlockedAdd(28, 1u, slot);
+        if (slot < NOTED) {
+            budget.Store(32u + slot * 4u, program);
+        }
+    }
+}
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     bool split = (has_count & 8u) != 0;
+    bool one_part = (has_count & 16u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
@@ -151,7 +168,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         // In parts: x as asked, up to what the parts run (past that, cut
         // to one part as before: a slot nothing filled, or more than the
         // host runs).
-        if (split && want.x <= PARTS * PART) {
+        if (split && !one_part && want.x <= PARTS * PART) {
             g.x = want.x;
         }
         // y * z fits 32 bits; the whole count may not (x * y neither, in
@@ -263,22 +280,14 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             budget.InterlockedAdd(20, parts, was);
         } else if (beyond) {
             budget.InterlockedAdd(24, 1u, was);
+            note_program(asked);
         }
         return;
     }
     if (beyond) {
         uint was;
         budget.InterlockedAdd(24, 1u, was);
-        // The program, if given, when the parts would have run it all: its
-        // dispatches run in parts from then on (VICTORY_DISPATCH_PARTS=seen).
-        uint program = has_count >> 8;
-        if (program != 0 && asked > PART && asked <= PARTS * PART) {
-            uint slot;
-            budget.InterlockedAdd(28, 1u, slot);
-            if (slot < NOTED) {
-                budget.Store(32u + slot * 4u, program);
-            }
-        }
+        note_program(asked);
     }
     if (kind <= 1) {
         if (over) {
@@ -490,12 +499,57 @@ pub(crate) fn bound_noted(
     clamp_into(list, c, &dst, budget, src, count, spec, program << PROGRAM_SHIFT).then_some(dst)
 }
 
+/// [`bound_split`] for a dispatch that takes the parts' records and count
+/// but runs one part at most: x is cut to [`PART`] as without the parts,
+/// and the program numbered `program` is noted as [`bound_noted`] notes it
+/// (`VICTORY_DISPATCH_PLAIN=split`, [`plain_mode`]).
+pub(crate) fn bound_split_one(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    stride: u32,
+    program: u32,
+) -> Option<ID3D12Resource> {
+    let spec = (2, stride, 1);
+    validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(SPLIT_BYTES)?);
+    let noted = if program <= MOST_PROGRAMS { program << PROGRAM_SHIFT } else { 0 };
+    clamp_into(list, c, &dst, budget, src, count, spec, IN_PARTS | ONE_PART | noted).then_some(dst)
+}
+
+/// Runs a split dispatch's records ([`bound_split`]) in `scratch` from
+/// `at`, up to [`MOST_PARTS`] of them as many as the count after them says:
+/// through `signature`, which sets the number of each part's first group at
+/// `base` (root parameter, dword) when given; otherwise through a plain
+/// dispatch signature of [`PART_STRIDE`] bytes, from the records' second
+/// words. A root argument a command signature sets is undefined after the
+/// execution (D3D12), so the number is set to 0 again.
+pub(crate) fn execute_parts(
+    l: &ID3D12GraphicsCommandList,
+    signature: &ID3D12CommandSignature,
+    base: Option<(u32, u32)>,
+    scratch: &ID3D12Resource,
+    at: u64,
+) {
+    let first = at + if base.is_some() { 0 } else { 4 };
+    // SAFETY: an open list with the program bound; the scratch buffer is
+    // readable as arguments and holds the records and their count; `base`
+    // is a dword of the program's user-data constants.
+    unsafe {
+        l.ExecuteIndirect(signature, MOST_PARTS, scratch, first, Some(scratch), at + PARTS_COUNT_AT);
+        if let Some((param, dword)) = base {
+            l.SetComputeRoot32BitConstant(param, 0, dword);
+        }
+    }
+}
+
 /// Bits of the clamp's `has_count` ([`record_clamp_how`]): a window
 /// clamped ahead of its draws ([`bound_ahead`]); one dispatch in parts
-/// ([`bound_split`]); from [`PROGRAM_SHIFT`] on, the program to note
-/// ([`bound_noted`]).
+/// ([`bound_split`]), at most one part ([`bound_split_one`]); from
+/// [`PROGRAM_SHIFT`] on, the program to note ([`bound_noted`]).
 const AHEAD: u32 = 2;
 const IN_PARTS: u32 = 8;
+const ONE_PART: u32 = 16;
 const PROGRAM_SHIFT: u32 = 8;
 /// The most programs numbered for the clamp's notes.
 const MOST_PROGRAMS: u32 = (1 << (32 - PROGRAM_SHIFT)) - 1;
@@ -572,6 +626,69 @@ pub(crate) fn parts_mode() -> Parts {
 /// at all ([`Parts::Off`]: no).
 pub(crate) fn parts_on() -> bool {
     parts_mode() != Parts::Off
+}
+
+/// With [`Parts::Seen`], what a single-record indirect dispatch that does
+/// not take the parted path does instead (`VICTORY_DISPATCH_PLAIN`, any of
+/// these, comma-separated; none by default: the plain path of before the
+/// parts). For telling why RT67 (seen) left the lower-right quarter of the
+/// picture dark where RT64 (every such dispatch parted) lit it, which no
+/// difference in the records explains:
+/// - `split`: everything the parted path does but the root constant: the
+///   clamp's part records and their count ([`bound_split_one`]: one part at
+///   most, its program noted), run through a plain dispatch signature from
+///   the records' second words with the clamp's count, where the plain path
+///   runs the clamped record with the title's count buffer;
+/// - `wait`: a full wait (every shader write, and an aliasing barrier on
+///   every resource) right before the execution, after the program's bind,
+///   as a driver may wait before an execution whose command signature sets
+///   root constants (RT64's about 20 microseconds of card time for each).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Plain {
+    pub(crate) split: bool,
+    pub(crate) wait: bool,
+}
+
+/// `VICTORY_DISPATCH_PLAIN`'s variants. Pure, for testing.
+fn parse_plain(value: Option<&str>) -> Plain {
+    let mut plain = Plain::default();
+    for word in value.unwrap_or("").split(',').map(str::trim) {
+        match word {
+            "split" => plain.split = true,
+            "wait" => plain.wait = true,
+            _ => {}
+        }
+    }
+    plain
+}
+
+/// The variants `VICTORY_DISPATCH_PLAIN` asks for ([`Plain`]); none unless
+/// `VICTORY_DISPATCH_PARTS=seen`.
+pub(crate) fn plain_mode() -> Plain {
+    static MODE: std::sync::OnceLock<Plain> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        if parts_mode() != Parts::Seen {
+            return Plain::default();
+        }
+        parse_plain(std::env::var("VICTORY_DISPATCH_PLAIN").ok().as_deref())
+    })
+}
+
+/// A full wait: every earlier shader write done, and an aliasing barrier
+/// on every resource, which drivers take for waiting until the card is
+/// idle ([`Plain::wait`]).
+pub(crate) fn full_wait() -> [D3D12_RESOURCE_BARRIER; 2] {
+    let aliasing = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                pResourceBefore: std::mem::ManuallyDrop::new(None),
+                pResourceAfter: std::mem::ManuallyDrop::new(None),
+            }),
+        },
+    };
+    [uav_barrier(), aliasing]
 }
 
 /// The programs of indirect dispatches numbered for the clamp's notes
@@ -744,10 +861,13 @@ pub(crate) fn parts_line(frames: f64) {
          largest group count asked for in x {i_largest} (a list late; one dispatch runs at most {PART}); \
          single-record indirect dispatches {:.2} through the parted path, {:.2} through the plain one; {} programs \
          seen asking for more in x",
-        match parts_mode() {
-            Parts::Off => "off",
-            Parts::All => "on",
-            Parts::Seen => "seen",
+        match (parts_mode(), plain_mode()) {
+            (Parts::Off, _) => "off",
+            (Parts::All, _) => "on",
+            (Parts::Seen, Plain { split: false, wait: false }) => "seen",
+            (Parts::Seen, Plain { split: true, wait: false }) => "seen, VICTORY_DISPATCH_PLAIN split",
+            (Parts::Seen, Plain { split: false, wait: true }) => "seen, VICTORY_DISPATCH_PLAIN wait",
+            (Parts::Seen, Plain { split: true, wait: true }) => "seen, VICTORY_DISPATCH_PLAIN split,wait",
         },
         split as f64 / frames,
         parts as f64 / frames,
@@ -3152,6 +3272,149 @@ void main(uint3 g : SV_GroupID) {
             let kept = (noted as usize).min(NOTED);
             assert!(words[8..8 + kept].iter().all(|&w| w == PROGRAM), "{case}: notes kept {:?}", &words[8..16]);
             assert!(words[8 + kept..17].iter().all(|&w| w == 0), "{case}: nothing past the notes {:?}", &words[8..17]);
+        }
+    }
+
+    /// `VICTORY_DISPATCH_PLAIN`: `split`, `wait`, both, or nothing.
+    #[test]
+    fn the_plain_switch_reads_split_and_wait() {
+        assert_eq!(parse_plain(None), Plain::default());
+        assert_eq!(parse_plain(Some("split")), Plain { split: true, wait: false });
+        assert_eq!(parse_plain(Some("wait")), Plain { split: false, wait: true });
+        assert_eq!(parse_plain(Some(" wait , split ")), Plain { split: true, wait: true });
+        assert_eq!(parse_plain(Some("nothing")), Plain::default());
+    }
+
+    /// After an execution of parts whose command signature sets the number
+    /// of each part's first group (`execute_parts`), a plain dispatch of the
+    /// same program, direct or indirect, with no constant set again in
+    /// between, counts its groups from 0: the number is 0 again, not the
+    /// last part's (D3D12 leaves a root argument a command signature sets
+    /// undefined). Every group of all three runs exactly once. (WARP gives
+    /// back the value set before the execution: the test passed with the
+    /// reset taken out too, so it guards the plain dispatches here but
+    /// cannot show a driver that leaves the last part's number.)
+    #[test]
+    fn warp_plain_dispatches_after_parts_count_from_group_0() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let counter = compile_cs(&warp.device, PARTS_CS).expect("the counting shader must compile");
+        let signature = make_split_signature(&warp.device, &counter.root, (0, 2)).expect("the split command signature");
+        let plain = warp.signature(2, 12);
+        const GROUPS: u32 = 98_000;
+        const DIRECT: u32 = 1_000;
+        const INDIRECT: u32 = 500;
+        let (src, src_ptr, _) = warp.shared_buffer(16);
+        let (args, args_ptr, _) = warp.shared_buffer(16);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (_hits, hits_ptr, hits_gpu) = warp.shared_buffer(4 * (u64::from(GROUPS) + 1));
+        let dst = warp.default_uav(SPLIT_BYTES);
+        // SAFETY: mappings of these sizes.
+        unsafe {
+            std::ptr::copy_nonoverlapping([GROUPS, 1, 1].as_ptr().cast(), src_ptr, 12);
+            std::ptr::copy_nonoverlapping([INDIRECT, 1, 1].as_ptr().cast(), args_ptr, 12);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(hits_ptr, 0, 4 * (GROUPS as usize + 1));
+        }
+        let common = D3D12_RESOURCE_STATE_COMMON;
+        assert!(record_clamp_how(&warp.clamp, &warp.list, (&dst, common), budget_gpu, (&src, 0), None, (2, 12, 1), IN_PARTS));
+        // SAFETY: our open list; the counter's own root signature and
+        // pipeline; the clamp left `dst` readable as arguments, `args` is
+        // read as arguments from the common state.
+        unsafe {
+            warp.list.SetComputeRootSignature(&counter.root);
+            warp.list.SetPipelineState(&counter.pso);
+            let constants = [GROUPS, 1, 0];
+            warp.list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+            warp.list.SetComputeRootUnorderedAccessView(1, hits_gpu);
+        }
+        execute_parts(&warp.list, &signature, Some((0, 2)), &dst, 0);
+        // SAFETY: as above; nothing set again.
+        unsafe {
+            warp.list.Dispatch(DIRECT, 1, 1);
+            warp.list.ExecuteIndirect(&plain, 1, &args, 0, None, 0);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the mapping holds `GROUPS + 1` words.
+        let hits = unsafe { std::slice::from_raw_parts(hits_ptr.cast::<u32>(), GROUPS as usize + 1) };
+        let want = |slot: u32| match slot {
+            s if s < INDIRECT => 3,
+            s if s < DIRECT => 2,
+            s if s < GROUPS => 1,
+            _ => 0,
+        };
+        let wrong: Vec<(u32, u32, u32)> =
+            (0..=GROUPS).filter(|&s| hits[s as usize] != want(s)).map(|s| (s, hits[s as usize], want(s))).take(8).collect();
+        assert!(wrong.is_empty(), "slots (slot, counted, wanted): {wrong:?}");
+    }
+
+    /// `VICTORY_DISPATCH_PLAIN=split` (`bound_split_one`): the parts'
+    /// records and count, one part at most: a record past one dispatch is
+    /// cut to 65,535 groups as without the parts and its program noted; a
+    /// small one is one part as it asked. Run from the records' second
+    /// words by a plain signature of 16 bytes, the cut record runs 65,535
+    /// groups.
+    #[test]
+    fn warp_one_part_records_cut_and_note_the_program() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const PROGRAM: u32 = 7;
+        let plain = warp.signature(2, PART_STRIDE);
+        // (asked, records, cut, notes, groups run)
+        let cases: [([u32; 3], [u32; 3], u32, u32, u32); 3] = [
+            ([98_000, 1, 1], [PART, 1, 1], 1, 1, PART),
+            ([5, 3, 2], [5, 3, 2], 0, 0, 30),
+            ([0, 1, 1], [0, 1, 1], 0, 0, 0),
+        ];
+        for (asked, clamped, cut, noted, ran) in cases {
+            let (src, src_ptr, _) = warp.shared_buffer(16);
+            let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+            let (_hits, hits_ptr, hits_gpu) = warp.shared_buffer(256);
+            let (readback, readback_ptr, _) = warp.shared_buffer(SPLIT_BYTES);
+            let dst = warp.default_uav(SPLIT_BYTES);
+            // SAFETY: mappings of these sizes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(asked.as_ptr().cast(), src_ptr, 12);
+                std::ptr::write_bytes(budget_ptr, 0, 256);
+                std::ptr::write_bytes(hits_ptr, 0, 256);
+            }
+            let common = D3D12_RESOURCE_STATE_COMMON;
+            let how = IN_PARTS | ONE_PART | (PROGRAM << PROGRAM_SHIFT);
+            assert!(record_clamp_how(&warp.clamp, &warp.list, (&dst, common), budget_gpu, (&src, 0), None, (2, 12, 1), how));
+            // SAFETY: our open list; the worker's own root signature and
+            // pipeline; the clamp left `dst` readable as arguments.
+            unsafe {
+                warp.list.SetComputeRootSignature(&warp.worker.root);
+                warp.list.SetPipelineState(&warp.worker.pso);
+                warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            }
+            execute_parts(&warp.list, &plain, None, &dst, 0);
+            // SAFETY: as above.
+            unsafe {
+                warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                warp.list.CopyBufferRegion(&readback, 0, &dst, 0, SPLIT_BYTES);
+            }
+            warp.submit_and_wait();
+            // SAFETY: the mappings hold what the clamp, the copy and the
+            // worker wrote.
+            let (made, words, hits) = unsafe {
+                (
+                    std::slice::from_raw_parts(readback_ptr.cast::<u32>(), SPLIT_BYTES as usize / 4).to_vec(),
+                    budget_ptr.cast::<[u32; 16]>().read_volatile(),
+                    hits_ptr.cast::<u32>().read_volatile(),
+                )
+            };
+            let parts = u32::from(clamped.iter().all(|&g| g > 0));
+            assert_eq!(made[(PARTS_COUNT_AT / 4) as usize], parts, "{asked:?}: one part at most");
+            assert_eq!(made[..4], [0, clamped[0], clamped[1], clamped[2]], "{asked:?}: the part");
+            assert_eq!(made[4..8], [PART, 0, clamped[1], clamped[2]], "{asked:?}: nothing in the second part");
+            assert_eq!([words[6], words[7]], [cut, noted], "{asked:?}: cut, notes");
+            if noted > 0 {
+                assert_eq!(words[8], PROGRAM, "{asked:?}: the program noted");
+            }
+            assert_eq!(hits, ran, "{asked:?}: groups run");
         }
     }
 
