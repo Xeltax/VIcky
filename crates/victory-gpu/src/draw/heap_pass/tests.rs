@@ -413,3 +413,300 @@ fn a_pass_whose_heap_went_ends_with_nothing() {
     assert_eq!(list.heap_pass_steps(), 0);
     list.close();
 }
+
+/// A small generator for the models below (xorshift).
+fn draws(seed: u64) -> impl FnMut() -> u64 {
+    let mut x = seed;
+    move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    }
+}
+
+/// With the spread, each buffer slot is in the window of one turn of 16,
+/// fixed by its index: in any 16 passes in a row, a slot that stayed a
+/// buffer slot throughout is in exactly one window, and no slot is in two,
+/// however many slots came and went meanwhile; a window holds the buffer
+/// slots of its turn, in order.
+#[test]
+fn the_window_visits_every_slot_once_in_16_passes_however_the_slots_change() {
+    let mut next = draws(0x5eed_5b1e_ad00_0001);
+    let mut slots: BTreeSet<u32> = (0..3_000).chain(40_000..41_000).collect();
+    // Per slot, the passes it was a buffer slot at and the passes whose
+    // window it was in (one bit a pass).
+    let (mut present, mut came) = (HashMap::<u32, u128>::new(), HashMap::<u32, u128>::new());
+    let passes = 96u32;
+    for n in 0..passes {
+        match n % 4 {
+            // A stretch comes, or goes.
+            0 => {
+                let from = (next() % 120_000) as u32;
+                slots.extend(from..from + (next() % 3_000) as u32);
+            }
+            1 => {
+                let from = (next() % 120_000) as u32;
+                let to = from + (next() % 2_000) as u32;
+                slots.retain(|&i| !(from..to).contains(&i));
+            }
+            // Single slots come and go.
+            2 => {
+                for _ in 0..400 {
+                    let i = (next() % 120_000) as u32;
+                    if !slots.remove(&i) {
+                        slots.insert(i);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let turn = n % 16;
+        let window = window(&slots, turn);
+        assert!(window.windows(2).all(|w| w[0] < w[1]), "pass {n}: in order, each once");
+        let of_turn: Vec<u32> = slots.iter().copied().filter(|&i| turn_of(i) == turn).collect();
+        assert_eq!(window, of_turn, "pass {n}: the buffer slots of turn {turn}");
+        for &i in &slots {
+            *present.entry(i).or_default() |= 1u128 << n;
+        }
+        for &i in &window {
+            *came.entry(i).or_default() |= 1u128 << n;
+        }
+    }
+    for start in 0..=passes - 16 {
+        let these = ((1u128 << 16) - 1) << start;
+        for (&i, &came) in &came {
+            let times = (came & these).count_ones();
+            assert!(times <= 1, "slot {i} came {times} times in passes {start} to {}", start + 15);
+            if present[&i] & these == these {
+                assert_eq!(times, 1, "slot {i}, a buffer slot throughout passes {start} to {}", start + 15);
+            }
+        }
+        // (A slot never in a window was never a buffer slot 16 passes in a
+        // row.)
+        for (&i, &present) in &present {
+            if present & these == these {
+                assert!(came.contains_key(&i), "slot {i}");
+            }
+        }
+    }
+}
+
+/// The windows cut the buffer slots about evenly, whatever their layout:
+/// a stretch, slots that come every 8th or in fours of each 16 (tables),
+/// and stretches strewn over a large heap.
+#[test]
+fn the_windows_are_about_even_whatever_the_layout() {
+    let mut next = draws(0x5eed_5b1e_ad00_0002);
+    let mut strewn = BTreeSet::new();
+    while strewn.len() < 150_000 {
+        let from = (next() % 1_200_000) as u32;
+        strewn.extend(from..from + 64 + (next() % 4_000) as u32);
+    }
+    let layouts: [(&str, BTreeSet<u32>); 4] = [
+        ("a stretch", (0..154_265).collect()),
+        ("every 8th", (0..1_245_184).step_by(8).collect()),
+        ("fours of each 16", (0..600_000).filter(|i| i % 16 < 4).collect()),
+        ("strewn stretches", strewn),
+    ];
+    for (layout, slots) in layouts {
+        let sizes: Vec<usize> = (0..16).map(|turn| window(&slots, turn).len()).collect();
+        assert_eq!(sizes.iter().sum::<usize>(), slots.len(), "{layout}: each slot in one window");
+        let even = slots.len() as f64 / 16.0;
+        let (least, most) = (*sizes.iter().min().unwrap() as f64, *sizes.iter().max().unwrap() as f64);
+        assert!(least > 0.8 * even && most < 1.2 * even, "{layout}: {sizes:?}");
+    }
+}
+
+/// A model of a heap for the passes ([`choose`], [`Afresh::apply`]): its
+/// buffer slots, what each one's view reads now (none: no copy), and the
+/// slots written since the last pass.
+#[derive(Clone, Default)]
+struct Model {
+    slots: BTreeSet<u32>,
+    reads: HashMap<u32, u64>,
+    changed: HashSet<u32>,
+}
+
+impl Model {
+    /// Pass `n` over the model, as [`in_place`] runs it: the ranges of its
+    /// slots dropped and kept again if their views read one. Returns how
+    /// many slots it looked at.
+    fn pass(&mut self, kept: &mut HashMap<u32, u64>, n: u64, spread: bool) -> usize {
+        let changed: Vec<u32> = self.changed.drain().collect();
+        let (mut slots, afresh) =
+            choose(n, spread, changed, || self.slots.iter().copied().collect(), |turn| window(&self.slots, turn));
+        afresh.apply(kept, &mut slots);
+        for &i in &slots {
+            kept.remove(&i);
+            if self.slots.contains(&i)
+                && let Some(&read) = self.reads.get(&i)
+            {
+                kept.insert(i, read);
+            }
+        }
+        slots.len()
+    }
+
+    /// What a pass that looked at every slot now would keep.
+    fn truth(&self) -> HashMap<u32, u64> {
+        self.slots.iter().filter_map(|&i| Some((i, *self.reads.get(&i)?))).collect()
+    }
+}
+
+/// On a model of a heap (slots written, emptied, and some whose views read
+/// another copy, or one for the first time, with no write: a released
+/// resource, memory that got a host copy late), the spread passes keep what
+/// the passes over every slot each 16th pass keep: the same after 16
+/// passes with nothing written, and with both, a change without a write is
+/// seen within 16 passes. No spread pass looks at all the slots after the
+/// first.
+#[test]
+fn the_spread_passes_keep_what_the_full_passes_keep_on_a_model() {
+    let mut next = draws(0x5eed_5b1e_ad00_0003);
+    let mut model = Model::default();
+    for i in (0..20_000).chain(70_000..90_000).filter(|i| i % 5 != 3) {
+        model.slots.insert(i);
+        model.reads.insert(i, u64::from(i));
+        model.changed.insert(i);
+    }
+    let (mut full, mut spread) = (model.clone(), model);
+    let (mut kept_full, mut kept_spread) = (HashMap::new(), HashMap::new());
+    // Per slot, the pass after its last change without a write.
+    let mut unwritten: HashMap<u32, u64> = HashMap::new();
+    let mut version = 1u64 << 32;
+    for n in 0..120u64 {
+        // Passes 40 to 55 and 104 to 119: nothing written.
+        let quiet = (40..56).contains(&n) || (104..120).contains(&n);
+        if !quiet {
+            for _ in 0..300 {
+                let i = (next() % 100_000) as u32;
+                version += 1;
+                let both = |m: &mut Model| match version % 4 {
+                    // Written with a view, or emptied.
+                    0 | 1 => {
+                        m.slots.insert(i);
+                        m.reads.insert(i, version);
+                        m.changed.insert(i);
+                    }
+                    2 => {
+                        m.slots.remove(&i);
+                        m.changed.insert(i);
+                    }
+                    // Its view reads another copy, with no write.
+                    _ => {
+                        m.reads.insert(i, version);
+                    }
+                };
+                both(&mut full);
+                both(&mut spread);
+                if version % 4 == 3 {
+                    unwritten.insert(i, n);
+                }
+            }
+        }
+        let looked = (full.pass(&mut kept_full, n, false), spread.pass(&mut kept_spread, n, true));
+        if n > 0 {
+            assert!(looked.1 < spread.slots.len() / 4, "pass {n}: {looked:?} of {}", spread.slots.len());
+        }
+        let truth = full.truth();
+        assert_eq!(truth, spread.truth());
+        for (&i, &since) in &unwritten {
+            if n >= since + 15 {
+                assert_eq!(kept_full.get(&i), truth.get(&i), "pass {n}, slot {i}, changed before pass {since}: over all");
+                assert_eq!(kept_spread.get(&i), truth.get(&i), "pass {n}, slot {i}, changed before pass {since}: spread");
+            }
+        }
+        if n == 55 || n == 119 {
+            assert_eq!(kept_full, truth, "pass {n}: over all");
+            assert_eq!(kept_spread, truth, "pass {n}: spread");
+        }
+    }
+}
+
+/// Three heaps written alike: passed over in place with a pass over every
+/// buffer slot each 16th pass, and with the spread in place and beside
+/// (checked every pass); with the cache of made views and without. Buffer
+/// slots in runs of every turn and on two buffers; each pass, one written
+/// in the pass's own window (looked at once). At every pass the spread in
+/// place and beside keep the same ranges and show the same buffers, the
+/// check finds every slot as at the call, and the spread keeps what the
+/// pass without it keeps. (A view that reads another copy with no write is
+/// the model's: `the_spread_passes_keep_what_the_full_passes_keep_on_a_model`.)
+#[test]
+fn the_spread_pass_keeps_what_the_full_pass_keeps() {
+    let Some(device) = crate::host::host() else {
+        return;
+    };
+    let runs = 64u32;
+    let run_of = |turn: u32| (0..runs).find(|&r| turn_of(r * RUN) == turn).expect("a run of each turn");
+    for cache in [0usize, 1 << 10] {
+        TEST_FAST.set(Some((cache, false, false)));
+        let (Some(full), Some(here), Some(beside)) = (title_heap(runs * RUN), title_heap(runs * RUN), title_heap(runs * RUN))
+        else {
+            TEST_FAST.set(None);
+            return;
+        };
+        let base = 0x5e_0000_0000u64 + ((cache as u64) << 28);
+        let (one, two) = (0x7e57_5e01 + cache, 0x7e57_5e02 + cache);
+        crate::shadow::register(one, base, 0x10_0000);
+        crate::shadow::register(two, base + 0x100_0000, 0x1000);
+        let all = |slot: u32, view: View| {
+            for heap in [full.1, here.1, beside.1] {
+                write(heap, slot, view.clone());
+            }
+        };
+        for run in 0..runs {
+            all(run * RUN + 5, buffer_view(base, 0x10_0000, 4 * run, 8));
+            all(run * RUN + 40, buffer_view(base, 0x10_0000, 4 * run + 2, 8));
+            all(run * RUN + 20, buffer_view(base + 0x100_0000, 0x1000, run % 32, 4));
+        }
+        for n in 0..=16u64 {
+            if n > 0 {
+                let turn = (n % 16) as u32;
+                all(run_of(turn) * RUN + 5, buffer_view(base, 0x10_0000, 300 + n as u32, 8));
+            }
+            let frame = 0x5e00 + n;
+            let lists = [(); 3].map(|()| device.new_list().expect("a list"));
+            TEST_SPREAD.set(Some(false));
+            in_place(&lists[0], full.1, full.2, frame);
+            TEST_SPREAD.set(Some(true));
+            let made = in_place(&lists[1], here.1, here.2, frame);
+            // (A pass's making marks the slots it made, with the spread and
+            // without: pass 1 looks at every slot again, and each pass at the
+            // slot written for the last.)
+            if n > 1 {
+                // The window's 3 slots of each of its runs (the slot written
+                // in it once), and the one written for the last pass.
+                let window = 3 * (0..runs).filter(|&r| turn_of(r * RUN) == (n % 16) as u32).count();
+                assert_eq!(made.slots, window + 1, "pass {n}, cache {cache}: looked at once");
+            }
+            let run = Run::new();
+            let pass = run.pass.clone();
+            start(&lists[2], beside.1, beside.2, frame, run, true);
+            lists[2].join_heap_passes();
+            TEST_SPREAD.set(None);
+            let checked = pass.checked().expect("a checked pass");
+            assert_eq!((checked.differed, checked.changed), (0, 0), "pass {n}, cache {cache}");
+            let spread = kept(here.2);
+            assert_eq!(spread, kept(beside.2), "pass {n}, cache {cache}: in place and beside");
+            for slot in 0..runs * RUN {
+                assert_eq!(here.2.made(slot), beside.2.made(slot), "pass {n}, cache {cache}, slot {slot}: made");
+                assert_eq!(here.2.shown_raw(slot), beside.2.shown_raw(slot), "pass {n}, cache {cache}, slot {slot}");
+            }
+            assert_eq!(spread, kept(full.2), "pass {n}, cache {cache}: with the spread and without");
+            for list in lists {
+                list.close();
+            }
+        }
+        crate::shadow::unregister(one, base);
+        crate::shadow::unregister(two, base + 0x100_0000);
+        for heap in [&full, &here, &beside] {
+            forget(heap.2);
+        }
+        for heap in [full, here, beside] {
+            assert_eq!(release(heap.0), 0);
+        }
+    }
+    TEST_FAST.set(None);
+}

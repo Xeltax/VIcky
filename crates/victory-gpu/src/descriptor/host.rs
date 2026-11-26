@@ -1989,6 +1989,13 @@ impl HostHeap {
         buffers.iter().copied().collect()
     }
 
+    /// What `f` takes of the title slots that hold buffer views, in order,
+    /// under the lock of that set (VIcky, `VICTORY_HEAP_PASS_SPREAD`: a
+    /// sixteenth of them, `crate::draw::heap_pass::window`).
+    pub(crate) fn with_buffer_slots<R>(&self, f: impl FnOnce(&std::collections::BTreeSet<u32>) -> R) -> R {
+        f(&self.buffers.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// The title slots whose buffer view was written, or went, since the
     /// last call.
     pub(crate) fn buffer_changes(&self) -> Vec<u32> {
