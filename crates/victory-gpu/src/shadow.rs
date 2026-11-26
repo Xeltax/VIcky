@@ -3458,6 +3458,7 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        crate::census::copy_gone(self.id, self.start, self.len);
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -3755,6 +3756,16 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    /// The copy as `crate::census` names it.
+    pub(crate) fn census(&self) -> crate::census::Which {
+        crate::census::Which {
+            id: self.id,
+            start: self.start,
+            len: self.len,
+            window: self.window,
+        }
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -3825,6 +3836,7 @@ impl Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
+        crate::census::copy_made(start, len);
         Shadow {
             buffer,
             data,
@@ -4664,8 +4676,11 @@ impl Shadow {
                         // VIcky (`VICTORY_DENSE_PAGE_WHOLE`): whole, if no
                         // shader wrote the piece lately. Put in, and taken,
                         // by the caller once nothing settles the flights.
+                        // Not a page holding shaders' bytes left on the card
+                        // (`VICTORY_SKIP_WC_BACK`): title memory lacks them.
                         if let Some(frames) = dense_whole()
                             && self.card_quiet(page, frames)
+                            && crate::census::stale_pages(self.id, lo, hi).is_empty()
                         {
                             let all = (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e;
                             whole.push(WholePage { lo, hi, page, now, all });
@@ -4829,6 +4844,17 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        // `crate::census`: the copy takes what other copies wrote back here.
+        if crate::census::tracking() {
+            use crate::census::Taker;
+            let kind = match (self.place.is_some(), self.window) {
+                (true, _) => Taker::InPlace,
+                (false, true) => Taker::Window,
+                (false, false) => Taker::Copy,
+            };
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            crate::census::asked(self.id, kind, address.max(start), address.saturating_add(len).min(end));
+        }
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -5003,15 +5029,70 @@ impl Shadow {
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
+    ///
+    /// `VICTORY_SKIP_WC_BACK` (`crate::census::skip_wc_back`): on a page
+    /// where shaders' bytes were left on the card, title memory and the
+    /// CPU's side both lack them, and title memory differs from the CPU's
+    /// side only where the title wrote since. Only those bytes go in and
+    /// up; the card keeps the shaders' bytes beside them (taken whole, the
+    /// page would put title memory's old bytes over them).
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if self.card.is_some() {
+            let stale = crate::census::stale_pages(self.id, from, to);
+            if !stale.is_empty() {
+                let mut at = from;
+                for page in stale {
+                    let (lo, hi) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+                    if at < lo {
+                        self.copy_whole(at, lo);
+                    }
+                    self.copy_title_changes(lo, hi);
+                    at = hi;
+                }
+                if at < to {
+                    self.copy_whole(at, to);
+                }
+                return to - from;
+            }
+        }
+        self.copy_whole(from, to)
+    }
+
+    /// [`Shadow::copy`] of a stale page's part `[from, to)` (inside the
+    /// buffer): the runs where title memory differs from the CPU's side.
+    fn copy_title_changes(&self, from: usize, to: usize) {
+        let start = self.start as usize;
+        let mut title = vec![0u8; to - from];
+        crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, to - from, false);
+        // SAFETY: inside the mapping (`from` and `to` are within the buffer).
+        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), to - from) };
+        let mut up = 0;
+        for (r, m) in changed_runs(&title, held) {
+            held[r..r + m].copy_from_slice(&title[r..r + m]);
+            let (a, b) = (from - start + r, from - start + r + m);
+            self.changed(a, b);
+            self.card_changed(a, b);
+            up += m;
+        }
+        if up > 0 {
+            crate::census::title_over(up);
+        }
+    }
+
+    /// [`Shadow::copy`] of `[from, to)` (inside the buffer), whole.
+    fn copy_whole(&self, from: usize, to: usize) -> usize {
+        let start = self.start as usize;
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
+        if self.card.is_some() {
+            crate::census::recopied(self.id, from, to);
+        }
         to - from
     }
 
@@ -6043,6 +6124,48 @@ mod card_merge_tests {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
     use windows::Win32::Graphics::Dxgi::*;
+
+    /// `VICTORY_SKIP_WC_BACK` (`crate::census::skip_wc_back`), on a real
+    /// copy in the card's memory: a refresh over a page whose shaders'
+    /// bytes were left on the card takes only what the title changed there
+    /// into the CPU's side and up (the card keeps its bytes beside them);
+    /// the pages around go in and up whole, as before.
+    #[test]
+    fn a_refresh_over_bytes_left_on_the_card_sends_only_the_titles_changes() {
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const LEN: usize = 3 * PAGE;
+        let content: Vec<u8> = (0..LEN).map(|i| (i * 3 + i / 977) as u8).collect();
+        let mut title = content.clone();
+        let mut side = content.clone();
+        let start = title.as_ptr() as usize;
+        // A page wholly inside the copy, at offset `at`.
+        let at = (start / PAGE + 1) * PAGE - start;
+        let at = if at < 16 { at + PAGE } else { at };
+        let (before, inside, after) = (at - 10, at + 1000, at + PAGE + 10);
+        for i in [before, inside, after] {
+            title[i] ^= 0x77;
+        }
+        let mut shadow = Shadow::new(buffer, side.as_mut_ptr(), 0, start as u64, LEN as u64);
+        shadow.card = Some(Card {
+            staging,
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            // 0: no card bytes counted (`Drop` takes them off again).
+            size: 0,
+            dense: Dense::default(),
+        });
+        crate::census::left_for_test(shadow.id, Some((start + at + 100, start + at + 200)));
+        let copied = shadow.copy(start, start + LEN);
+        let dirty = shadow.card.as_ref().map(|c| c.dirty.lock().unwrap().ranges.clone()).unwrap_or_default();
+        crate::census::left_for_test(shadow.id, None);
+        drop(shadow);
+        assert_eq!(copied, LEN);
+        assert_eq!(side, title, "every byte the title changed is in the CPU's side");
+        assert_eq!(dirty, vec![(0, at), (inside, inside + 1), (at + PAGE, LEN)]);
+    }
 
     /// A plain buffer on the software adapter: what a copy's `buffer` and
     /// its card's `staging` are; the merge never touches them.

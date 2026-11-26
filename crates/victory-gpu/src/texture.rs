@@ -461,6 +461,8 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // Not a copy the census numbers: nothing of it is left on the card.
+        crate::census::copy_gone(0, self.memory as u64, self.layout.size);
         // Nothing holds the staging any more (lists keep it until they are
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
@@ -969,6 +971,11 @@ impl Staging {
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        // `crate::census`: the texture takes what copies wrote back here.
+        if crate::census::tracking() {
+            let (at, size) = self.memory();
+            crate::census::asked(crate::census::texture_taker(at), crate::census::Taker::Texture, at, at.saturating_add(size));
+        }
         let started = std::time::Instant::now();
         let read = self.refresh_now();
         let preparing = &crate::host::PREPARING;
@@ -1477,6 +1484,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    // `crate::census`: another copy of the title memory it is read from.
+    crate::census::copy_made(memory as u64, layout.size);
     let s = Arc::new(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]
