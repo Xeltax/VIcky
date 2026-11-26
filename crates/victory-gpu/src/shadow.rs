@@ -87,7 +87,27 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Diagnostics: the ways shader writes to the copy were declared,
+    /// or-ed ([`DECLARED_ROOT`] and the others), for the line that names a
+    /// page over the runs left ([`Shadow::over_cap_said`]).
+    #[cfg(feature = "diagnostics")]
+    declared_by: AtomicU8,
 }
+
+/// Diagnostics ([`Shadow::declared_by`]): shader writes to a copy were
+/// declared by a root unordered access view, by a buffer view (a table's,
+/// or a heap slot a table names), or by `crate::memory` for a copy it
+/// numbered just now, one a dispatch names, or one shaders marked lately.
+#[cfg(feature = "diagnostics")]
+pub(crate) const DECLARED_ROOT: u8 = 1;
+#[cfg(feature = "diagnostics")]
+pub(crate) const DECLARED_VIEW: u8 = 2;
+#[cfg(feature = "diagnostics")]
+pub(crate) const DECLARED_MEMORY_NEW: u8 = 4;
+#[cfg(feature = "diagnostics")]
+pub(crate) const DECLARED_MEMORY_NAMED: u8 = 8;
+#[cfg(feature = "diagnostics")]
+pub(crate) const DECLARED_MEMORY_MARKED: u8 = 16;
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
 /// shaders see.
@@ -111,6 +131,55 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// What the card's compare said of each piece ([`Dense`]).
+    dense: Dense,
+}
+
+/// Per 64 KiB piece of a copy in the card's memory (cut as the compare
+/// cuts it, [`pieces_of`]): the last frame a landing found the piece
+/// flagged by its flight's compare, i.e. written by shaders. Empty unless
+/// kept ([`dense_tracked`]).
+#[derive(Default)]
+struct Dense {
+    /// The frame the copy was made in.
+    made: u64,
+    /// Per piece: 1 + the frame of the last landing whose compare flagged
+    /// it (a range without a compare counts as flagged whole); 0: never.
+    flagged: Box<[AtomicU64]>,
+}
+
+impl Dense {
+    /// For a copy whose buffers are `size` bytes: a piece more than they
+    /// hold, for a copy that does not start on a piece's boundary.
+    fn new(size: u64) -> Dense {
+        if !dense_tracked() {
+            return Dense::default();
+        }
+        let pieces = (size / PIECE as u64 + 2) as usize;
+        Dense {
+            made: crate::frame::current(),
+            flagged: (0..pieces).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// How many frames before `frame` the piece was last flagged, and
+    /// whether it ever was (if not: the frames since the copy was made).
+    /// `None` if not kept.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    fn flagged_ago(&self, piece: usize, frame: u64) -> Option<(u64, bool)> {
+        let at = self.flagged.get(piece)?.load(Ordering::Relaxed);
+        Some(match at {
+            0 => (frame.saturating_sub(self.made), false),
+            at => (frame.saturating_sub(at - 1), true),
+        })
+    }
+}
+
+/// Whether the copies in the card's memory keep what their compares said
+/// of each piece ([`Dense`]): in the diagnostics build, for the line that
+/// names a page over the runs left.
+pub(crate) fn dense_tracked() -> bool {
+    cfg!(feature = "diagnostics")
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -2467,6 +2536,71 @@ pub(crate) fn merged_stats() -> [u64; 9] {
     std::array::from_fn(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// Diagnostics ([`Shadow::over_cap_said`]): pages over the runs left since
+/// the start.
+#[cfg(feature = "diagnostics")]
+static OVER_CAP_TRIPS: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostics ([`Shadow::over_cap_said`]), since the last frame-rate
+/// line, per copy (its number): where it starts, its length, its pages over
+/// the runs left and the runs they wanted.
+#[cfg(feature = "diagnostics")]
+static OVER_CAP_BY_COPY: Mutex<BTreeMap<u64, (u64, u64, u64, u64)>> = Mutex::new(BTreeMap::new());
+
+/// Diagnostics, for the frame-rate line: the three copies with the most
+/// pages over the runs left ([`Shadow::over_cap_said`]) since the last one,
+/// per frame. Nothing if none.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn over_cap_line(frames: f64) {
+    let all = std::mem::take(&mut *OVER_CAP_BY_COPY.lock().unwrap_or_else(|e| e.into_inner()));
+    if all.is_empty() {
+        return;
+    }
+    let mut most: Vec<(u64, (u64, u64, u64, u64))> = all.into_iter().collect();
+    let count = most.len();
+    most.sort_by_key(|m| (std::cmp::Reverse(m.1.2), m.0));
+    let most: Vec<String> = most
+        .iter()
+        .take(3)
+        .map(|(id, (start, len, trips, wanted))| {
+            format!(
+                "copy {id} at {start:#x}+{len:#x}: {:.2} ({:.0} runs wanted each time)",
+                *trips as f64 / frames,
+                *wanted as f64 / (*trips).max(1) as f64
+            )
+        })
+        .collect();
+    tracing::info!(
+        "card copies' pages over the runs left (VICTORY_MERGE_RUNS) per frame, by copy, the most of {count}: {}",
+        most.join("; ")
+    );
+}
+
+/// Diagnostics: the three commonest of `values`, as "value x times", the
+/// most first.
+#[cfg(feature = "diagnostics")]
+fn commonest(values: impl Iterator<Item = usize>) -> String {
+    let mut counts: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+    for v in values {
+        *counts.entry(v).or_default() += 1;
+    }
+    let mut counts: Vec<(usize, u64)> = counts.into_iter().collect();
+    counts.sort_by_key(|c| (std::cmp::Reverse(c.1), c.0));
+    let shown: Vec<String> = counts.iter().take(3).map(|c| format!("{} x{}", c.0, c.1)).collect();
+    if shown.is_empty() { "none".into() } else { shown.join(", ") }
+}
+
+/// Diagnostics: bytes as hexadecimal pairs.
+#[cfg(feature = "diagnostics")]
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// `runs` (in order) with those a gap of `gap` bytes or fewer apart made
 /// one run, the gap's bytes included.
 fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
@@ -3056,6 +3190,17 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            #[cfg(feature = "diagnostics")]
+            declared_by: AtomicU8::new(0),
+        }
+    }
+
+    /// Diagnostics: shader writes to the copy are declared by `by`
+    /// ([`DECLARED_ROOT`] and the others).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn declared_by(&self, by: u8) {
+        if self.declared_by.load(Ordering::Relaxed) & by != by {
+            self.declared_by.fetch_or(by, Ordering::Relaxed);
         }
     }
 
@@ -3843,6 +3988,8 @@ impl Shadow {
                         MERGED[MERGED_OVER].fetch_add(1, Ordering::Relaxed);
                         MERGED[MERGED_OVER + 1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         MERGED[MERGED_OVER + 2].fetch_add(*runs_left as u64, Ordering::Relaxed);
+                        #[cfg(feature = "diagnostics")]
+                        self.over_cap_said(lo, (a, e), title, held, &runs, *runs_left);
                         return true;
                     }
                     *runs_left -= runs.len();
@@ -3897,6 +4044,84 @@ impl Shadow {
             }
         }
         false
+    }
+
+    /// Diagnostics, where [`Shadow::merge_under_writes`] settles for a page
+    /// of a copy in the card's memory with more changed runs than are left
+    /// (`VICTORY_MERGE_RUNS`): counted per copy for the frame-rate line
+    /// ([`over_cap_line`]), and said (the first 16 times, then one in 256)
+    /// with what tells the table apart: the copy, who declared its shader
+    /// writes, the page (title address `page`, in the declared range
+    /// `declared`), the runs (`runs`, offsets in the page) and the commonest
+    /// gaps between their starts and lengths, whether the card's compare
+    /// ever found the page written by shaders, and the first runs' bytes as
+    /// the CPU's side holds them (`held`) and as title memory has them now
+    /// (`title`).
+    #[cfg(feature = "diagnostics")]
+    fn over_cap_said(&self, page: usize, declared: (usize, usize), title: &[u8], held: &[u8], runs: &[(usize, usize)], left: usize) {
+        let frame = crate::frame::current();
+        {
+            let mut by = OVER_CAP_BY_COPY.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = by.entry(self.id).or_insert((self.start, self.len, 0, 0));
+            entry.2 += 1;
+            entry.3 += runs.len() as u64;
+        }
+        let n = OVER_CAP_TRIPS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n > 16 && !n.is_multiple_of(256) {
+            return;
+        }
+        let start = self.start as usize;
+        let bytes: usize = runs.iter().map(|r| r.1).sum();
+        let (first, last) = (runs.first().map_or(0, |r| r.0), runs.last().map_or(0, |r| r.0 + r.1));
+        let gaps = commonest(runs.windows(2).map(|w| w[1].0 - w[0].0));
+        let lengths = commonest(runs.iter().map(|r| r.1));
+        let piece = page / PIECE - start / PIECE;
+        let compare = match self.card.as_ref().and_then(|c| c.dense.flagged_ago(piece, frame)) {
+            Some((ago, true)) => format!("last flagged the piece written by shaders {ago} frames ago"),
+            Some((ago, false)) => format!("never flagged the piece written by shaders (the copy was made {ago} frames ago)"),
+            None => "is not kept per piece".into(),
+        };
+        let shown: Vec<String> = runs
+            .iter()
+            .take(8)
+            .map(|&(r, m)| {
+                let k = m.min(16);
+                let more = if m > k { "..." } else { "" };
+                format!("+{r:#x} {m}: {}{more} -> {}{more}", hex(&held[r..r + k]), hex(&title[r..r + k]))
+            })
+            .collect();
+        let by = self.declared_by.load(Ordering::Relaxed);
+        let declarers: Vec<&str> = [
+            (DECLARED_ROOT, "a root unordered access view"),
+            (DECLARED_VIEW, "a buffer view"),
+            (DECLARED_MEMORY_NEW, "memory: numbered just now"),
+            (DECLARED_MEMORY_NAMED, "memory: named by a dispatch"),
+            (DECLARED_MEMORY_MARKED, "memory: marked by shaders lately"),
+        ]
+        .iter()
+        .filter(|d| by & d.0 != 0)
+        .map(|d| d.1)
+        .collect();
+        tracing::info!(
+            "a card copy's page over the runs left (VICTORY_MERGE_RUNS), trip {n} (the first 16, then one in 256), frame {frame}: \
+             copy {} at title {start:#x}..{:#x} ({} bytes, buffers of {} bytes in the {} memory{}), shader writes declared by {}; \
+             the page from {page:#x} (offset {:#x} in the copy) in the declared range {:#x}..{:#x}; {} runs wanted with {left} left, \
+             {bytes} bytes changed from +{first:#x} to +{last:#x} of the page; the commonest gaps between run starts \
+             (bytes x times): {gaps}; run lengths: {lengths}; the card's compare {compare}; the first runs (offset in the page, \
+             bytes: the CPU's side -> title memory): {}",
+            self.id,
+            start + self.len as usize,
+            self.len,
+            self.card.as_ref().map_or(self.len, |c| c.size),
+            if self.card.is_some() { "card's" } else { "PC's" },
+            if self.window { ", a window outside buffers" } else { "" },
+            if declarers.is_empty() { "nothing recorded".into() } else { declarers.join(", ") },
+            page - start,
+            declared.0,
+            declared.1,
+            runs.len(),
+            shown.join("; "),
+        );
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -4108,6 +4333,15 @@ impl Shadow {
         match dirty.last_mut() {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
+        }
+    }
+
+    /// A landing found piece `piece` of the copy (numbered as the compare
+    /// numbers them, [`CardSpan::first`]) flagged by its flight's compare:
+    /// shaders wrote it ([`Dense`]; nothing if not kept).
+    pub(crate) fn card_flagged(&self, piece: u32) {
+        if let Some(at) = self.card.as_ref().and_then(|c| c.dense.flagged.get(piece as usize)) {
+            at.store(crate::frame::current() + 1, Ordering::Relaxed);
         }
     }
 
@@ -4575,6 +4809,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     size,
+                    dense: Dense::new(size),
                 };
                 (on_card, Some(card))
             }
@@ -4791,6 +5026,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 size: len,
+                dense: Dense::new(len),
             };
             (on_card, Some(card))
         }
@@ -4999,7 +5235,7 @@ mod window_tests {
 
 #[cfg(test)]
 mod card_merge_tests {
-    use super::{Both, Card, Shadow};
+    use super::{Both, Card, Dense, Shadow};
     use std::sync::Mutex;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     use windows::Win32::Graphics::Direct3D12::*;
@@ -5071,6 +5307,7 @@ mod card_merge_tests {
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
+                dense: Dense::default(),
             });
             // As `card_dirty` with the mark set by the old-way fetch.
             if let Some(card) = &shadow.card {
@@ -5234,6 +5471,7 @@ mod card_merge_tests {
                 sent: Mutex::default(),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
+                dense: Dense::default(),
             });
             let mut slot = content.clone();
             slot[both_byte] ^= 0xc3;

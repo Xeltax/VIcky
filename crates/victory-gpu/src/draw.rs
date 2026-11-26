@@ -1456,6 +1456,8 @@ impl State {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
+                #[cfg(feature = "diagnostics")]
+                s.declared_by(crate::shadow::DECLARED_ROOT);
                 s.gpu_writes(list, a, len);
             }
         };
@@ -3541,6 +3543,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
+                #[cfg(feature = "diagnostics")]
+                shadow.declared_by(crate::shadow::DECLARED_VIEW);
                 shadow.gpu_writes(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]

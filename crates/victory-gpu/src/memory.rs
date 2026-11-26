@@ -721,6 +721,14 @@ pub(crate) fn ready(
                     }
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            shadow.declared_by(if is_new {
+                crate::shadow::DECLARED_MEMORY_NEW
+            } else if is_named {
+                crate::shadow::DECLARED_MEMORY_NAMED
+            } else {
+                crate::shadow::DECLARED_MEMORY_MARKED
+            });
             if whole || runs.is_empty() {
                 shadow.gpu_writes(list, start, len);
             } else {

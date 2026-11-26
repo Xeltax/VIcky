@@ -2292,6 +2292,31 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
     flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect()
 }
 
+/// [`relay`], as flights land (`Host::relay_land`, before their pieces are
+/// fetched): the pieces their compares flagged (all of a range the card
+/// did not compare) are noted on their copies as written by shaders in
+/// this frame (`Shadow::card_flagged`, kept with
+/// `crate::shadow::dense_tracked`).
+fn card_flags_noted(plans: &[(u64, &CardPlan)]) {
+    let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(work) = work.as_ref() else {
+        return;
+    };
+    // SAFETY: the mapping of the results. The compares of these plans have
+    // run, and their dwords are given to no other plan before these are
+    // done with (`card_done`).
+    let differs = unsafe { std::slice::from_raw_parts(work.differs.1 as *const u32, (work.differs.2 / 4) as usize) };
+    for (_, plan) in plans {
+        for r in &plan.ranges {
+            for p in 0..r.span.pieces {
+                if !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| d != 0) {
+                    r.shadow.card_flagged(r.span.first + p);
+                }
+            }
+        }
+    }
+}
+
 /// Whether pieces fetched on a copy queue beside later flights are fetched
 /// again when those flights land (`VICTORY_QUEUE2_REFETCH=0`: not, as
 /// before; on by default with `VICTORY_QUEUE2` bit 1).
@@ -3595,6 +3620,8 @@ fn late_line(frames: f64) {
             per_trip(wanted),
             per_trip(left),
         );
+        #[cfg(feature = "diagnostics")]
+        crate::shadow::over_cap_line(frames);
     }
 }
 
@@ -4971,6 +4998,9 @@ impl Host {
                 let plans: Vec<(u64, &CardPlan)> = flights.iter().filter_map(|f| f.card.as_ref().map(|card| (f.number, card))).collect();
                 let behind = flights.iter().map(|f| f.fence).max().unwrap_or(0);
                 let landed = flights.iter().map(|f| f.number).max().unwrap_or(0);
+                if crate::shadow::dense_tracked() {
+                    card_flags_noted(&plans);
+                }
                 self.relay_card_back(&plans, fetch, behind, landed);
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
