@@ -2871,7 +2871,9 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         }
         line.written.clone()
     };
-    blocked_by(&written, runs, true)
+    let why = blocked_by(&written, runs, true);
+    fill_ahead::passed(why.is_none());
+    why
 }
 
 /// [`late_blocked`] against `written`, the title memory flights' shaders
@@ -2893,10 +2895,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
-                            if count {
-                                fill_ahead::read(src, len);
-                            }
+                        if !touches(written, dst, dst + len) && fill_ahead::ahead(src, len, count) {
                             continue;
                         }
                         if count {
@@ -2911,10 +2910,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
-                        if fill_ahead::on() {
-                            if count {
-                                fill_ahead::read(src, len);
-                            }
+                        if fill_ahead::ahead(src, len, count) {
                             continue;
                         }
                         if count {
@@ -2983,9 +2979,34 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 /// lands (the bytes going into title memory are compared with the ones
 /// there, over every fill that read ahead of them) and from then on fills
 /// wait as before. `VICTORY_FILL_WAIT=1`: they wait from the start.
+///
+/// VIcky (`VICTORY_FILL_LATCH_PIECE=1`; off by default): the latch is kept
+/// per 64 KiB piece of title memory instead of for the whole run. A fill
+/// that read bytes a flight then changed makes only the fills that read the
+/// same piece wait for flights from then on; fills of other pieces go on
+/// ahead and keep the check that latched this one, so each piece draws with
+/// old bytes at most once, as the whole run did before. Why: the latch
+/// tripped six times in the logs on disk, always on the same 8 bytes
+/// (0xd6ab9c8c0, far from the title's 174 MB buffer), and from then on
+/// every frame waited for the per-draw constants in that buffer (run RT78b:
+/// one settle a frame, 27 to 39 ms of the submitting thread). Why 64 KiB:
+/// it is the piece fills are already looked up by, a latched piece is one
+/// key in a small map, and the waits that followed the latch in those runs
+/// were all in other pieces; a narrower latch would let more neighbouring
+/// bytes each draw old bytes once before they latch too.
+/// `VICTORY_FILL_LATCH_DECAY=<frames>` (by piece only; unset or 0: never):
+/// a piece lets go after that many frames in which no fill of it read, or
+/// waiting would have read, bytes a flight changed (the fills that wait for
+/// a latched piece are checked like the ones that go ahead). By piece, a
+/// fill is noted as read ahead only once its submission is known to go
+/// without waiting first: before, a fill ahead of a step that waited was
+/// noted although it read after the wait, and a flight landed by that wait
+/// could trip the latch for a race that never happened (whether the six
+/// trips were such is not known).
 mod fill_ahead {
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    use std::collections::hash_map::Entry;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
     use std::sync::{Mutex, OnceLock};
 
     /// Fills are looked up by the 64 KiB of title memory they read.
@@ -2999,17 +3020,22 @@ mod fill_ahead {
     static WAIT: AtomicBool = AtomicBool::new(false);
     /// Since the last frame line: fills that read ahead; landings' writes
     /// that touched one's piece. Since the start: fills that read bytes a
-    /// flight then changed.
-    static COUNT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    /// flight then changed. By piece: since the last frame line, fills that
+    /// waited for a latched piece and the microseconds those waits took;
+    /// since the start, such fills whose bytes a flight then changed (the
+    /// wait was needed), pieces let go, latches (a piece latching again
+    /// after it was let go counts again), and fills that waited.
+    static COUNT: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
     #[derive(Default)]
     struct Piece {
         /// The frame its old fills were last dropped in.
         pruned: u64,
-        /// From, to, frame, and the number of the last submission started
-        /// when it read: the flights in the air then have that number or
-        /// a lower one, and only their writes can be ones it missed.
-        fills: Vec<(usize, usize, u64, u64)>,
+        /// From, to, frame, the number of the last submission started
+        /// when it read (the flights in the air then have that number or
+        /// a lower one, and only their writes can be ones it missed), and
+        /// whether it waited for them (a latched piece) instead.
+        fills: Vec<(usize, usize, u64, u64, bool)>,
     }
 
     /// The lowest submission number among the flights the landing thread
@@ -3030,23 +3056,194 @@ mod fill_ahead {
         *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
     }
 
-    /// A fill reads `len` bytes at `src` ahead of flights that may write
-    /// them.
-    pub(super) fn read(src: usize, len: usize) {
-        if len == 0 {
+    /// `VICTORY_FILL_LATCH_PIECE=1`: the latch is per piece ([`Latch`]).
+    pub(super) fn by_piece() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_LATCH_PIECE").is_some_and(|v| v == "1"))
+    }
+
+    /// `VICTORY_FILL_LATCH_DECAY=<frames>`: how long a piece stays latched
+    /// after its last race; 0: for good.
+    fn decay() -> u64 {
+        static FRAMES: OnceLock<u64> = OnceLock::new();
+        *FRAMES.get_or_init(|| {
+            std::env::var("VICTORY_FILL_LATCH_DECAY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+        })
+    }
+
+    /// The pieces whose fills wait for flights (`VICTORY_FILL_LATCH_PIECE=1`).
+    #[derive(Default)]
+    pub(super) struct Latch {
+        /// A latched piece, and the last frame a fill of it read (or,
+        /// waiting, would have read) bytes a flight changed.
+        pieces: HashMap<usize, u64>,
+        /// Every piece that ever latched.
+        ever: HashSet<usize>,
+    }
+
+    impl Latch {
+        /// Whether a fill of `len` bytes at `src` reads a latched piece in
+        /// `frame`, and how many pieces were let go first: with `decay`
+        /// (frames; 0: never), a piece whose last race is more than that
+        /// old.
+        pub(super) fn holds(&mut self, src: usize, len: usize, frame: u64, decay: u64) -> (bool, u64) {
+            let (mut held, mut let_go) = (false, 0);
+            if len == 0 || self.pieces.is_empty() {
+                return (false, 0);
+            }
+            for piece in src / PIECE..=(src + len - 1) / PIECE {
+                let Some(&last) = self.pieces.get(&piece) else { continue };
+                if decay != 0 && frame > last.saturating_add(decay) {
+                    self.pieces.remove(&piece);
+                    let_go += 1;
+                    continue;
+                }
+                held = true;
+            }
+            (held, let_go)
+        }
+
+        /// A flight changed bytes `[from, to)` a fill read (or waited to
+        /// read), seen in `frame`: their pieces latch, or stay latched from
+        /// `frame` on. The pieces that were not latched, each with whether
+        /// it had latched before (and was let go since).
+        pub(super) fn race(&mut self, from: usize, to: usize, frame: u64) -> Vec<(usize, bool)> {
+            let mut new = Vec::new();
+            if from >= to {
+                return new;
+            }
+            for piece in from / PIECE..=(to - 1) / PIECE {
+                match self.pieces.entry(piece) {
+                    Entry::Occupied(mut o) => *o.get_mut() = (*o.get()).max(frame),
+                    Entry::Vacant(v) => {
+                        v.insert(frame);
+                        new.push((piece, !self.ever.insert(piece)));
+                    }
+                }
+            }
+            new
+        }
+    }
+
+    static LATCH: Mutex<Option<Latch>> = Mutex::new(None);
+    /// How many pieces [`LATCH`] holds: none, nothing to look up.
+    static LATCHED: AtomicUsize = AtomicUsize::new(0);
+    /// The last fill [`ahead`] counted waited for a latched piece: the
+    /// submission's wait is timed for it (`blocked_by_latch`).
+    static BLOCKED: AtomicBool = AtomicBool::new(false);
+
+    /// Whether a fill of `len` bytes at `src` reads a latched piece now.
+    fn held(src: usize, len: usize) -> bool {
+        if LATCHED.load(Relaxed) == 0 {
+            return false;
+        }
+        let frame = crate::frame::current();
+        let (held, let_go) = {
+            let mut latch = LATCH.lock().unwrap_or_else(|e| e.into_inner());
+            let latch = latch.get_or_insert_with(Latch::default);
+            let r = latch.holds(src, len, frame, decay());
+            LATCHED.store(latch.pieces.len(), Relaxed);
+            r
+        };
+        if let_go != 0 {
+            let n = COUNT[6].fetch_add(let_go, Relaxed) + let_go;
+            if n <= 16 {
+                tracing::info!(
+                    "fill latch by piece: the 64 KiB at {:#x} goes ahead of flights again in frame {frame}: no fill of it read, or \
+                     waiting would have read, bytes a flight changed for VICTORY_FILL_LATCH_DECAY={} frames ({n} pieces let go)",
+                    src / PIECE * PIECE,
+                    decay()
+                );
+            }
+        }
+        held
+    }
+
+    /// Whether a fill of `len` bytes at `src` (or a title buffer copy that
+    /// only reads there), which reads title memory flights may write, goes
+    /// ahead of them; with `count` it is noted, to be checked when they
+    /// land. Waiting by piece, it is noted too: whether a flight then
+    /// changes its bytes says if the wait was needed, and keeps the piece
+    /// latched.
+    pub(super) fn ahead(src: usize, len: usize, count: bool) -> bool {
+        if !on() {
+            return false;
+        }
+        if by_piece() && held(src, len) {
+            if count {
+                BLOCKED.store(true, Relaxed);
+                COUNT[3].fetch_add(1, Relaxed);
+                COUNT[8].fetch_add(1, Relaxed);
+                note(&[(src, len)], true);
+            }
+            return false;
+        }
+        if count {
+            if by_piece() {
+                PENDING.lock().unwrap_or_else(|e| e.into_inner()).push((src, len));
+            } else {
+                note(&[(src, len)], false);
+            }
+        }
+        true
+    }
+
+    /// By piece: the fills a pass of [`super::blocked_by`] lets go ahead,
+    /// noted only if the submission does not wait ([`passed`]). A fill
+    /// before a step that waits reads after the wait, not ahead of the
+    /// flights it lands; noted as ahead, a flight that changed its bytes
+    /// would latch its piece for a race that did not happen.
+    static PENDING: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+    /// A pass of [`super::late_blocked`] ended: the submission goes
+    /// (`ahead`) or waits first, and is looked at again after the wait.
+    pub(super) fn passed(ahead: bool) {
+        if !by_piece() {
             return;
         }
-        COUNT[0].fetch_add(1, Relaxed);
+        let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        if ahead {
+            note(&pending, false);
+        }
+        pending.clear();
+    }
+
+    /// Whether the wait [`super::late_blocked`] just asked for is one for a
+    /// latched piece (`VICTORY_FILL_LATCH_PIECE=1`).
+    pub(super) fn blocked_by_latch() -> bool {
+        BLOCKED.swap(false, Relaxed)
+    }
+
+    /// How long that wait took.
+    pub(super) fn latch_waited(took: std::time::Duration) {
+        COUNT[4].fetch_add(took.as_micros() as u64, Relaxed);
+    }
+
+    /// Fills (source, length) read ahead of flights that may write them,
+    /// or (`waited`) wait for them because their piece is latched.
+    fn note(fills: &[(usize, usize)], waited: bool) {
+        if fills.is_empty() {
+            return;
+        }
         let frame = crate::frame::current();
+        let started = super::STARTED.load(Relaxed);
         let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
         let map = read.get_or_insert_with(HashMap::new);
-        for piece in src / PIECE..=(src + len - 1) / PIECE {
-            let p = map.entry(piece).or_default();
-            if p.pruned != frame {
-                p.pruned = frame;
-                p.fills.retain(|f| f.2 + KEEP >= frame);
+        for &(src, len) in fills {
+            if len == 0 {
+                continue;
             }
-            p.fills.push((src, src + len, frame, super::STARTED.load(Relaxed)));
+            if !waited {
+                COUNT[0].fetch_add(1, Relaxed);
+            }
+            for piece in src / PIECE..=(src + len - 1) / PIECE {
+                let p = map.entry(piece).or_default();
+                if p.pruned != frame {
+                    p.pruned = frame;
+                    p.fills.retain(|f| f.2 + KEEP >= frame);
+                }
+                p.fills.push((src, src + len, frame, started, waited));
+            }
         }
     }
 
@@ -3058,7 +3255,7 @@ mod fill_ahead {
         }
         let frame = crate::frame::current();
         let landing = LANDING.load(Relaxed);
-        let hits: Vec<(usize, usize, u64)> = {
+        let hits: Vec<(usize, usize, u64, bool)> = {
             let read = READ.lock().unwrap_or_else(|e| e.into_inner());
             let Some(map) = read.as_ref() else { return };
             let end = at + new.len();
@@ -3066,7 +3263,7 @@ mod fill_ahead {
                 .filter_map(|piece| map.get(&piece))
                 .flat_map(|p| p.fills.iter().copied())
                 .filter(|f| f.0 < end && f.1 > at && f.2 + KEEP >= frame && (landing == 0 || landing <= f.3))
-                .map(|f| (f.0, f.1, f.2))
+                .map(|f| (f.0, f.1, f.2, f.4))
                 .collect()
         };
         if hits.is_empty() {
@@ -3074,7 +3271,7 @@ mod fill_ahead {
         }
         COUNT[1].fetch_add(1, Relaxed);
         let mut now = Vec::new();
-        for (from, to, read_in) in hits {
+        for (from, to, read_in, waited) in hits {
             let (a, b) = (from.max(at), to.min(at + new.len()));
             now.clear();
             now.resize(b - a, 0);
@@ -3083,8 +3280,46 @@ mod fill_ahead {
             if !super::read_into(a as *const u8, &mut now) || now[..] == new[a - at..b - at] {
                 continue;
             }
-            let n = COUNT[2].fetch_add(1, Relaxed) + 1;
             let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
+            if by_piece() {
+                // Every fill is looked at: other pieces may have raced in
+                // the same landing. (A fill read ahead of the flights and a
+                // fill of the same bytes that waited for them may both be
+                // here; each piece is latched once.)
+                let (new_pieces, latched, ever) = {
+                    let mut latch = LATCH.lock().unwrap_or_else(|e| e.into_inner());
+                    let latch = latch.get_or_insert_with(Latch::default);
+                    let new_pieces = latch.race(a, b, frame);
+                    LATCHED.store(latch.pieces.len(), Relaxed);
+                    (new_pieces, latch.pieces.len(), latch.ever.len())
+                };
+                COUNT[7].fetch_add(new_pieces.len() as u64, Relaxed);
+                if waited {
+                    COUNT[5].fetch_add(1, Relaxed);
+                    continue;
+                }
+                let n = COUNT[2].fetch_add(1, Relaxed) + 1;
+                // Each piece the first time it latches (the first 256), and
+                // the first 64 latches of pieces let go before.
+                for (piece, again) in new_pieces {
+                    let say = if again { COUNT[7].load(Relaxed) <= 64 } else { ever <= 256 };
+                    if say {
+                        tracing::warn!(
+                            "fill latch by piece (VICTORY_FILL_LATCH_PIECE=1): a fill of upload memory read {} bytes at {from:#x} in \
+                             frame {read_in} ahead of a flight whose shaders changed them (first at {:#x}, landed in frame {frame}): \
+                             the lists of that submission drew with the bytes from before. Fills that read the 64 KiB at {:#x} wait \
+                             for flights from here on{}; other pieces go on ahead ({latched} pieces latched; {n} such fills since \
+                             the start)",
+                            to - from,
+                            a + first,
+                            piece * PIECE,
+                            if again { " (again: it had been let go)" } else { "" }
+                        );
+                    }
+                }
+                continue;
+            }
+            let n = COUNT[2].fetch_add(1, Relaxed) + 1;
             if !WAIT.swap(true, Relaxed) {
                 tracing::warn!(
                     "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
@@ -3100,8 +3335,8 @@ mod fill_ahead {
 
     /// With the frame line.
     pub(super) fn line(frames: f64) {
-        let [ahead, looked] = [0, 1].map(|i| COUNT[i].swap(0, Relaxed));
-        if ahead == 0 && looked == 0 {
+        let [ahead, looked, waits, waited_us] = [0, 1, 3, 4].map(|i| COUNT[i].swap(0, Relaxed));
+        if ahead == 0 && looked == 0 && waits == 0 {
             return;
         }
         let kept = {
@@ -3115,15 +3350,111 @@ mod fill_ahead {
                 map.values().map(|p| p.fills.len()).sum::<usize>()
             })
         };
+        let by = if by_piece() {
+            let (now, ever) = {
+                let latch = LATCH.lock().unwrap_or_else(|e| e.into_inner());
+                latch.as_ref().map_or((0, 0), |l| (l.pieces.len(), l.ever.len()))
+            };
+            format!(
+                "; by piece (VICTORY_FILL_LATCH_PIECE=1): {now} pieces of 64 KiB latched ({ever} ever, {} latches, {} let go \
+                 after VICTORY_FILL_LATCH_DECAY={} frames); fills that waited for a latched piece: {:.2} per frame, {:.1} ms \
+                 per frame, {} since the start, {} of them needed (a flight then changed their bytes)",
+                COUNT[7].load(Relaxed),
+                COUNT[6].load(Relaxed),
+                decay(),
+                waits as f64 / frames,
+                waited_us as f64 / 1000.0 / frames,
+                COUNT[8].load(Relaxed),
+                COUNT[5].load(Relaxed)
+            )
+        } else {
+            String::new()
+        };
         tracing::info!(
             "fills of upload memory that read title memory flights may write, not waited for (VICTORY_FILL_WAIT=1 waits): {:.1} per \
              frame; {:.1} landings' writes per frame fell in the same 64 KiB as one and were compared with it; fills that read \
-             bytes a flight then changed, since the start: {}{}; {kept} fills kept to check",
+             bytes a flight then changed, since the start: {}{}; {kept} fills kept to check{by}",
             ahead as f64 / frames,
             looked as f64 / frames,
             COUNT[2].load(Relaxed),
             if WAIT.load(Relaxed) { " (fills wait again)" } else { "" }
         );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Latch, PIECE};
+
+        /// A race latches the piece of the bytes it changed, and only that
+        /// piece: fills of other pieces stay ahead; without decay it holds
+        /// for good.
+        #[test]
+        fn a_race_latches_only_its_piece() {
+            let mut latch = Latch::default();
+            let at = 0xd_6ab9_c8c0usize;
+            assert_eq!(latch.holds(at, 8, 2100, 0), (false, 0));
+            assert_eq!(latch.race(at, at + 8, 2100), [(at / PIECE, false)]);
+            // Racing again in the same piece latches nothing new.
+            assert!(latch.race(at + 8, at + 16, 2101).is_empty());
+            // Other bytes of the same 64 KiB wait too.
+            assert_eq!(latch.holds(at, 8, 2101, 0), (true, 0));
+            assert_eq!(latch.holds(at & !(PIECE - 1), 16, 2101, 0), (true, 0));
+            // A fill from the piece before that runs into it waits.
+            assert_eq!(latch.holds((at & !(PIECE - 1)) - 8, 16, 2101, 0), (true, 0));
+            // The pieces around it, and the per-draw constants far away, go
+            // on ahead.
+            assert_eq!(latch.holds((at & !(PIECE - 1)) - 16, 16, 2101, 0), (false, 0));
+            assert_eq!(latch.holds((at | (PIECE - 1)) + 1, 480, 2101, 0), (false, 0));
+            assert_eq!(latch.holds(0x1b55_f270, 16, 2101, 0), (false, 0));
+            // Nothing read: nothing waits.
+            assert_eq!(latch.holds(at, 0, 2101, 0), (false, 0));
+            // No decay: still latched much later.
+            assert_eq!(latch.holds(at, 8, 1 << 40, 0), (true, 0));
+        }
+
+        /// Bytes that straddle two pieces latch both.
+        #[test]
+        fn a_race_over_two_pieces_latches_both() {
+            let mut latch = Latch::default();
+            let edge = 0x1_0000_0000usize;
+            let new = latch.race(edge - 4, edge + 4, 7);
+            assert_eq!(new, [(edge / PIECE - 1, false), (edge / PIECE, false)]);
+            assert_eq!(latch.holds(edge - PIECE, 4, 8, 0), (true, 0));
+            assert_eq!(latch.holds(edge + PIECE - 4, 4, 8, 0), (true, 0));
+            assert_eq!(latch.holds(edge + PIECE, 4, 8, 0), (false, 0));
+            // Empty or reversed: nothing.
+            assert!(latch.race(edge + 2 * PIECE, edge + 2 * PIECE, 9).is_empty());
+            assert!(latch.race(edge + 3 * PIECE, edge + 2 * PIECE, 9).is_empty());
+        }
+
+        /// With decay, a piece lets go once it has not raced for that many
+        /// frames; a race (or a waited fill whose bytes changed) keeps it;
+        /// latching again after it was let go is told apart.
+        #[test]
+        fn a_latched_piece_lets_go_after_decay_frames_without_a_race() {
+            let mut latch = Latch::default();
+            let at = 0x40_0000usize;
+            latch.race(at, at + 8, 100);
+            assert_eq!(latch.holds(at, 8, 150, 50), (true, 0));
+            // Raced again (a fill that waited would have read old bytes).
+            assert!(latch.race(at, at + 8, 140).is_empty());
+            assert_eq!(latch.holds(at, 8, 190, 50), (true, 0));
+            // Older frames do not move it back.
+            assert!(latch.race(at, at + 8, 120).is_empty());
+            assert_eq!(latch.holds(at, 8, 190, 50), (true, 0));
+            // Quiet for more than 50 frames: let go, once.
+            assert_eq!(latch.holds(at, 8, 191, 50), (false, 1));
+            assert_eq!(latch.holds(at, 8, 192, 50), (false, 0));
+            // It races again: latched again, known.
+            assert_eq!(latch.race(at, at + 8, 300), [(at / PIECE, true)]);
+            assert_eq!(latch.holds(at, 8, 301, 50), (true, 0));
+            // Another piece that never raced is not touched by the decay.
+            let other = at + 4 * PIECE;
+            latch.race(other, other + 8, 300);
+            assert_eq!(latch.holds(other, 8, 1000, 0), (true, 0));
+            assert_eq!(latch.holds(at, 8, 1000, 0), (true, 0));
+            assert_eq!(latch.holds(other, 8, 1000, 50), (false, 1));
+        }
     }
 }
 
@@ -5969,13 +6300,32 @@ impl Host {
         // what they write.
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
-        } else if let Some(why) = late_blocked(runs) {
-            if relay_exact() && why == WHY_READ {
-                // Only until the flights that may write what is read have
-                // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
-            } else {
-                self.settle(&mut submitted, why);
+        } else if let Some(mut why) = late_blocked(runs) {
+            loop {
+                // VIcky (`VICTORY_FILL_LATCH_PIECE=1`): a wait for a fill
+                // of a latched piece is timed (`fill_ahead`).
+                let latch = fill_ahead::blocked_by_latch().then(std::time::Instant::now);
+                if relay_exact() && why == WHY_READ {
+                    // Only until the flights that may write what is read have
+                    // landed: their copy-back's end, not the card's other work.
+                    relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                } else {
+                    self.settle(&mut submitted, why);
+                }
+                if let Some(waited) = latch {
+                    fill_ahead::latch_waited(waited.elapsed());
+                }
+                // By piece, a pass that waits notes no fill as read ahead:
+                // the fills that go ahead of what is still in the air are
+                // noted now, and a piece latched by a landing meanwhile can
+                // make this submission wait again.
+                if !fill_ahead::by_piece() {
+                    break;
+                }
+                match late_blocked(runs) {
+                    Some(again) => why = again,
+                    None => break,
+                }
             }
         }
         // Descriptors the title copied into placed heaps directly, before
