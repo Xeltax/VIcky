@@ -188,6 +188,11 @@ pub(crate) enum C {
     GuardHotMade,
     GuardHotRetests,
     GuardHotCooled,
+    /// Questions whether memory is uncommitted answered by a run asked
+    /// about before (`VICTORY_GUARD_ABSENT_KNOWN`), and blocks noted absent
+    /// that a question found committed (nobody told us of the commit).
+    GuardQueriesSaved,
+    GuardAbsentFound,
 }
 const COUNTERS: usize = 128;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1189,7 +1194,7 @@ pub(crate) fn log(frames: f64) {
          {:.0} written ({:.0} of them still read-only), {:.0} absent, {:.0} clean; \
          {:.0} waits for their lock {:.2} ms, held {:.2} ms finding all clean and {:.2} ms \
          walking: {:.0} calls making {:.0} blocks read-only {:.2} ms ({:.0} blocks would not), \
-         {:.0} questions whether memory is uncommitted {:.2} ms, {:.0} lookups of other views \
+         {:.0} questions whether memory is uncommitted {:.2} ms{}, {:.0} lookups of other views \
          {:.2} ms, {:.0} other views made read-only {:.2} ms, the rest {:.2} ms{}; \
          summary checks since the start: {} of {} differed); \
          {:.1} MB copied whole (memory not watched); {:.1} frame waits \
@@ -1226,6 +1231,7 @@ pub(crate) fn log(frames: f64) {
         c[C::GuardProtectFailed as usize],
         c[C::GuardQueries as usize],
         c[C::GuardQueryNs as usize] / 1e6,
+        crate::watch::absent_clause(c[C::GuardQueriesSaved as usize], c[C::GuardAbsentFound as usize]),
         c[C::GuardViewLookups as usize],
         c[C::GuardViewLookupNs as usize] / 1e6,
         c[C::GuardViewProtects as usize],

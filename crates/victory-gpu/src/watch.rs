@@ -580,7 +580,9 @@ macro_rules! timed {
 /// ones still read-only by our hand; blocks noted absent that are still
 /// uncommitted; and with [`hot_frames`], blocks reported for being hot,
 /// blocks made hot, hot blocks guarded again to test them, and hot blocks
-/// guarded again for being reported too often ([`hot_ratio`]).
+/// guarded again for being reported too often ([`hot_ratio`]); questions
+/// whether memory is uncommitted answered by a run asked about before
+/// ([`absent_known`]), and blocks noted absent found committed.
 #[derive(Default)]
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 struct Tally {
@@ -591,6 +593,8 @@ struct Tally {
     made: u64,
     retests: u64,
     cooled: u64,
+    saved: u64,
+    found: u64,
 }
 
 impl Tally {
@@ -606,8 +610,162 @@ impl Tally {
             add(C::GuardHotMade, self.made);
             add(C::GuardHotRetests, self.retests);
             add(C::GuardHotCooled, self.cooled);
+            add(C::GuardQueriesSaved, self.saved);
+            add(C::GuardAbsentFound, self.found);
         }
     }
+}
+
+/// Whether a run of uncommitted blocks Windows was asked about answers for
+/// its blocks noted absent at later askings ([`uncommitted_run`]):
+/// `VICTORY_GUARD_ABSENT_KNOWN=1` in the same frame, `=forever` until the
+/// runtime remaps the run; unset, every asking asks again, as before.
+///
+/// Run RT75: 36,640 questions a frame (VirtualQuery, `uncommitted_end`),
+/// 23 ms of the walk's 32, for 58,458 blocks noted absent walked: the holes
+/// of view memory the copies' ranges cover, each asked about again at every
+/// asking that walks it. A block noted absent becomes committed when the
+/// runtime maps it, and the runtime says so ([`title_memory_remapped`],
+/// which lets go of its runs here). Whether nothing else commits such
+/// memory cannot be shown: the title's kernel32 imports the HLE does not
+/// take (VirtualAlloc, VirtualFree) reach Windows directly, a free gap can
+/// be taken by any allocator of the process, and Windows does not tell a
+/// placeholder from a reservation. With `=1` such a commit is seen at the
+/// frame's first asking that walks the block, as without the switch at the
+/// next asking; `=forever` sees none until the runtime remaps the range.
+/// Diagnostics count, on the frame line, the blocks noted absent that a
+/// question found committed (a commit nobody told us of), and with
+/// `VICTORY_GUARD_ABSENT_CHECK=1` one answer from a run in 64 is asked of
+/// Windows too and counted wrong if the block is committed ([`check_absent`]).
+fn absent_known() -> AbsentKnown {
+    #[cfg(test)]
+    if let Some(mode) = TEST_ABSENT_KNOWN.get() {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<AbsentKnown> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_GUARD_ABSENT_KNOWN").as_deref().map(str::trim) {
+        Ok("1") => AbsentKnown::Frame,
+        Ok("forever") => AbsentKnown::Forever,
+        _ => AbsentKnown::Off,
+    })
+}
+
+/// [`absent_known`]'s modes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AbsentKnown {
+    Off,
+    Frame,
+    Forever,
+}
+
+/// [`uncommitted_end`] for the walk, at a block noted absent. With
+/// [`absent_known`] the run of wholly uncommitted blocks Windows gave is
+/// kept, and a block in it is answered from it, in the same frame or until
+/// the runtime remaps it.
+fn uncommitted_run(g: &mut Guards, block: usize, tally: &mut Tally) -> usize {
+    let mode = absent_known();
+    if mode == AbsentKnown::Off {
+        return uncommitted_end(block);
+    }
+    if mode == AbsentKnown::Frame {
+        let frame = frame_now();
+        if g.uncommitted_frame != frame {
+            g.uncommitted_frame = frame;
+            g.uncommitted.clear();
+        }
+    }
+    // The runs do not overlap: the one starting last at or before `block`
+    // is the only one that can hold it.
+    if let Some((_, &end)) = g.uncommitted.range(..=block).next_back()
+        && block < end
+    {
+        tally.saved += 1;
+        #[cfg(feature = "diagnostics")]
+        check_absent(block);
+        return end;
+    }
+    let end = uncommitted_end(block);
+    if end > block {
+        // The run before ends at or before `block` (else it answered);
+        // the runs inside this one were asked about before it grew.
+        let inside: Vec<usize> = g.uncommitted.range(block + 1..end).map(|(&first, _)| first).collect();
+        for first in inside {
+            g.uncommitted.remove(&first);
+        }
+        g.uncommitted.insert(block, end);
+    }
+    end
+}
+
+/// The runs of [`uncommitted_run`] that touch blocks `[first, last)` are
+/// let go of (the runtime remapped them).
+fn forget_uncommitted(g: &mut Guards, first: usize, last: usize) {
+    if g.uncommitted.is_empty() || first >= last {
+        return;
+    }
+    let mut gone: Vec<usize> = g.uncommitted.range(first..last).map(|(&start, _)| start).collect();
+    if let Some((&start, &end)) = g.uncommitted.range(..first).next_back()
+        && end > first
+    {
+        gone.push(start);
+    }
+    for start in gone {
+        g.uncommitted.remove(&start);
+    }
+}
+
+/// `VICTORY_GUARD_ABSENT_CHECK`, since the start: answers from a run that
+/// were asked of Windows too, and of them the ones where the block was
+/// committed.
+#[cfg(feature = "diagnostics")]
+pub(crate) static ABSENT_CHECKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// With `VICTORY_GUARD_ABSENT_CHECK=1`, one answer from a run in 64: asks
+/// Windows too (not counted with the walk's questions) and counts it wrong
+/// if `block` is committed now (the first few said in the log).
+#[cfg(feature = "diagnostics")]
+fn check_absent(block: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static TURN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if !absent_check() || !TURN.fetch_add(1, Relaxed).is_multiple_of(64) {
+        return;
+    }
+    ABSENT_CHECKS[0].fetch_add(1, Relaxed);
+    if ask_uncommitted_end(block) <= block && ABSENT_CHECKS[1].fetch_add(1, Relaxed) < 32 {
+        tracing::warn!(
+            "VICTORY_GUARD_ABSENT_CHECK: block {:#x} was answered uncommitted from a run asked about before, and is committed",
+            block * BLOCK
+        );
+    }
+}
+
+/// `VICTORY_GUARD_ABSENT_CHECK=1`.
+#[cfg(feature = "diagnostics")]
+fn absent_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_ABSENT_CHECK").is_some_and(|v| v == "1"))
+}
+
+/// The frame line's words on the questions whether memory is uncommitted,
+/// given its counters per frame: answered from runs ([`absent_known`]),
+/// blocks noted absent found committed, and the checks.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn absent_clause(saved: f64, found: f64) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mode = match absent_known() {
+        AbsentKnown::Off => "",
+        AbsentKnown::Frame => " (VICTORY_GUARD_ABSENT_KNOWN=1)",
+        AbsentKnown::Forever => " (VICTORY_GUARD_ABSENT_KNOWN=forever)",
+    };
+    let checks = if absent_check() {
+        format!(", checks since the start: {} of {} answers wrong", ABSENT_CHECKS[1].load(Relaxed), ABSENT_CHECKS[0].load(Relaxed))
+    } else {
+        String::new()
+    };
+    format!(
+        " ({saved:.0} more answered by runs asked about before{mode}; {found:.1} blocks noted absent found committed \
+         with nothing said{checks})"
+    )
 }
 
 /// Blocks found written in this many frames in a row are left writable
@@ -929,6 +1087,11 @@ struct Guards {
     cool: BTreeMap<usize, u64>,
     /// The frame `streak` and `cool` were last pruned at.
     pruned: u64,
+    /// With [`absent_known`]: runs of wholly uncommitted blocks Windows was
+    /// asked about, first block to end (exclusive), none overlapping; with
+    /// `=1`, those of frame `uncommitted_frame`.
+    uncommitted: BTreeMap<usize, usize>,
+    uncommitted_frame: u64,
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -1251,6 +1414,10 @@ thread_local! {
     static TEST_HOT_RATIO: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     /// Tests: [`views_batch`] for this thread.
     static TEST_VIEWS_BATCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Tests: [`absent_known`] for this thread, and the questions whether
+    /// memory is uncommitted it asked.
+    static TEST_ABSENT_KNOWN: std::cell::Cell<Option<AbsentKnown>> = const { std::cell::Cell::new(None) };
+    static TEST_QUESTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static TEST_FRAME: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
@@ -1264,6 +1431,8 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     streak: BTreeMap::new(),
     cool: BTreeMap::new(),
     pruned: 0,
+    uncommitted: BTreeMap::new(),
+    uncommitted_frame: 0,
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -1425,13 +1594,17 @@ fn step(g: &mut Guards, block: usize, clean: bool, walk: Walk<'_>) {
     let mut open = !clean;
     if open && g.absent.contains(&block) {
         // Ordinary commits need no runtime mapping notification. Reuse
-        // this asking's query for the following blocks in the same region.
+        // this asking's query for the following blocks in the same region
+        // (with [`absent_known`], the frame's or an earlier one's).
         if block >= *uncommitted_until {
-            *uncommitted_until = uncommitted_end(block);
+            *uncommitted_until = uncommitted_run(g, block, tally);
         }
         open = block >= *uncommitted_until;
         if open {
+            // Committed with nothing said: a mapping of the runtime's
+            // takes its blocks out of `absent` (`title_memory_remapped`).
             g.absent.remove(&block);
+            tally.found += 1;
         } else {
             tally.absent += 1;
         }
@@ -1787,17 +1960,23 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     }
 }
 
-/// The end (exclusive) of the whole uncommitted blocks starting at `block`.
+/// The end (exclusive) of the whole uncommitted blocks starting at `block`
+/// (counted and timed with the walk's questions).
 fn uncommitted_end(block: usize) -> usize {
+    #[cfg(test)]
+    TEST_QUESTIONS.set(TEST_QUESTIONS.get() + 1);
+    timed!(GuardQueries, GuardQueryNs, ask_uncommitted_end(block))
+}
+
+/// [`uncommitted_end`], uncounted.
+fn ask_uncommitted_end(block: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
-    let n = timed!(GuardQueries, GuardQueryNs, unsafe {
-        VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info))
-    });
+    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
         (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
     } else {
@@ -2045,9 +2224,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in aliased {
         g.aliased.remove(&block);
     }
-    // Nor hot, nor found written lately, nor kept cold.
+    // Nor hot, nor found written lately, nor kept cold; nor known
+    // uncommitted.
     unhot(&mut g, at, at.saturating_add(len));
     let blocks = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    forget_uncommitted(&mut g, blocks.start, blocks.end);
     if !g.streak.is_empty() {
         let streak: Vec<usize> = g.streak.range(blocks.clone()).map(|(&b, _)| b).collect();
         for block in streak {
@@ -2703,7 +2884,18 @@ mod tests {
     /// ranges that cross the summary's words.
     #[test]
     fn the_summary_answers_as_the_set_does() {
-        the_summary_answers_as_the_set(None);
+        the_summary_answers_as_the_set(None, AbsentKnown::Off);
+    }
+
+    /// The same with the runs of uncommitted blocks kept for the frame
+    /// (`VICTORY_GUARD_ABSENT_KNOWN=1`), and kept until remapped with hot
+    /// blocks (`=forever`): the pages the test commits with nothing said are
+    /// seen alike at both views.
+    #[test]
+    fn the_summary_answers_as_the_set_does_with_absent_runs_known() {
+        let _alone = one_at_a_time();
+        the_summary_answers_as_the_set(None, AbsentKnown::Frame);
+        the_summary_answers_as_the_set(Some(2), AbsentKnown::Forever);
     }
 
     /// The same with hot blocks (`VICTORY_GUARD_HOT=2`), the frames going
@@ -2712,21 +2904,22 @@ mod tests {
     /// views, and are tested again after `HOT_RETEST` frames.
     #[test]
     fn the_summary_answers_as_the_set_does_with_hot_blocks() {
-        let _alone = hot_test();
-        the_summary_answers_as_the_set(Some(2));
+        let _alone = one_at_a_time();
+        the_summary_answers_as_the_set(Some(2), AbsentKnown::Off);
     }
 
-    /// The tests with hot blocks, one at a time. Each test numbers its own
-    /// frames ([`TEST_FRAME`]), and the first asking of a frame lets go of
-    /// the streaks of blocks not found written in the frame before: a test
-    /// at frame 5,000 would let go of those of a test at frame 11 (the
-    /// runtime has one count of frames).
-    fn hot_test() -> std::sync::MutexGuard<'static, ()> {
+    /// The tests with hot blocks or runs of uncommitted blocks kept, one at
+    /// a time. Each test numbers its own frames ([`TEST_FRAME`]), and the
+    /// first asking of a frame lets go of the streaks of blocks not found
+    /// written in the frame before, and of the runs asked about in the frame
+    /// before: a test at frame 5,000 would let go of those of a test at
+    /// frame 11 (the runtime has one count of frames).
+    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
         static ONE: Mutex<()> = Mutex::new(());
         ONE.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn the_summary_answers_as_the_set(hot: Option<u64>) {
+    fn the_summary_answers_as_the_set(hot: Option<u64>, absent: AbsentKnown) {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -2751,7 +2944,8 @@ mod tests {
                     std::ptr::null(),
                 );
                 assert!(!section.is_null());
-                let high = (0x2B00_0000_0000 + n * 0x1000_0000 + usize::from(hot.is_some()) * 0x4000_0000) as *const _;
+                let apart = usize::from(hot.is_some() || absent != AbsentKnown::Off) * 0x4000_0000;
+                let high = (0x2B00_0000_0000 + n * 0x1000_0000 + apart) as *const _;
                 let mut view = MapViewOfFileEx(section, FILE_MAP_WRITE, 0, 0, SIZE, high);
                 if view.Value.is_null() {
                     view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE);
@@ -2791,9 +2985,10 @@ mod tests {
             })
         };
         TEST_HOT.set(hot);
+        TEST_ABSENT_KNOWN.set(Some(absent));
         let mut hot_seen = 0;
         for round in 0..4000 {
-            if hot.is_some() && round % 8 == 0 {
+            if (hot.is_some() || absent != AbsentKnown::Off) && round % 8 == 0 {
                 TEST_FRAME.set(Some(100 + round as u64 / 8));
                 hot_seen += guards().hot.range(views[0] / BLOCK..views[0] / BLOCK + BLOCKS).count();
             }
@@ -2873,6 +3068,7 @@ mod tests {
         TEST_SUMMARY.set(None);
         TEST_HOT.set(None);
         TEST_HOT_RATIO.set(None);
+        TEST_ABSENT_KNOWN.set(None);
         TEST_FRAME.set(None);
         for view in views {
             title_memory_remapped(view, SIZE);
@@ -2953,7 +3149,7 @@ mod tests {
     /// runs (`VICTORY_GUARD_VIEWS_BATCH`).
     #[test]
     fn the_view_tests_with_the_views_in_runs() {
-        let _alone = hot_test();
+        let _alone = one_at_a_time();
         TEST_VIEWS_BATCH.set(Some(true));
         a_write_through_another_view_is_reported_at_the_guarded_one();
         a_view_mapped_beside_a_guarded_one_makes_it_check_again();
@@ -2967,6 +3163,188 @@ mod tests {
             }
         }
         TEST_VIEWS_BATCH.set(None);
+    }
+
+    /// With `VICTORY_GUARD_ABSENT_KNOWN=1`, the holes of a view (blocks
+    /// noted absent, walked at every asking) are asked about once a frame,
+    /// each run of them in one question; with `=forever` not again; a
+    /// mapping of the runtime's lets go of the run it touches.
+    #[test]
+    fn uncommitted_runs_are_asked_about_once_a_frame() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER,
+            MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let _alone = one_at_a_time();
+        // SAFETY: a fresh placeholder of four blocks and a pagefile section
+        // of four, as in `unmapped_blocks_are_reported_once_until_mapped`.
+        let (p, section) = unsafe {
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                4 * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(p, 0);
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (4 * BLOCK) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            (p, section)
+        };
+        let map = |block: usize| {
+            // SAFETY: splits the placeholder at the block and maps the
+            // section's block there.
+            let view = unsafe {
+                VirtualFree((p + block * BLOCK) as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                MapViewOfFile3(
+                    section,
+                    GetCurrentProcess(),
+                    (p + block * BLOCK) as *const _,
+                    (block * BLOCK) as u64,
+                    BLOCK,
+                    MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(view.Value as usize, p + block * BLOCK);
+            title_memory_remapped(p + block * BLOCK, BLOCK);
+            view
+        };
+        TEST_ABSENT_KNOWN.set(Some(AbsentKnown::Frame));
+        TEST_FRAME.set(Some(7));
+        // Holes: block 0, and blocks 2 and 3.
+        let middle = map(1);
+        let page = |block: usize| (p + block * BLOCK) / PAGE;
+        let ask = || guard(p, p + 4 * BLOCK).expect("view memory");
+        let questions = || TEST_QUESTIONS.replace(0);
+        let none: Vec<usize> = Vec::new();
+        assert_eq!(ask(), (0..4).map(page).collect::<Vec<_>>());
+        questions();
+        assert_eq!(ask(), none);
+        assert_eq!(questions(), 2, "each hole once");
+        assert_eq!(ask(), none);
+        assert_eq!(questions(), 0, "answered by the frame's runs");
+        TEST_FRAME.set(Some(8));
+        assert_eq!(ask(), none);
+        assert_eq!(questions(), 2, "asked again in the next frame");
+        TEST_ABSENT_KNOWN.set(Some(AbsentKnown::Forever));
+        for frame in 9..12 {
+            TEST_FRAME.set(Some(frame));
+            assert_eq!(ask(), none);
+            assert_eq!(questions(), 0, "kept until remapped");
+        }
+        // The runtime maps the first hole: reported, and its run let go of;
+        // the other hole is still answered by its run.
+        let first = map(0);
+        assert!(guards().uncommitted.range(p / BLOCK..p / BLOCK + 2).next().is_none());
+        assert_eq!(ask(), [page(0)]);
+        assert_eq!(questions(), 0);
+        assert_eq!(ask(), none);
+        TEST_ABSENT_KNOWN.set(None);
+        TEST_FRAME.set(None);
+        // SAFETY: our views and placeholder.
+        unsafe {
+            UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);
+            UnmapViewOfFile2(GetCurrentProcess(), middle, MEM_PRESERVE_PLACEHOLDER);
+            for block in 0..4 {
+                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+        title_memory_remapped(p, 4 * BLOCK);
+        assert!(guards().uncommitted.range(p / BLOCK..p / BLOCK + 4).next().is_none());
+    }
+
+    /// A hole committed with nothing said (as only a caller other than the
+    /// runtime's mappings can): with `VICTORY_GUARD_ABSENT_KNOWN=1` it is
+    /// seen, and reported written, at the next frame's first asking that
+    /// walks it, not at the askings left in its frame; with `=forever` only
+    /// once the runtime remaps it.
+    #[test]
+    fn a_hole_committed_with_nothing_said_is_seen_the_next_frame() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, SEC_RESERVE,
+            UnmapViewOfFile,
+        };
+        let _alone = one_at_a_time();
+        const SIZE: usize = 4 * BLOCK;
+        // SAFETY: a new reserved pagefile section, mapped; the view holds
+        // its own reference once the handle is closed.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE,
+                0,
+                SIZE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE);
+            CloseHandle(section);
+            assert!(!view.Value.is_null());
+            view.Value as usize
+        };
+        let commit = |block: usize| {
+            // SAFETY: a block of our reserved view.
+            let done = unsafe { VirtualAlloc((view + block * BLOCK) as _, BLOCK, MEM_COMMIT, PAGE_READWRITE) };
+            assert_eq!(done as usize, view + block * BLOCK);
+            // SAFETY: committed just now, read-write.
+            unsafe { ((view + block * BLOCK + 8) as *mut u8).write_volatile(1) };
+        };
+        let page = |block: usize| (view + block * BLOCK) / PAGE;
+        let ask = || guard(view, view + SIZE).expect("view memory");
+        let none: Vec<usize> = Vec::new();
+        commit(0);
+        TEST_ABSENT_KNOWN.set(Some(AbsentKnown::Frame));
+        TEST_FRAME.set(Some(20));
+        // Blocks 1-3 noted absent.
+        assert_eq!(ask(), (0..4).map(page).collect::<Vec<_>>());
+        assert_eq!(ask(), none);
+        commit(2);
+        assert_eq!(ask(), none, "the frame's run says uncommitted");
+        TEST_FRAME.set(Some(21));
+        assert_eq!(ask(), [page(2)], "seen at the next frame");
+        assert_eq!(ask(), none);
+        TEST_ABSENT_KNOWN.set(Some(AbsentKnown::Forever));
+        TEST_FRAME.set(Some(22));
+        assert_eq!(ask(), none);
+        commit(3);
+        for frame in 23..26 {
+            TEST_FRAME.set(Some(frame));
+            assert_eq!(ask(), none, "not seen with the runs kept");
+        }
+        title_memory_remapped(view + 3 * BLOCK, BLOCK);
+        assert_eq!(ask(), [page(3)], "seen once remapped");
+        TEST_ABSENT_KNOWN.set(None);
+        TEST_FRAME.set(None);
+        title_memory_remapped(view, SIZE);
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+    }
+
+    /// The view tests whose holes are mapped by the runtime, with the runs
+    /// of uncommitted blocks kept (`VICTORY_GUARD_ABSENT_KNOWN=1`, every
+    /// asking in one frame): the runtime's mappings let go of them.
+    #[test]
+    fn the_view_tests_with_absent_runs_known() {
+        let _alone = one_at_a_time();
+        TEST_ABSENT_KNOWN.set(Some(AbsentKnown::Frame));
+        TEST_FRAME.set(Some(1));
+        kernel_reads_into_guarded_blocks_after_opening();
+        a_range_that_begins_in_an_unmapped_block_is_guarded();
+        unmapped_blocks_are_reported_once_until_mapped();
+        a_write_through_another_view_is_reported_at_the_guarded_one();
+        a_write_is_reported_at_every_checked_view();
+        TEST_ABSENT_KNOWN.set(None);
+        TEST_FRAME.set(None);
     }
 
     /// A pagefile section of `bytes`, mapped once (no title view); its
@@ -2995,7 +3373,7 @@ mod tests {
     /// forgets it.
     #[test]
     fn a_block_written_every_frame_goes_hot() {
-        let _alone = hot_test();
+        let _alone = one_at_a_time();
         use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
         const SIZE: usize = 4 * BLOCK;
         let view = one_view(SIZE);
@@ -3080,7 +3458,7 @@ mod tests {
     /// through six askings a frame.
     #[test]
     fn a_hot_block_asked_about_more_often_than_written_is_guarded_again() {
-        let _alone = hot_test();
+        let _alone = one_at_a_time();
         use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
         const SIZE: usize = 2 * BLOCK;
         let view = one_view(SIZE);
@@ -3154,7 +3532,7 @@ mod tests {
     /// are guarded together again.
     #[test]
     fn the_other_views_of_a_hot_page_are_hot_with_it() {
-        let _alone = hot_test();
+        let _alone = one_at_a_time();
         the_other_views_of_a_hot_page_are_hot();
     }
 
@@ -3213,7 +3591,7 @@ mod tests {
     /// blocks are as they must be. As before, and with the summary.
     #[test]
     fn no_write_is_missed_with_hot_blocks() {
-        let _alone = hot_test();
+        let _alone = one_at_a_time();
         for summed in [false, true] {
             for ratio in [0, 2] {
                 no_write_is_missed(summed, ratio);
