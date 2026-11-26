@@ -3560,11 +3560,40 @@ fn late_line(frames: f64) {
         }
     }
     if late_exact() {
-        let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [pages, runs, bytes, unwatched, journal, no_snapshot, over, wanted, left] =
+            crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let per_trip = |n: f64| if over > 0.0 { n / over } else { 0.0 };
+        // VIcky (`crate::fence::sent`, "The bytes kept as the title's go up
+        // at the landing"): only with the switch, so that the line is as
+        // before without it.
+        let put_up = if crate::fence::sent::on() {
+            let p = crate::shadow::put_up_stats().map(|n| n as f64 / frames);
+            let (cards, pcs) = crate::fence::sent::put_up();
+            format!(
+                "; bytes the relay's merges kept as the title's, put up at the landing (VICTORY_FENCE_SENT_PUT_UP: card copies {cards}, PC copies {pcs}): \
+                 card copies {:.0} runs {:.1} KB, PC copies {:.0} runs {:.1} KB; stretches with more than {} such runs, left to the next preparing: \
+                 card copies {:.2} ({:.0} runs), PC copies {:.2} ({:.0} runs)",
+                p[0],
+                p[1] / 1024.0,
+                p[4],
+                p[5] / 1024.0,
+                crate::fence::sent::put_up_most(),
+                p[2],
+                p[3],
+                p[6],
+                p[7],
+            )
+        } else {
+            String::new()
+        };
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
-            bytes / (1 << 20) as f64
+             {runs:.0} changed runs, {:.2} MB; settles it asked for (\"title memory changed under shader writes\"), by why: \
+             memory not write-watched {unwatched:.2}, the journal could not say {journal:.2}, a PC copy without a snapshot {no_snapshot:.2}, \
+             a card copy's page over the runs left (VICTORY_MERGE_RUNS) {over:.2}, wanting {:.0} runs with {:.0} left each time{put_up}",
+            bytes / (1 << 20) as f64,
+            per_trip(wanted),
+            per_trip(left),
         );
     }
 }

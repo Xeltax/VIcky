@@ -192,6 +192,43 @@
 //! `VICTORY_FENCE_SENT_KEEP_TITLE=1`, which never stores such a word) and
 //! those in words it took the card's bytes in (a race on the word, lost to
 //! the card's).
+//!
+//! # The bytes kept as the title's go up at the landing
+//!
+//! A byte the rule keeps as the title's leaves title memory and the copy's
+//! reference apart: the reference took the card's byte, title memory kept
+//! the title's (about 10 KB a frame in RT60's check, scattered). The next
+//! submission that refreshes the range while a flight may write it finds
+//! each such byte again as a title write (`merge_under_writes`) and puts it
+//! in. For a copy in the card's memory every run found there is a copy of
+//! its own on the queue, 512 a submission at most (`VICTORY_MERGE_RUNS`):
+//! past that the flights are settled ("title memory changed under shader
+//! writes", 1.5 to 1.8 settles a frame with the rule against about 1.1
+//! without it, 35 to 40 ms more of the submitting thread). For a copy in
+//! the PC's memory they were only more "changed runs" (9,000 to 14,000 a
+//! frame against 700 to 2,900).
+//!
+//! So the merge that keeps them puts them in itself ([`put_up`]), under the
+//! lock `merge_under_writes` takes, with title memory as the merge read it:
+//! what `merge_under_writes` does one submission later. In a copy in the
+//! card's memory the runs go into the CPU's side and are noted to go up
+//! before the next submission (joined over `VICTORY_MERGE_GAP`, as
+//! `merge_under_writes` joins them); they lie outside what the merge left
+//! out (runs still to go up, and those sent after its fetch), and are left
+//! out of later merges themselves until the card has them, so a flight
+//! still in the air cannot take the title's byte back. In a copy in the
+//! PC's memory they go into the copy and its snapshot and are noted for the
+//! stretch, as `merge_under_writes` notes what it puts in while a value is
+//! ahead. The next `merge_under_writes` then finds title memory equal to the
+//! reference there.
+//!
+//! What changes besides: the title's byte reaches the card at the next
+//! send even if that submission does not refresh the range (before, it
+//! waited for a refresh): the rule's own direction, the title wrote after
+//! the card. A stretch with more than [`put_up_most`] such runs is left as
+//! before. The frame-rate line's "title bytes put in under flights' shader
+//! writes" counts the runs put up, the stretches left, and the settles
+//! `merge_under_writes` asked for by cause.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -250,6 +287,49 @@ pub(crate) fn keep_exact() -> bool {
             );
         }
         exact
+    })
+}
+
+/// Which of the relay's merges, while a value is published ahead, put the
+/// bytes they keep as the title's up at once ("The bytes kept as the
+/// title's go up at the landing", in the module's docs): (those of copies
+/// in the card's memory, those of copies in the PC's memory). Both with the
+/// switch; `VICTORY_FENCE_SENT_PUT_UP=0` neither (as before: left to the
+/// next preparing), `=card` the card's only.
+pub(crate) fn put_up() -> (bool, bool) {
+    static ON: OnceLock<(bool, bool)> = OnceLock::new();
+    *ON.get_or_init(|| {
+        if !on() {
+            return (false, false);
+        }
+        let which = match std::env::var("VICTORY_FENCE_SENT_PUT_UP").ok().as_deref().map(str::trim) {
+            Some("0") => (false, false),
+            Some("card") => (true, false),
+            _ => (true, true),
+        };
+        tracing::info!(
+            "while a frame-begin value is published ahead, the relay's merges put the bytes they keep as the title's into the copy's reference at once \
+             (copies in the card's memory {}, in the PC's memory {}; at most {} runs a stretch; VICTORY_FENCE_SENT_PUT_UP, VICTORY_FENCE_SENT_PUT_UP_RUNS)",
+            which.0,
+            which.1,
+            put_up_most()
+        );
+        which
+    })
+}
+
+/// The most runs of bytes kept as the title's one merged stretch puts up
+/// ([`put_up`]); a stretch with more leaves them all to the next preparing,
+/// as before (`VICTORY_FENCE_SENT_PUT_UP_RUNS`, 1 to 65536; 64 by default).
+/// Each run put up in a copy in the card's memory is a copy of its own on
+/// the queue before the next submission.
+pub(crate) fn put_up_most() -> usize {
+    static MOST: OnceLock<usize> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_FENCE_SENT_PUT_UP_RUNS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(64, |n| n.clamp(1, 1 << 16))
     })
 }
 
