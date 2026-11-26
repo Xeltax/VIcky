@@ -557,6 +557,49 @@ impl Tracked {
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
+/// `$e`, counted once in the diagnostics counter `$n` and its time added
+/// to `$ns` (`crate::copystat`); just `$e` in other builds. For the costs
+/// of [`guard`]'s walk, each a call into Windows or a lookup under another
+/// lock, which the clock's reading (some 20 ns) does not change much.
+macro_rules! timed {
+    ($n:ident, $ns:ident, $e:expr) => {{
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let value = $e;
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::$n, 1);
+            crate::copystat::add(crate::copystat::C::$ns, started.elapsed().as_nanos() as u64);
+        }
+        value
+    }};
+}
+
+/// What one asking's walk of [`guard`] found, block by block, summed there
+/// and counted once (diagnostics): blocks reported written; of them, the
+/// ones still read-only by our hand; and blocks noted absent that are still
+/// uncommitted.
+#[derive(Default)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+struct Tally {
+    written: u64,
+    guarded: u64,
+    absent: u64,
+}
+
+impl Tally {
+    /// Adds this walk's numbers to the frame's.
+    fn count(&self) {
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::GuardWritten, self.written);
+            add(C::GuardWrittenGuarded, self.guarded);
+            add(C::GuardAbsentSkipped, self.absent);
+        }
+    }
+}
+
 /// Whether the block holding `start` is view memory the guards already
 /// hold (read-only by our hand, or noted absent): asking the kernel's write
 /// watch about it can only fail. `VICTORY_VIEW_ASK=1` (or
@@ -837,6 +880,13 @@ pub(crate) fn guard_summary() -> bool {
     summary()
 }
 
+/// The frame line's clause on hot blocks (`VICTORY_GUARD_HOT`), given its
+/// counters per frame; empty while the switch is off.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn hot_clause(_made: f64, _reported: f64, _retests: f64) -> String {
+    String::new()
+}
+
 /// One check of `VICTORY_GUARD_SUMMARY_CHECK` in this many askings.
 #[cfg(feature = "diagnostics")]
 const CHECK_EVERY: u64 = 64;
@@ -983,7 +1033,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let walking = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardCheckNs, (walking - checking).as_nanos() as u64);
-        let _walked = walk_summed(&mut g, first, last, &mut written);
+        let mut tally = Tally::default();
+        let _walked = walk_summed(&mut g, first, last, &mut written, &mut tally);
+        tally.count();
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -1011,13 +1063,16 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut run: Option<usize> = None;
     let mut next_clean = 0;
     let mut uncommitted_until = first;
+    let mut tally = Tally::default();
     for block in first..=last {
         while next_clean < clean.len() && clean[next_clean] < block {
             next_clean += 1;
         }
         let is_clean = next_clean < clean.len() && clean[next_clean] == block;
-        step(&mut g, block, block >= last || is_clean, &mut run, &mut uncommitted_until, &mut written);
+        let walk = Walk { run: &mut run, uncommitted_until: &mut uncommitted_until, written: &mut written, tally: &mut tally };
+        step(&mut g, block, block >= last || is_clean, walk);
     }
+    tally.count();
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
@@ -1033,14 +1088,8 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 /// wholly uncommitted. One still read-only by our hand (written through the
 /// runtime) is noted clean again; the others are guarded again in runs,
 /// each run ending at the next block that needs no guarding.
-fn step(
-    g: &mut Guards,
-    block: usize,
-    clean: bool,
-    run: &mut Option<usize>,
-    uncommitted_until: &mut usize,
-    written: &mut Vec<usize>,
-) {
+fn step(g: &mut Guards, block: usize, clean: bool, walk: Walk<'_>) {
+    let Walk { run, uncommitted_until, written, tally } = walk;
     let mut open = !clean;
     if open && g.absent.contains(&block) {
         // Ordinary commits need no runtime mapping notification. Reuse
@@ -1051,13 +1100,17 @@ fn step(
         open = block >= *uncommitted_until;
         if open {
             g.absent.remove(&block);
+        } else {
+            tally.absent += 1;
         }
     }
     if open {
         written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+        tally.written += 1;
         if g.protected.contains(&block) {
             // Written through the runtime, still read-only.
             g.clean.insert(block);
+            tally.guarded += 1;
         } else {
             run.get_or_insert(block);
             return;
@@ -1066,6 +1119,16 @@ fn step(
     if let Some(from) = run.take() {
         protect(g, from, block);
     }
+}
+
+/// The state one asking's walk carries from block to block ([`step`]):
+/// the run of written blocks to guard again, the end of the uncommitted
+/// memory last asked about, the pages reported, what was found.
+struct Walk<'a> {
+    run: &'a mut Option<usize>,
+    uncommitted_until: &'a mut usize,
+    written: &'a mut Vec<usize>,
+    tally: &'a mut Tally,
 }
 
 /// [`guard`]'s walk of `[first, last)` with [`summary`]: the words of
@@ -1077,7 +1140,7 @@ fn step(
 /// clean meanwhile is the block it stands at or ones before it (the runs it
 /// guards again end there), so the later blocks read as they were when the
 /// asking began, as the set read once at the start gave them.
-fn walk_summed(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usize>) -> u64 {
+fn walk_summed(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usize>, tally: &mut Tally) -> u64 {
     let mut run: Option<usize> = None;
     let mut uncommitted_until = first;
     let mut walked = 0;
@@ -1096,11 +1159,13 @@ fn walk_summed(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usiz
         walked += (end - block) as u64;
         while block < end {
             let clean = bits & (1 << (block % WORD)) != 0;
-            step(g, block, clean, &mut run, &mut uncommitted_until, written);
+            let walk = Walk { run: &mut run, uncommitted_until: &mut uncommitted_until, written: &mut *written, tally: &mut *tally };
+            step(g, block, clean, walk);
             block += 1;
         }
     }
-    step(g, last, true, &mut run, &mut uncommitted_until, written);
+    let walk = Walk { run: &mut run, uncommitted_until: &mut uncommitted_until, written: &mut *written, tally: &mut *tally };
+    step(g, last, true, walk);
     walked
 }
 
@@ -1159,11 +1224,16 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     if !view_guard() {
         return;
     }
-    for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
+    let views = timed!(
+        GuardViewLookups,
+        GuardViewLookupNs,
+        crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK))
+    );
+    for (base, bytes) in views {
         let first = (base / BLOCK).max(from);
         let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
         for block in first..last {
-            let shown = crate::inplace::pages_of(block * BLOCK);
+            let shown = timed!(GuardViewLookups, GuardViewLookupNs, crate::inplace::pages_of(block * BLOCK));
             // One view (nothing else to guard), or the page the title shows
             // wherever it has nothing (thousands of views): each view of
             // that one is guarded by itself.
@@ -1214,7 +1284,10 @@ fn protect_alias(g: &mut Guards, block: usize) {
     }
     let mut old = 0;
     // SAFETY: title view memory; only its protection changes.
-    if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
+    let done = timed!(GuardViewProtects, GuardViewProtectNs, unsafe {
+        VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old)
+    });
+    if done != 0 {
         g.protected.insert(block);
         if view_known() {
             g.viewed.insert(block);
@@ -1228,16 +1301,18 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     let set = |from: usize, to: usize| {
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
-        unsafe {
+        timed!(GuardProtects, GuardProtectNs, unsafe {
             VirtualProtect(
                 (from * BLOCK) as *const _,
                 (to - from) * BLOCK,
                 PAGE_READONLY,
                 &mut old,
             ) != 0
-        }
+        })
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardProtected, (to - from) as u64);
         g.protected.extend(from..to);
         g.clean.extend(from, to);
         if view_known() {
@@ -1262,6 +1337,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
                 // known to the guards (one in 1,024 said).
                 #[cfg(feature = "diagnostics")]
                 {
+                    crate::copystat::add(crate::copystat::C::GuardProtectFailed, 1);
                     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 1024 == 0 {
                         tracing::info!("a block of title memory could not be made read-only (one in 1024): {:#x}: {error}", block * BLOCK);
@@ -1280,7 +1356,9 @@ fn uncommitted_end(block: usize) -> usize {
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    let n = timed!(GuardQueries, GuardQueryNs, unsafe {
+        VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info))
+    });
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
         (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
     } else {
@@ -2477,6 +2555,222 @@ mod tests {
         title_memory_remapped(view, SIZE);
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+    }
+
+    /// Not a test: what each step of [`guard`]'s walk costs on this
+    /// machine, for reading the frame line's split of "walking": a block
+    /// made read-only and writable again, alone and while other threads
+    /// read the memory on other processors (as the title's threads do, so
+    /// that each change waits for their processors to forget the page);
+    /// one call for a run of blocks against one a block; a write fault
+    /// taken by our handler; the question whether memory is uncommitted,
+    /// at a placeholder and at a reserved view; the lookups of a page's
+    /// other views among many views. `cargo test --profile diag -p
+    /// victory-gpu --lib -- --ignored --nocapture costs`.
+    #[test]
+    #[ignore]
+    fn each_step_of_a_walk_costs() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_RESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS,
+            MapViewOfFile, PAGE_NOACCESS, PAGE_READONLY, SEC_RESERVE, UnmapViewOfFile, VirtualAlloc2,
+            VirtualProtect,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const BLOCKS: usize = 64;
+        const SIZE: usize = BLOCKS * BLOCK;
+        const REPS: usize = 20;
+        let mapped = |bytes: usize, flags: u32| {
+            // SAFETY: a new pagefile section, mapped; the view holds its
+            // own reference once the handle is closed.
+            unsafe {
+                let section = CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    PAGE_READWRITE | flags,
+                    (bytes >> 32) as u32,
+                    bytes as u32,
+                    std::ptr::null(),
+                );
+                assert!(!section.is_null());
+                let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, bytes);
+                CloseHandle(section);
+                assert!(!view.Value.is_null());
+                view.Value as usize
+            }
+        };
+        let unmap = |view: usize| {
+            // SAFETY: a view of `mapped`.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        };
+        let us = |d: Duration, n: usize| d.as_secs_f64() * 1e6 / n as f64;
+        let view = mapped(SIZE, 0);
+        for at in (view..view + SIZE).step_by(KERNEL_PAGE) {
+            // SAFETY: our view, read-write.
+            unsafe { (at as *mut u8).write_volatile(1) };
+        }
+        let set = |at: usize, blocks: usize, how: u32| {
+            let mut old = 0;
+            // SAFETY: our view; only its protection changes.
+            assert_ne!(unsafe { VirtualProtect(at as *const _, blocks * BLOCK, how, &mut old) }, 0);
+        };
+        // Each block read-only then writable again, one call a block; and
+        // runs of 16 blocks, one call a run.
+        let changes = || {
+            let [mut ro, mut rw, mut run_ro, mut run_rw] = [Duration::ZERO; 4];
+            for _ in 0..REPS {
+                for b in 0..BLOCKS {
+                    let t = Instant::now();
+                    set(view + b * BLOCK, 1, PAGE_READONLY);
+                    ro += t.elapsed();
+                    let t = Instant::now();
+                    set(view + b * BLOCK, 1, PAGE_READWRITE);
+                    rw += t.elapsed();
+                }
+                for b in (0..BLOCKS).step_by(16) {
+                    let t = Instant::now();
+                    set(view + b * BLOCK, 16, PAGE_READONLY);
+                    run_ro += t.elapsed();
+                    let t = Instant::now();
+                    set(view + b * BLOCK, 16, PAGE_READWRITE);
+                    run_rw += t.elapsed();
+                }
+            }
+            let n = REPS * BLOCKS;
+            [us(ro, n), us(rw, n), us(run_ro, n / 16), us(run_rw, n / 16)]
+        };
+        // A write fault on each block of a guarded view of its own (not a
+        // title view: no other views), and guarding them again, in runs of
+        // one block (every other block written) and in one run.
+        let faults = || {
+            let fv = view;
+            assert!(guard(fv, fv + SIZE).is_some());
+            let (mut fault, mut single, mut whole) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+            for _ in 0..REPS {
+                let t = Instant::now();
+                for b in (0..BLOCKS).step_by(2) {
+                    // SAFETY: our view, opened by the handler.
+                    unsafe { ((fv + b * BLOCK + 8) as *mut u8).write_volatile(2) };
+                }
+                fault += t.elapsed();
+                let t = Instant::now();
+                assert_eq!(guard(fv, fv + SIZE).map(|p| p.len()), Some(BLOCKS / 2));
+                single += t.elapsed();
+                for b in 0..BLOCKS {
+                    // SAFETY: as above.
+                    unsafe { ((fv + b * BLOCK + 8) as *mut u8).write_volatile(3) };
+                }
+                let t = Instant::now();
+                assert_eq!(guard(fv, fv + SIZE).map(|p| p.len()), Some(BLOCKS));
+                whole += t.elapsed();
+            }
+            title_memory_remapped(fv, SIZE);
+            set(fv, BLOCKS, PAGE_READWRITE);
+            [us(fault, REPS * BLOCKS / 2), us(single, REPS * BLOCKS / 2), us(whole, REPS * BLOCKS)]
+        };
+        let quiet = (changes(), faults());
+        // Readers on other processors, as the title's threads.
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..std::thread::available_parallelism().map_or(4, |n| n.get()).saturating_sub(2).clamp(1, 16))
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut sum = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        for at in (view..view + SIZE).step_by(KERNEL_PAGE) {
+                            // SAFETY: our view, readable throughout.
+                            sum = sum.wrapping_add(u64::from(unsafe { (at as *const u8).read_volatile() }));
+                        }
+                    }
+                    sum
+                })
+            })
+            .collect();
+        let n_readers = readers.len();
+        let busy = (changes(), faults());
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            std::hint::black_box(r.join().unwrap());
+        }
+        unmap(view);
+        // The question whether memory is uncommitted: at a placeholder of
+        // 1 GiB, at a reserved view of 256 MiB, and at a reserved view
+        // whose next block is committed.
+        // SAFETY: a fresh placeholder, released at the end.
+        let placeholder = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                1 << 30,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize
+        };
+        assert_ne!(placeholder, 0);
+        let reserved = mapped(256 << 20, SEC_RESERVE);
+        let short = mapped(4 * BLOCK, SEC_RESERVE);
+        // SAFETY: the second block of our reserved view.
+        let done = unsafe { VirtualAlloc((short + BLOCK) as _, BLOCK, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(done as usize, short + BLOCK);
+        let query = |at: usize| {
+            let t = Instant::now();
+            for _ in 0..REPS * 10 {
+                std::hint::black_box(uncommitted_end(at / BLOCK));
+            }
+            us(t.elapsed(), REPS * 10)
+        };
+        let queries = [query(placeholder), query(reserved), query(short)];
+        assert_eq!(uncommitted_end(short / BLOCK), short / BLOCK + 1);
+        // SAFETY: our placeholder.
+        unsafe { VirtualFree(placeholder as *mut _, 0, MEM_RELEASE) };
+        unmap(reserved);
+        unmap(short);
+        // The lookups among 20,000 views of a block each, high up where
+        // nothing is mapped, one page in ten shown twice.
+        let base = 0x6100_0000_0000usize;
+        const VIEWS: usize = 20_000;
+        for n in 0..VIEWS {
+            let offset = if n % 10 == 9 { (n - 1) * BLOCK } else { n * BLOCK };
+            crate::inplace::title_memory_view(base + n * BLOCK, BLOCK, 0x5EC7, offset as u64);
+        }
+        let t = Instant::now();
+        let mut shown = 0;
+        for n in 0..VIEWS {
+            shown += crate::inplace::pages_of(base + n * BLOCK).len();
+        }
+        let pages_of = us(t.elapsed(), VIEWS);
+        assert_eq!(shown, VIEWS + VIEWS / 10 * 2);
+        let t = Instant::now();
+        let mut found = 0;
+        for n in (0..VIEWS).step_by(16) {
+            found += crate::inplace::views_between(base + n * BLOCK, base + (n + 16) * BLOCK).len();
+        }
+        let between = us(t.elapsed(), VIEWS / 16);
+        assert!(found >= VIEWS);
+        title_memory_remapped(base, VIEWS * BLOCK);
+        println!(
+            "a block made read-only {:.2} us, writable again {:.2} us; 16 blocks in one call {:.2} us and {:.2} us; \
+             a write fault taken {:.2} us; a walk guarding blocks again in runs of one {:.2} us a block, in one run \
+             {:.2} us a block",
+            quiet.0[0], quiet.0[1], quiet.0[2], quiet.0[3], quiet.1[0], quiet.1[1], quiet.1[2]
+        );
+        println!(
+            "the same with {n_readers} threads reading the memory: read-only {:.2} us, writable {:.2} us; 16 blocks \
+             {:.2} us and {:.2} us; a fault {:.2} us; guarding again in runs of one {:.2} us a block, in one run {:.2} \
+             us a block",
+            busy.0[0], busy.0[1], busy.0[2], busy.0[3], busy.1[0], busy.1[1], busy.1[2]
+        );
+        println!(
+            "whether memory is uncommitted: a placeholder of 1 GiB {:.2} us, a reserved view of 256 MiB {:.2} us, \
+             a reserved block before a committed one {:.2} us; among {VIEWS} views, a page's other views {:.3} us, \
+             the views of 16 blocks {:.3} us",
+            queries[0], queries[1], queries[2], pages_of, between
+        );
     }
 }
 
