@@ -209,8 +209,9 @@ pub(crate) fn once() -> bool {
 
 /// With [`once`]: asks about `ranges` (everything a submission's lists
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
-/// [`ask_once_end`].
-pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
+/// [`ask_once_end`]. `view` is told the place in `ranges` of each range
+/// found to be view memory the guards hold (left to [`writes`]).
+pub(crate) fn ask_once(ranges: &[(usize, usize)], mut view: impl FnMut(usize)) {
     if !once() {
         return;
     }
@@ -228,7 +229,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
-    for &(start, end) in ranges {
+    for (i, &(start, end)) in ranges.iter().enumerate() {
         if start >= end {
             continue;
         }
@@ -239,6 +240,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         if known_view(start) {
             #[cfg(feature = "diagnostics")]
             AHEAD_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            view(i);
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -406,13 +408,16 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+        #[cfg(feature = "diagnostics")]
+        let collecting = std::time::Instant::now();
+        let written = j.written.range(first..last).map(|(&p, &w)| (p, w)).collect();
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::WritesJournal, 1);
+            add(C::WritesCollectNs, collecting.elapsed().as_nanos() as u64);
+        }
+        return Some((j.ahead_asked, written));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -475,13 +480,12 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    #[cfg(feature = "diagnostics")]
+    let collecting = std::time::Instant::now();
+    let written = j.written.range(first..last).map(|(&p, &w)| (p, w)).collect();
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::WritesCollectNs, collecting.elapsed().as_nanos() as u64);
+    Some((now, written))
 }
 
 /// Diagnostics: one in 2,048 of the askings the kernel's write watch

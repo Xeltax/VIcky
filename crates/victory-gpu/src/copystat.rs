@@ -201,6 +201,41 @@ pub(crate) enum C {
     SparseReads,
     SparseReadsFailed,
     SparseQueries,
+    /// VIcky (`crate::host::front`): a submission's parts (its steps
+    /// between two that write title memory, `Step::Copy` and `Step::Run`),
+    /// the distinct (copy, part) pairs its refreshes name, of them those
+    /// whose copy is view memory the guards hold (as the submission's one
+    /// asking found it), and those refreshed again after their shaders'
+    /// first write in the part.
+    FrontParts,
+    FrontPairs,
+    FrontPairsViews,
+    FrontPairsLate,
+    /// Host copies brought up to date (`Shadow::update` from the
+    /// submission's batch), and their microseconds: all of them, and of
+    /// them the ones before a step that gives a copy to shaders
+    /// (`Batch::flush_one`).
+    Updates,
+    UpdateUs,
+    UpdatesOne,
+    UpdateOneUs,
+    /// `watch::writes` asked by those updates (once per stretch between the
+    /// ranges shaders are writing) and their nanoseconds; of all its
+    /// askings (textures' too), the ones the journal answered under an
+    /// asking ahead, and the nanoseconds of collecting the journal's pages
+    /// for the answers.
+    WritesAsked,
+    WritesNs,
+    WritesJournal,
+    WritesCollectNs,
+    /// Of the submission's copies time: copying the pages found written
+    /// (`Shadow::copy_stale`, nanoseconds), the fills of upload memory, the
+    /// title's buffer copies, and the kernel askings ahead of a group of
+    /// updates (microseconds).
+    CopyStaleNs,
+    FillUs,
+    CopyStepUs,
+    AskAheadUs,
 }
 const COUNTERS: usize = 128;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1146,6 +1181,45 @@ fn page_faults() -> u64 {
     u64::from(c.PageFaultCount)
 }
 
+/// The copies line's words beside the write-watch askings: the distinct
+/// (copy, part) pairs the submissions' refreshes name (`crate::host::front`),
+/// the bound a refresh per copy and part would bring the updates to.
+fn pairs_clause(c: &[f64]) -> String {
+    format!(
+        " ({:.0} copies by part over {:.0} parts of submissions: {:.0} of them view memory the guards hold, \
+         {:.0} refreshed again after their shaders' first write in the part)",
+        c[C::FrontPairs as usize],
+        c[C::FrontParts as usize],
+        c[C::FrontPairsViews as usize],
+        c[C::FrontPairsLate as usize],
+    )
+}
+
+/// The copies line's split of the submissions' copies time: fills, title
+/// buffer copies, askings ahead, and the updates of host copies by where
+/// they were done, with what is inside them.
+fn split_clause(c: &[f64]) -> String {
+    let ms = |v: f64| v / 1e3;
+    format!(
+        "copies split: fills {:.2} ms, title copies {:.2} ms, askings ahead {:.2} ms, {:.0} updates of host copies \
+         {:.2} ms ({:.0} before a shader write {:.2} ms; inside them {:.0} askings of the journal or the guards \
+         {:.2} ms, pages found written copied {:.2} ms); of all askings (textures' too) {:.0} answered by the journal, \
+         collecting its pages {:.2} ms",
+        ms(c[C::FillUs as usize]),
+        ms(c[C::CopyStepUs as usize]),
+        ms(c[C::AskAheadUs as usize]),
+        c[C::Updates as usize],
+        ms(c[C::UpdateUs as usize]),
+        c[C::UpdatesOne as usize],
+        ms(c[C::UpdateOneUs as usize]),
+        c[C::WritesAsked as usize],
+        c[C::WritesNs as usize] / 1e6,
+        c[C::CopyStaleNs as usize] / 1e6,
+        c[C::WritesJournal as usize],
+        c[C::WritesCollectNs as usize] / 1e6,
+    )
+}
+
 /// Logs the counters per frame, and the ranges that took most bytes. The
 /// counters run from line to line, so they are divided by the frames
 /// presented since the last line, not by `frames` (the frames of the last
@@ -1166,9 +1240,9 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
-         {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
+         {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms{}, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
-         changed, {:.1} MB hashed, {:.1} MB of them changed",
+         changed, {:.1} MB hashed, {:.1} MB of them changed; {}",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -1185,6 +1259,7 @@ pub(crate) fn log(frames: f64) {
         faults as f64 / frames,
         c[C::Watches as usize],
         ms(c[C::WatchUs as usize]),
+        pairs_clause(&c),
         mb(c[C::Checked as usize]),
         mb(c[C::Unchanged as usize]),
         c[C::Fallbacks as usize],
@@ -1192,6 +1267,7 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+        split_clause(&c),
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \

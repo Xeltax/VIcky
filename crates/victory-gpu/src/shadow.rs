@@ -4907,9 +4907,22 @@ impl Shadow {
                     return 0;
                 }
             }
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            #[cfg(feature = "diagnostics")]
+            let asking = std::time::Instant::now();
+            let answer = crate::watch::writes(from, to, true);
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::WritesAsked, 1);
+                add(C::WritesNs, asking.elapsed().as_nanos() as u64);
+            }
+            if let Some((now, written)) = answer {
                 self.watched.store(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                let copying = std::time::Instant::now();
                 let copied = self.copy_stale(from, to, now, &written);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::CopyStaleNs, copying.elapsed().as_nanos() as u64);
                 if ahead == Some(now) {
                     *self.stamp.lock().unwrap_or_else(|e| e.into_inner()) = (now, from, to);
                 }

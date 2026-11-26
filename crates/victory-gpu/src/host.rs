@@ -6432,6 +6432,9 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        // Of the copies the one asking below names, those it found to be
+        // view memory the guards hold (the copies line's pairs).
+        let mut views: Vec<usize> = Vec::new();
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
@@ -6448,8 +6451,8 @@ impl Host {
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
-            crate::watch::ask_once(&ranges);
+            let (keys, ranges): (Vec<usize>, Vec<(usize, usize)>) = spans.into_iter().unzip();
+            crate::watch::ask_once(&ranges, |i| views.push(keys[i]));
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
@@ -6458,13 +6461,17 @@ impl Host {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
-                crate::watch::ask_once(&ranges);
+                crate::watch::ask_once(&ranges, |_| {});
             }
         } else if behind && stale_under_flights(runs) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        // VIcky (diagnostics, [`front`]): the submission's refreshes by part.
+        #[cfg(feature = "diagnostics")]
+        front::count(&front::walk(runs), &views);
+        drop(views);
         for (i, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -8124,8 +8131,11 @@ impl HostList {
                     continue;
                 }
             };
-            preparing(0, started.elapsed().as_micros() as u64);
+            let us = started.elapsed().as_micros() as u64;
+            preparing(0, us);
             preparing(1, copied as u64);
+            #[cfg(feature = "diagnostics")]
+            add(if matches!(step, Step::Fill(..)) { C::FillUs } else { C::CopyStepUs }, us);
         }
     }
 }
@@ -8220,6 +8230,20 @@ struct Batch {
     textures: std::collections::HashSet<usize>,
 }
 
+/// Where a host copy is brought up to date in a submission (the copies
+/// line's counters).
+#[derive(Clone, Copy)]
+enum Refreshed {
+    /// With the other pending refreshes ([`Batch::flush`]).
+    Flush,
+    /// Before a step gives the copy to shaders ([`Batch::flush_one`]).
+    One,
+}
+
+/// VIcky: a submission's refreshes by part (diagnostics).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+mod front;
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
@@ -8260,7 +8284,7 @@ impl Batch {
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        Self::update(&shadow, from, to, Refreshed::One);
         Self::brought(&mut self.current, &shadow, from, to);
     }
 
@@ -8287,12 +8311,24 @@ impl Batch {
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
-    fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+    fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize, _at: Refreshed) {
         let started = std::time::Instant::now();
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
-        crate::copystat::range(from, to - from, us, 0);
+        {
+            use crate::copystat::{C, add};
+            crate::copystat::range(from, to - from, us, 0);
+            add(C::Updates, 1);
+            add(C::UpdateUs, us);
+            match _at {
+                Refreshed::Flush => {}
+                Refreshed::One => {
+                    add(C::UpdatesOne, 1);
+                    add(C::UpdateOneUs, us);
+                }
+            }
+        }
         preparing(0, us);
         preparing(1, copied as u64);
     }
@@ -8349,7 +8385,10 @@ impl Batch {
                 .map(|r| (r.1, r.2))
                 .collect();
             crate::watch::ask_ahead(&ranges);
-            preparing(0, started.elapsed().as_micros() as u64);
+            let us = started.elapsed().as_micros() as u64;
+            preparing(0, us);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::AskAheadUs, us);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
@@ -8364,7 +8403,9 @@ impl Batch {
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+                .map(|(shadow, from, to)| {
+                    Box::new(move || Self::update(&shadow, from, to, Refreshed::Flush)) as Box<dyn FnOnce() + Send>
+                })
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
@@ -8373,7 +8414,7 @@ impl Batch {
             crate::framelog::sub(crate::framelog::T::CopyUs, over);
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+                Self::update(&shadow, from, to, Refreshed::Flush);
                 Self::brought(&mut self.current, &shadow, from, to);
             }
         }
