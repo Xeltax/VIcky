@@ -225,7 +225,7 @@ fn kept(host: &HostHeap) -> std::collections::BTreeMap<u32, (u64, u64, u64)> {
         .unwrap()
         .as_ref()
         .and_then(|kept| kept.get(&key))
-        .map(|(_, ranges)| ranges.iter().map(|(&i, (s, from, to))| (i, (s.id(), *from, *to))).collect())
+        .map(|(_, ranges)| ranges.iter().map(|(i, (s, from, to))| (i, (s.id(), *from, *to))).collect())
         .unwrap_or_default()
 }
 
@@ -1160,13 +1160,14 @@ fn a_pass_counts_what_its_slots_came_to() {
     };
     let base = 0x61_0000_0000u64;
     crate::shadow::register(0x7e57_6101, base, 0x1_0000);
-    // At different addresses: the cache keeps two records a set, and the
-    // set is chosen by the record's low bits (the address of a placed view).
+    // Views of one buffer at one address, other elements (records that
+    // differ in their high bits alone: they once fell in one set of the
+    // cache and put each other out).
     for slot in 1..=4 {
-        write(heap, slot, buffer_view(base + 0x1000 * u64::from(slot), 0x1000, 0, 8));
+        write(heap, slot, buffer_view(base, 0x1_0000, 4 * slot, 8));
     }
     // The view of slot 1 again; slot 6 never written.
-    write(heap, 5, buffer_view(base + 0x1000, 0x1000, 0, 8));
+    write(heap, 5, buffer_view(base, 0x1_0000, 4, 8));
     let mut ranges = Ranges::new();
     let mut slots: Vec<u32> = (1..=6).collect();
     let took = buffers_taken(heap, host, &mut slots, &mut ranges, None, true);
@@ -1179,6 +1180,7 @@ fn a_pass_counts_what_its_slots_came_to() {
     assert_eq!(ranges.len(), 5);
     let took = buffers_taken(heap, host, &mut slots, &mut ranges, None, true);
     assert_eq!(of(&took), [0, 0, 1, 5, 5, 0], "{took:?}");
+    assert_eq!((took.of(Count::Again), took.of(Count::Moved)), (5, 0), "the ranges they had kept");
     assert!(!parts::counting(), "the pass's counting ended with it");
     crate::shadow::unregister(0x7e57_6101, base);
     forget(host);
@@ -1264,7 +1266,7 @@ fn the_pass_on_threads_makes_and_keeps_what_the_pass_on_one_thread_does() {
             let what = format!("round {round}, cache {cache}, map {map:?}");
             assert_eq!(f1, f4, "{what}: what each slot came to");
             let keys = |r: &Ranges| -> std::collections::BTreeMap<u32, (u64, u64, u64)> {
-                r.iter().map(|(&i, (s, from, to))| (i, (s.id(), *from, *to))).collect()
+                r.iter().map(|(i, (s, from, to))| (i, (s.id(), *from, *to))).collect()
             };
             assert!(!r1.is_empty(), "{what}");
             assert_eq!(keys(&r1), keys(&r4), "{what}: the ranges kept");
@@ -1447,4 +1449,39 @@ fn the_threads_and_the_title_s_writes_take_turns() {
     forget(host);
     assert_eq!(release(object), 0);
     TEST_FAST.set(None);
+}
+
+/// The ranges kept by slot: kept, replaced, dropped and counted, walked in
+/// slot order; a turn's dropped and all cleared as [`Afresh`] drops them.
+#[test]
+fn ranges_are_kept_by_slot() {
+    if crate::host::host().is_none() {
+        return;
+    }
+    let base = 0x65_0000_0000u64;
+    crate::shadow::register(0x7e57_6501, base, 0x1_0000);
+    let copy = crate::shadow::find(base, 0x1_0000).expect("a copy");
+    let range = |from: u64| (copy.clone(), base + from, base + from + 0x10);
+    let mut ranges = Ranges::new();
+    assert!(ranges.is_empty() && ranges.get(7).is_none() && ranges.remove(&7).is_none());
+    assert!(ranges.insert(70, range(0x70)).is_none());
+    assert!(ranges.insert(3, range(0x30)).is_none());
+    let old = ranges.insert(70, range(0x700)).expect("replaced");
+    assert_eq!(old.1, base + 0x70);
+    assert_eq!(ranges.len(), 2);
+    assert_eq!(ranges.iter().map(|(i, r)| (i, r.1 - base)).collect::<Vec<_>>(), [(3, 0x30), (70, 0x700)]);
+    assert_eq!(ranges.values().count(), 2);
+    assert_eq!(ranges.remove(&3).map(|r| r.1 - base), Some(0x30));
+    assert!(ranges.remove(&3).is_none());
+    assert_eq!(ranges.len(), 1);
+    assert!(ranges.contains_key(&70) && !ranges.contains_key(&3));
+    // A turn's slots dropped, the others kept.
+    let other = (0..RUN * 64).step_by(RUN as usize).find(|&i| turn_of(i) != turn_of(70)).expect("another turn");
+    ranges.insert(other, range(0x80));
+    let mut slots = Vec::new();
+    Afresh::Turn(turn_of(70)).apply(&mut ranges, &mut slots);
+    assert_eq!(ranges.iter().map(|(i, _)| i).collect::<Vec<_>>(), [other]);
+    Afresh::All.apply(&mut ranges, &mut slots);
+    assert!(ranges.is_empty() && ranges.get(other).is_none());
+    crate::shadow::unregister(0x7e57_6501, base);
 }

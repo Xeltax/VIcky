@@ -128,7 +128,123 @@ use crate::shadow::Shadow;
 pub(crate) type Range = (Arc<Shadow>, u64, u64);
 
 /// Per title slot, the range its view read when the pass last looked at it.
-pub(crate) type Ranges = HashMap<u32, Range>;
+///
+/// VIcky: by slot, in a vector as long as the highest slot kept (some 30 MB
+/// for the title's 1.2 million slots). It was a hash map of some 350,000
+/// ranges, a table larger than the processor's caches: each slot of a pass
+/// dropped its range and kept the new one with a probe into it at random,
+/// 17-22 ms a pass in PT0 and PB1 (`parts`' "kept ranges"). The pass walks
+/// its slots in order, so here they are walked forward. What is kept is the
+/// same; the order the spans are worked out in ([`spans`]) is that of the
+/// slots instead of the hash map's, which was random.
+#[derive(Default)]
+pub(crate) struct Ranges {
+    by_slot: Vec<Option<Range>>,
+    len: usize,
+}
+
+impl Ranges {
+    pub(crate) fn new() -> Ranges {
+        Ranges::default()
+    }
+
+    /// The ranges kept.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The range kept for title slot `index`.
+    pub(crate) fn get(&self, index: u32) -> Option<&Range> {
+        self.by_slot.get(index as usize)?.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_key(&self, index: &u32) -> bool {
+        self.get(*index).is_some()
+    }
+
+    /// Keeps `range` for title slot `index`; the one it had.
+    pub(crate) fn insert(&mut self, index: u32, range: Range) -> Option<Range> {
+        let at = index as usize;
+        if at >= self.by_slot.len() {
+            self.by_slot.resize_with(at + 1, || None);
+        }
+        let old = self.by_slot[at].replace(range);
+        self.len += usize::from(old.is_none());
+        old
+    }
+
+    /// Drops the range of title slot `index`; the one it had.
+    pub(crate) fn remove(&mut self, index: &u32) -> Option<Range> {
+        let old = self.by_slot.get_mut(*index as usize)?.take();
+        self.len -= usize::from(old.is_some());
+        old
+    }
+
+    /// Each slot kept and its range, in slot order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (u32, &Range)> {
+        self.by_slot.iter().enumerate().filter_map(|(i, r)| Some((i as u32, r.as_ref()?)))
+    }
+
+    /// The ranges kept, in slot order.
+    pub(crate) fn values(&self) -> impl Iterator<Item = &Range> {
+        self.by_slot.iter().flatten()
+    }
+}
+
+/// What [`Afresh::apply`] drops kept ranges from: the passes' [`Ranges`], or
+/// a model's map (tests).
+trait KeptBySlot {
+    fn clear(&mut self);
+    fn retain_slots(&mut self, keep: impl FnMut(u32) -> bool);
+}
+
+impl KeptBySlot for Ranges {
+    fn clear(&mut self) {
+        self.by_slot.clear();
+        self.len = 0;
+    }
+
+    fn retain_slots(&mut self, mut keep: impl FnMut(u32) -> bool) {
+        for (i, r) in self.by_slot.iter_mut().enumerate() {
+            if r.is_some() && !keep(i as u32) {
+                *r = None;
+                self.len -= 1;
+            }
+        }
+    }
+}
+
+impl<V> KeptBySlot for HashMap<u32, V> {
+    fn clear(&mut self) {
+        HashMap::clear(self);
+    }
+
+    fn retain_slots(&mut self, mut keep: impl FnMut(u32) -> bool) {
+        self.retain(|&index, _| keep(index));
+    }
+}
+
+/// Diagnostics builds: whether the pass looks, for each slot it keeps a range
+/// of, whether the slot shows the buffer of the copy the range is on
+/// (`HostHeap::shows`; the memory line's count of views whose slot showed
+/// another copy): `VICTORY_HEAP_PASS_SHOWN=1`, or with a check of the pass
+/// (`VICTORY_HEAP_PASS_BESIDE_CHECK=1`, `VICTORY_HEAP_PASS_THREADS_CHECK=1`).
+/// VIcky: off by default, even in diagnostics builds. The look takes the
+/// slot state's lock once a slot: 33-59 ms of a pass of 139-147 ms in PT0
+/// and PB1 (`parts`).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn shown() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_HEAP_PASS_SHOWN").is_some_and(|v| v == "1") || check_on() || threads::check_on()
+    })
+}
 
 /// Per host heap: the passes so far (in place) and the range each slot's
 /// buffer view reads, kept from pass to pass. Only the slots written since
@@ -214,10 +330,10 @@ pub(crate) fn buffers_taken(
         if !shared && n % PASS_CHUNK == 0 {
             taking.chunk();
         }
-        {
+        let had = {
             let _ranges = enter(Part::Ranges);
-            ranges.remove(&index);
-        }
+            ranges.remove(&index)
+        };
         let Some(handle) = heap.handle(index) else {
             parts::count(Count::Past);
             continue;
@@ -264,6 +380,8 @@ pub(crate) fn buffers_taken(
             tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
             crate::host::log_removal_context();
         }
+        // (No lookup kept: the slot was made from its record already.)
+        let made_already = shared && lookups.asked() == 0;
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
         let copy = {
@@ -286,11 +404,16 @@ pub(crate) fn buffers_taken(
         } else {
             (shadow, address, len)
         };
+        if made_already {
+            parts::count(if same_range(had.as_ref(), (&shadow, address, address + len)) { Count::Again } else { Count::Moved });
+        }
         #[cfg(feature = "diagnostics")]
         {
-            let _shows = enter(Part::Shows);
-            if host.shows(index, &shadow.buffer) == Some(false) {
-                super::HEAP_VIEWS_ELSEWHERE.fetch_add(1, Relaxed);
+            if shown() {
+                let _shows = enter(Part::Shows);
+                if host.shows(index, &shadow.buffer) == Some(false) {
+                    super::HEAP_VIEWS_ELSEWHERE.fetch_add(1, Relaxed);
+                }
             }
         }
         if let Some(found) = found.as_deref_mut() {
@@ -300,6 +423,12 @@ pub(crate) fn buffers_taken(
         ranges.insert(index, (shadow, address, address + len));
     }
     taking.end()
+}
+
+/// Whether `had` (a slot's kept range) is the range `now` (the same copy,
+/// from, to).
+fn same_range(had: Option<&Range>, (shadow, from, to): (&Arc<Shadow>, u64, u64)) -> bool {
+    had.is_some_and(|(s, f, t)| Arc::ptr_eq(s, shadow) && (*f, *t) == (from, to))
 }
 
 /// Per host copy (by its address), the span the kept ranges cover on it.
@@ -646,12 +775,12 @@ impl Afresh {
     /// Drops the kept ranges the pass makes afresh. For a turn and a list,
     /// `slots` (the written ones, then the window) are put in order, each
     /// once.
-    fn apply<V>(self, ranges: &mut HashMap<u32, V>, slots: &mut Vec<u32>) {
+    fn apply(self, ranges: &mut impl KeptBySlot, slots: &mut Vec<u32>) {
         match self {
             Afresh::None => {}
             Afresh::All => ranges.clear(),
             Afresh::Turn(turn) => {
-                ranges.retain(|&index, _| turn_of(index) != turn);
+                ranges.retain_slots(|index| turn_of(index) != turn);
                 slots.sort_unstable();
                 slots.dedup();
             }

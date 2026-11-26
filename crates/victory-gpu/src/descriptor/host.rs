@@ -3454,9 +3454,18 @@ impl RecordCache {
     }
 
     /// The first of the two entries `key` may be kept in.
+    ///
+    /// VIcky: the top bits of the record's product with an odd constant,
+    /// which every bit of the record moves. It was bits 29 and up, masked:
+    /// those move only with the record's low 38 bits, which for a view of
+    /// placed memory are its address alone (its shape number lies in bits
+    /// 40 and up), so every view at one address, whatever its elements,
+    /// fell in one set of two and they put each other out (a ring of views
+    /// of one buffer, `a_pass_counts_what_its_slots_came_to`). Which records
+    /// are kept changes; what a slot is made of does not.
     fn set(&self, key: u64) -> usize {
-        let sets = self.entries.len() / 2;
-        ((key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 29) as usize & (sets - 1)) * 2
+        let bits = (self.entries.len() / 2).trailing_zeros();
+        ((key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - bits)) as usize) * 2
     }
 
     /// The entry of `key`, if it is kept.
@@ -5765,6 +5774,22 @@ mod fast_tests {
         cache.tick = 4;
         let room = cache.room(same[2]);
         assert_eq!(cache.entries[room].key, same[1]);
+    }
+
+    /// Records that differ in their high bits alone (views of placed memory
+    /// at one address with other shapes) are kept in sets of their own.
+    #[test]
+    fn records_that_differ_in_their_high_bits_take_other_sets() {
+        if host().is_none() {
+            return;
+        }
+        let cache = RecordCache::new(1 << 18, 32).unwrap();
+        // A placed view's record: its address in the low 40 bits, its shape
+        // above.
+        let at = 0x8000_0061u64 << 32;
+        let sets: std::collections::HashSet<usize> = (0..64u64).map(|shape| cache.set(at | shape << 40)).collect();
+        assert!(sets.len() >= 60, "{} sets for 64 shapes", sets.len());
+        assert!(sets.iter().all(|&s| s % 2 == 0 && s < cache.entries.len()));
     }
 
     /// Lookups kept look each ask up once and give the same copy again.

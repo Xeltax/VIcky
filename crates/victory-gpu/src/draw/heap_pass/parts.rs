@@ -123,9 +123,16 @@ pub(crate) enum Count {
     /// The diagnostics' looks at the shown buffer that waited for the slot
     /// state's lock.
     ShowsWaited,
+    /// Of the slots made from their record already (no lookup kept for
+    /// their making) that have a copy and range: those whose range is the
+    /// one the pass kept for them last time (the same copy, from, to), and
+    /// the others. What a cache of each slot's copy and range would have
+    /// spared, at most, and how often it would have been wrong.
+    Again,
+    Moved,
 }
 
-const COUNTS: usize = 17;
+const COUNTS: usize = 19;
 
 /// One chunk of slots in this many is timed part by part.
 pub(crate) const SAMPLE: u64 = 8;
@@ -435,7 +442,9 @@ pub(crate) fn line() {
          {:.0} past the heap, {:.0} naming no view of ours, {:.0} without a pool slot, {:.0} made from their record \
          already, {:.0} copied from the cache, {:.0} made and kept in it, {:.0} made otherwise, {:.0} the host could not \
          make; {:.0} with a copy and range to keep, {:.0} without; heap map: {:.0} host slots looked up, {:.0} pool slots \
-         taken; {:.0} host copies looked up; {:.0} of the diagnostics' looks at the shown buffer waited for the lock",
+         taken; {:.0} host copies looked up; of the slots made from their record already, {:.0} found the copy and \
+         range they had kept, {:.0} another; {:.0} of the diagnostics' looks at the shown buffer waited for the lock \
+         (VICTORY_HEAP_PASS_SHOWN=1)",
         per(p[1]),
         us as f64 / 1000.0,
         ms(p[3]),
@@ -455,6 +464,8 @@ pub(crate) fn line() {
         c(Count::Mapped),
         c(Count::Taken),
         c(Count::Lookups),
+        c(Count::Again),
+        c(Count::Moved),
         c(Count::ShowsWaited),
     );
 }

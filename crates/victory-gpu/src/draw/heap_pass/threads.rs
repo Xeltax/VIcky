@@ -104,7 +104,7 @@ pub(crate) fn wanted(slots: usize) -> Option<usize> {
 
 /// Whether one pass in [`CHECK_EVERY`] is run again on one thread and
 /// compared (`VICTORY_HEAP_PASS_THREADS_CHECK=1`).
-fn check_on() -> bool {
+pub(crate) fn check_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_CHECK.get() {
         return on;
@@ -154,6 +154,8 @@ pub(crate) fn buffers(
     let fast = crate::descriptor::host::TEST_FAST.get();
     let (heap_at, host_at) = (std::ptr::from_ref(heap) as usize, std::ptr::from_ref(host) as usize);
     let slots_ro: &[u32] = slots;
+    // (Read by the threads, changed only once they are done.)
+    let kept: &Ranges = ranges;
     let one = || {
         #[cfg(test)]
         let _fast = super::TestFast::here(fast);
@@ -162,7 +164,7 @@ pub(crate) fn buffers(
         // reading: `crate::descriptor::with_heap`) until this returns,
         // which is after every thread is joined.
         let (heap, host) = unsafe { (&*(heap_at as *const Heap), &*(host_at as *const HostHeap)) };
-        work(heap, host, slots_ro, &next, &done, (marks, shared, noting))
+        work(heap, host, (slots_ro, kept), &next, &done, (marks, shared, noting))
     };
     let one = &one;
     let results: Vec<(Took, Vec<(u32, u64)>)> = std::thread::scope(|s| {
@@ -221,7 +223,7 @@ pub(crate) fn buffers(
 fn work(
     heap: &Heap,
     host: &HostHeap,
-    slots: &[u32],
+    (slots, kept): (&[u32], &Ranges),
     next: &AtomicUsize,
     done: &[Mutex<Vec<Slot>>],
     (marks, shared, noting): (bool, bool, bool),
@@ -257,6 +259,8 @@ fn work(
                 chunk.push(Slot { index, found, range: None });
                 continue;
             };
+            // (No lookup kept: the slot was made from its record already.)
+            let made_already = shared && lookups.asked() == 0;
             let copy = {
                 let _copy = enter(Part::Copy);
                 buffer_copy_with(&view, &mut lookups)
@@ -276,8 +280,16 @@ fn work(
             } else {
                 (shadow, address, len)
             };
+            if made_already {
+                let again = super::same_range(kept.get(index), (&shadow, address, address + len));
+                parts::count(if again { Count::Again } else { Count::Moved });
+            }
             #[cfg(feature = "diagnostics")]
-            shown.push((index, shadow.clone()));
+            {
+                if super::shown() {
+                    shown.push((index, shadow.clone()));
+                }
+            }
             let found = noting.then(|| Found { index, view: Some(view), range: Some((shadow.id(), address, address + len)) });
             chunk.push(Slot { index, found, range: Some((shadow, address, address + len)) });
         }
@@ -286,10 +298,12 @@ fn work(
         // alone, which would have had every thread wait for it).
         #[cfg(feature = "diagnostics")]
         {
-            let _shows = enter(Part::Shows);
-            let pairs: Vec<(u32, &windows::Win32::Graphics::Direct3D12::ID3D12Resource)> =
-                shown.iter().map(|(i, s)| (*i, &s.buffer)).collect();
-            crate::draw::HEAP_VIEWS_ELSEWHERE.fetch_add(host.shows_elsewhere(&pairs), Relaxed);
+            if !shown.is_empty() {
+                let _shows = enter(Part::Shows);
+                let pairs: Vec<(u32, &windows::Win32::Graphics::Direct3D12::ID3D12Resource)> =
+                    shown.iter().map(|(i, s)| (*i, &s.buffer)).collect();
+                crate::draw::HEAP_VIEWS_ELSEWHERE.fetch_add(host.shows_elsewhere(&pairs), Relaxed);
+            }
         }
         // Once a chunk while the device lives (a cheap query), as the pass
         // on one thread asks once every 64 views.
