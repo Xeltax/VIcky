@@ -1,8 +1,8 @@
 //! `VICTORY_CENSUS=1` (off by default): what of the copy-back of shader
 //! writes comes from memory the title reserved write-combining, and who
 //! takes those bytes afterwards. Written to the log every
-//! `VICTORY_CENSUS_SECONDS` (10). Logging only: nothing here changes what
-//! is copied, when, or where.
+//! `VICTORY_CENSUS_SECONDS` (10). The census is logging only: it changes
+//! nothing of what is copied, when, or where.
 //!
 //! From fork PR #868 (Chipsraine; the per-range classification and the
 //! in-flight count by iGoldenNinja): the `XMemVirtualAlloc` reservation each
@@ -23,14 +23,18 @@
 //!   a copy in place) or a texture over them: such a page cannot be left on
 //!   the card, the other copy would read old bytes;
 //! - the same copy taking the page again (the upload echo: the write-back
-//!   made title memory newer than the copy's CPU side, and the whole page
-//!   goes up again);
+//!   wrote title memory, the write watch tells of the page, and the copy's
+//!   next refresh takes it in whole and sends it up again);
 //!
 //! and, of the WC bytes fetched, how many lie in pages no other live copy
-//! covers, and how many in pages no other copy was ever seen taking after
-//! a card write. What the title's own CPU reads is not seen: nothing
-//! watches reads. Copies in the PC's memory, merged on the CPU, are counted
-//! on a line of their own.
+//! covers (textures read from title memory count as copies), and how many
+//! in pages no other copy was ever seen taking after a card write: what
+//! [`skip_wc_back`] would leave on the card with `1` and with `2`. What the
+//! title's own CPU reads is not seen: nothing watches reads. Copies in the
+//! PC's memory, merged on the CPU, are counted on a line of their own.
+//!
+//! The same notes serve [`skip_wc_back`] (`VICTORY_SKIP_WC_BACK`), which
+//! keeps them whether or not the census logs.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -46,9 +50,101 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CENSUS").is_some_and(|v| v == "1"))
 }
 
-/// Whether the pages and the reservations are kept.
+/// Whether the pages and the reservations are kept: with the census or
+/// with [`skip_wc_back`].
 pub(crate) fn tracking() -> bool {
-    on()
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| on() || skip_wc_back() != Skip::Off)
+}
+
+/// `VICTORY_SKIP_WC_BACK` (off by default), an experiment after fork PR
+/// #868 (Chipsraine): what shaders wrote to a title buffer's copy in the
+/// card's memory, in memory the title reserved write-combining, is left on
+/// the card instead of being fetched back into title memory. The console's
+/// CPU writes such memory and does not read it back (#868's census: 97-99 %
+/// of some 100 MB fetched back a frame came from it); fetched back, a page
+/// also went up again whole with the copy's next refresh (the echo).
+///
+/// What it assumes, and what guards it here:
+/// - The title's CPU does not read those bytes. Not seen: nothing watches
+///   reads. With `VICTORY_SKIP_WC_BACK_CHECK=N` ([`check_every`]), every N
+///   frames one landing leaves nothing on the card and asks for the pieces
+///   left before with the next flight that declares them: a reader then
+///   sees bytes some N frames old at worst, and the census counts what that
+///   landing wrote into title memory (what had differed).
+/// - No other copy reads them. Another copy of the same memory (a buffer
+///   inside this one with a copy of its own, a window, a copy in place, a
+///   texture) gets a shader's write only through title memory. So a piece
+///   is left only in a title buffer's copy (not a window: windows are let
+///   go when idle, and what they hold with them), only in a page shown at
+///   one address, only where no copy other than the one that wrote it ever
+///   wrote it back or took it after a card write, and with `1` only in a
+///   page no other live copy covers at all. A copy that takes a page while
+///   it holds bytes left on the card is counted, the page is fetched with
+///   the next flight that declares it, and it is never left again.
+/// - The title's CPU writing part of such a page: the refresh would take
+///   the whole page from title memory, old bytes where the shaders wrote,
+///   and send it up over the card's. Here only the bytes title memory
+///   changed go into the CPU's side and up there ([`stale_pages`],
+///   `Shadow::copy`); with `VICTORY_DENSE_PAGE_WHOLE=1` such a page does
+///   not go up whole either (it takes the runs or the patch).
+///
+/// `1`: as above. `2`: also in pages other live copies cover, until one of
+/// them is seen taking a card write there (that one reads old bytes once).
+/// Any other value: off, and nothing changes. Landings that take their
+/// pieces from in-flight slots (`VICTORY_CARD_FETCH_INFLIGHT=1`) leave
+/// nothing. `VICTORY_SKIP_WC_COMPARE` of #868 is not taken: a device
+/// removal and a black world were reported with it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Skip {
+    Off,
+    /// `1`: in pages no other copy covers.
+    Alone,
+    /// `2`: in pages no other copy took a card write in.
+    Untaken,
+}
+
+pub(crate) fn skip_wc_back() -> Skip {
+    static MODE: std::sync::OnceLock<Skip> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_SKIP_WC_BACK").as_deref().map(str::trim) {
+            Ok("1") => Skip::Alone,
+            Ok("2") => Skip::Untaken,
+            _ => Skip::Off,
+        };
+        if mode != Skip::Off {
+            tracing::warn!(
+                ?mode,
+                check_every = check_every(),
+                "VICTORY_SKIP_WC_BACK: what shaders write to copies of write-combining title memory is left on the card where no \
+                 other copy takes it (an experiment after fork PR #868)"
+            );
+        }
+        mode
+    })
+}
+
+/// `VICTORY_SKIP_WC_BACK_CHECK=N` (N at least 2; off by default): one
+/// landing in every N frames leaves nothing on the card ([`skip_wc_back`]).
+pub(crate) fn check_every() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_WC_BACK_CHECK").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n >= 2).unwrap_or(0)
+    })
+}
+
+/// Whether the landing that asks is the check of its N frames
+/// ([`check_every`]): the first to ask once a multiple of N frames is reached.
+pub(crate) fn check_landing() -> bool {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let every = check_every();
+    every != 0 && skip_wc_back() != Skip::Off && check_due(&LAST, crate::frame::current(), every)
+}
+
+fn check_due(last: &AtomicU64, frame: u64, every: u64) -> bool {
+    let epoch = frame / every + 1;
+    let was = last.load(Ordering::Relaxed);
+    epoch > was && last.compare_exchange(was, epoch, Ordering::Relaxed, Ordering::Relaxed).is_ok()
 }
 
 fn period() -> Duration {
@@ -170,7 +266,30 @@ mod n {
     pub(super) const PC_WRITTEN_WC: usize = 19;
     /// Bytes sent up to copies in the card's memory.
     pub(super) const SENT: usize = 20;
-    pub(super) const COUNT: usize = 21;
+    /// WC bytes fetched from windows (never left on the card).
+    pub(super) const WC_WINDOW: usize = 21;
+    /// `VICTORY_SKIP_WC_BACK`: pieces and bytes left on the card.
+    pub(super) const LEFT_PIECES: usize = 22;
+    pub(super) const LEFT: usize = 23;
+    /// Bytes left on the card that another copy then took (old bytes), and
+    /// how many times.
+    pub(super) const STALE_TAKEN: usize = 24;
+    pub(super) const STALE_TAKEN_PAGES: usize = 25;
+    /// Bytes the merges wrote of pieces left before (fetched again).
+    pub(super) const BROUGHT_BACK: usize = 26;
+    /// Pages holding bytes left on the card that the title's CPU wrote
+    /// again, and the bytes of its that went up there.
+    pub(super) const TITLE_OVER: usize = 27;
+    pub(super) const TITLE_OVER_UP: usize = 28;
+    /// Pages holding bytes left on the card whose copy went.
+    pub(super) const LOST: usize = 29;
+    /// Check landings ([`super::check_every`]): bytes fetched of pieces the
+    /// rules would have left, bytes the merges wrote of them, and of those
+    /// the bytes of pieces left before.
+    pub(super) const CHECK_FETCHED: usize = 30;
+    pub(super) const CHECK_WRITTEN: usize = 31;
+    pub(super) const CHECK_STALE: usize = 32;
+    pub(super) const COUNT: usize = 33;
 }
 
 static COUNTS: [AtomicU64; n::COUNT] = [const { AtomicU64::new(0) }; n::COUNT];
@@ -195,6 +314,22 @@ struct Written {
     takers: Vec<u64>,
     /// Whether the owner took the page again since (the echo).
     echoed: bool,
+    /// [`skip_wc_back`]: `[lo, hi)` was left on the card, and title memory
+    /// lacks what the owner's shaders wrote there.
+    stale: bool,
+}
+
+impl Written {
+    fn new(owner: u64, lo: usize, hi: usize, stale: bool) -> Written {
+        Written {
+            owner,
+            lo,
+            hi,
+            takers: Vec::new(),
+            echoed: false,
+            stale,
+        }
+    }
 }
 
 /// The pages noted ([`Written`]), how many live copies cover each page,
@@ -205,15 +340,24 @@ struct Pages {
     /// Pages noted per owner.
     owners: HashMap<u64, usize>,
     cover: HashMap<usize, u32>,
+    /// Pages another copy took after a card write, or two copies wrote
+    /// back: never left on the card.
     taken: HashSet<usize>,
+    /// Pages noted `stale`, in all and per owner.
+    stale: usize,
+    stale_by: HashMap<u64, usize>,
+    /// Stale pages (owner, page) to fetch with the next flight that
+    /// declares them, whatever its compare says.
+    refetch: HashSet<(u64, usize)>,
 }
 
-/// What [`Pages::took`] found: bytes taken, and pages that had no other
-/// taker before.
+/// What [`Pages::took`] found: bytes taken, pages that had no other taker
+/// before, and bytes taken that title memory lacked (left on the card).
 #[derive(Default, Debug, PartialEq, Eq)]
 struct Took {
     bytes: usize,
     pages: usize,
+    stale: usize,
 }
 
 impl Pages {
@@ -251,6 +395,19 @@ impl Pages {
         let page = lo / PAGE;
         let mut two = false;
         match self.written.get_mut(&page) {
+            Some(w) if w.owner != owner && w.stale => {
+                // The first copy's bytes left on the card are still not in
+                // title memory: the page stays noted under it.
+                self.taken.insert(page);
+                (w.lo, w.hi) = (w.lo.min(lo), w.hi.max(hi));
+                return true;
+            }
+            Some(w) if w.owner == owner && w.stale => {
+                // Bytes left before, beside this write.
+                (w.lo, w.hi) = (w.lo.min(lo), w.hi.max(hi));
+                w.takers.clear();
+                w.echoed = false;
+            }
             Some(w) => {
                 if w.owner != owner {
                     two = true;
@@ -274,7 +431,7 @@ impl Pages {
                 w.echoed = false;
             }
             None => {
-                self.written.insert(page, Written { owner, lo, hi, takers: Vec::new(), echoed: false });
+                self.written.insert(page, Written::new(owner, lo, hi, false));
                 *self.owners.entry(owner).or_insert(0) += 1;
             }
         }
@@ -283,10 +440,11 @@ impl Pages {
 
     /// `taker` (not `owner` of a page) brought `[from, to)` up to date:
     /// what of the noted pages' written bytes it took for the first time
-    /// since their write.
+    /// since their write. A stale page so taken is to be fetched again.
     fn took(&mut self, taker: u64, from: usize, to: usize) -> Took {
         let mut took = Took::default();
         let mut first = Vec::new();
+        let mut again = Vec::new();
         for (&page, w) in self.written.range_mut(Self::pages(from, to)) {
             if w.owner == taker || w.takers.contains(&taker) {
                 continue;
@@ -299,11 +457,109 @@ impl Pages {
                 took.pages += 1;
                 first.push(page);
             }
+            if w.stale {
+                took.stale += b - a;
+                again.push((w.owner, page));
+            }
             w.takers.push(taker);
             took.bytes += b - a;
         }
         self.taken.extend(first);
+        self.refetch.extend(again);
         took
+    }
+
+    /// Whether copy `owner` may leave a piece of `page` on the card under
+    /// `mode` ([`skip_wc_back`]): no other copy took a card write there or
+    /// wrote it back, and with [`Skip::Alone`] no other live copy covers it.
+    fn may_skip(&self, mode: Skip, owner: u64, page: usize) -> bool {
+        mode != Skip::Off
+            && !self.taken.contains(&page)
+            && self.written.get(&page).is_none_or(|w| w.owner == owner)
+            && (mode != Skip::Alone || self.covered(page) <= 1)
+    }
+
+    /// Copy `owner` left title bytes `[lo, hi)` (inside one page) on the
+    /// card ([`Pages::may_skip`] said it may).
+    fn left(&mut self, owner: u64, lo: usize, hi: usize) {
+        let page = lo / PAGE;
+        match self.written.get_mut(&page) {
+            Some(w) => {
+                if w.stale {
+                    (w.lo, w.hi) = (w.lo.min(lo), w.hi.max(hi));
+                } else {
+                    (w.lo, w.hi, w.stale) = (lo, hi, true);
+                    self.stale += 1;
+                    *self.stale_by.entry(owner).or_insert(0) += 1;
+                }
+                w.takers.clear();
+                w.echoed = false;
+            }
+            None => {
+                self.written.insert(page, Written::new(owner, lo, hi, true));
+                *self.owners.entry(owner).or_insert(0) += 1;
+                self.stale += 1;
+                *self.stale_by.entry(owner).or_insert(0) += 1;
+            }
+        }
+    }
+
+    /// `n` of `owner`'s stale pages are not any more.
+    fn stale_gone(&mut self, owner: u64, n: usize) {
+        self.stale -= n;
+        if let Some(by) = self.stale_by.get_mut(&owner) {
+            *by = by.saturating_sub(n);
+            if *by == 0 {
+                self.stale_by.remove(&owner);
+            }
+        }
+    }
+
+    /// Copy `owner`'s piece `[lo, hi)` came back and was merged (`wrote`:
+    /// it changed title memory). Returns whether another copy had written
+    /// the page back, and whether it brought back all that was left there.
+    fn merged(&mut self, owner: u64, lo: usize, hi: usize, wrote: bool) -> (bool, bool) {
+        let page = lo / PAGE;
+        let mut back = false;
+        if let Some(w) = self.written.get_mut(&page)
+            && w.stale
+            && w.owner == owner
+            && lo <= w.lo
+            && w.hi <= hi
+        {
+            w.stale = false;
+            back = true;
+        }
+        if back {
+            self.stale_gone(owner, 1);
+            self.refetch.remove(&(owner, page));
+        }
+        (wrote && self.wrote(owner, lo, hi), back)
+    }
+
+    /// Copy `id` is gone: its pages left on the card are lost (title memory
+    /// keeps the old bytes) and never left again. Returns how many.
+    fn gone(&mut self, id: u64) -> usize {
+        if !self.owners.contains_key(&id) {
+            return 0;
+        }
+        let mut lost = Vec::new();
+        for (&page, w) in self.written.iter_mut() {
+            if w.owner == id && w.stale {
+                w.stale = false;
+                lost.push(page);
+            }
+        }
+        self.stale_gone(id, lost.len());
+        self.refetch.retain(|r| r.0 != id);
+        let n = lost.len();
+        self.taken.extend(lost);
+        n
+    }
+
+    /// Copy `id`'s stale pages in `[from, to)`.
+    fn stale_in(&self, id: u64, from: usize, to: usize) -> Vec<usize> {
+        self.written.range(Self::pages(from, to)).filter(|(_, w)| w.stale && w.owner == id).map(|(&page, _)| page).collect()
     }
 
     /// Copy `id` took title memory `[from, to)` again: the bytes of pages it
@@ -335,10 +591,20 @@ fn pages() -> MutexGuard<'static, Pages> {
 /// that copy has nothing to look for.
 static OWNERS: AtomicUsize = AtomicUsize::new(0);
 static SOLE_OWNER: AtomicU64 = AtomicU64::new(0);
+/// Pages noted stale, and pages to fetch again ([`Pages`]).
+static STALE: AtomicUsize = AtomicUsize::new(0);
+static REFETCH: AtomicUsize = AtomicUsize::new(0);
+/// The copies with stale pages, as bit `id % 64`: a refresh of any other
+/// copy has nothing to look for ([`stale_pages`]).
+static STALE_OWNERS: AtomicU64 = AtomicU64::new(0);
 
-fn owners_now(p: &Pages) {
+/// After a change of the pages: what the hooks look at without the lock.
+fn noted(p: &Pages) {
     OWNERS.store(p.owners.len(), Ordering::Relaxed);
     SOLE_OWNER.store(p.owners.keys().next().copied().unwrap_or(0), Ordering::Relaxed);
+    STALE.store(p.stale, Ordering::Relaxed);
+    REFETCH.store(p.refetch.len(), Ordering::Relaxed);
+    STALE_OWNERS.store(p.stale_by.keys().fold(0, |bits, id| bits | 1 << (id % 64)), Ordering::Relaxed);
 }
 
 /// A copy of title memory `[start, start + len)` was made (any kind: in the
@@ -349,11 +615,110 @@ pub(crate) fn copy_made(start: u64, len: u64) {
     }
 }
 
-/// That copy is gone.
-pub(crate) fn copy_gone(start: u64, len: u64) {
-    if tracking() {
-        pages().cover(start as usize, len as usize, false);
+/// Copy `id` of `[start, start + len)` is gone.
+pub(crate) fn copy_gone(id: u64, start: u64, len: u64) {
+    if !tracking() {
+        return;
     }
+    let mut p = pages();
+    p.cover(start as usize, len as usize, false);
+    let lost = p.gone(id);
+    if lost > 0 {
+        noted(&p);
+        drop(p);
+        count(n::LOST, lost as u64);
+        tracing::warn!(
+            copy = id,
+            start = format_args!("{start:#x}"),
+            pages = lost,
+            "VICTORY_SKIP_WC_BACK: a copy went with pages it had left on the card; title memory keeps older bytes there"
+        );
+    }
+}
+
+/// [`skip_wc_back`]: whether piece `[lo, hi)` (offsets) of copy `which`,
+/// flagged by the card's compare under the declared title range
+/// `declared`, is left on the card instead of being fetched back. Not in a
+/// check landing (`check`, [`check_landing`]). See [`skip_wc_back`] for
+/// the rules.
+pub(crate) fn skip_back(which: Which, declared: (usize, usize), lo: usize, hi: usize, check: bool) -> bool {
+    let mode = skip_wc_back();
+    if mode == Skip::Off || check || which.window || lo >= hi {
+        return false;
+    }
+    let (a, b) = (which.start as usize + lo, which.start as usize + hi);
+    if !all_wc(&[declared, (a, b)]) || crate::inplace::view_census(a, b - a).1 > 0 {
+        return false;
+    }
+    let mut p = pages();
+    // A page due to come back ([`refetch_due`]) comes back.
+    if !p.may_skip(mode, which.id, a / PAGE) || p.refetch.contains(&(which.id, a / PAGE)) {
+        return false;
+    }
+    p.left(which.id, a, b);
+    noted(&p);
+    drop(p);
+    count(n::LEFT, (b - a) as u64);
+    let pieces = COUNTS[n::LEFT_PIECES].fetch_add(1, Ordering::Relaxed) + 1;
+    if pieces.is_power_of_two() {
+        tracing::info!(
+            "VICTORY_SKIP_WC_BACK: {pieces} pieces ({} MB) of write-combining memory left on the card so far",
+            COUNTS[n::LEFT].load(Ordering::Relaxed) >> 20
+        );
+    }
+    true
+}
+
+/// Copy `id`'s pages in title memory `[from, to)` that hold bytes left on
+/// the card: a refresh there must not send title memory's old bytes up
+/// over them (`Shadow::copy`).
+pub(crate) fn stale_pages(id: u64, from: usize, to: usize) -> Vec<usize> {
+    if STALE_OWNERS.load(Ordering::Relaxed) & 1 << (id % 64) == 0 || from >= to {
+        return Vec::new();
+    }
+    pages().stale_in(id, from, to)
+}
+
+/// The title wrote a page holding bytes left on the card: `up` bytes of its
+/// went into the copy's CPU side and up.
+pub(crate) fn title_over(up: usize) {
+    count(n::TITLE_OVER, 1);
+    count(n::TITLE_OVER_UP, up as u64);
+}
+
+/// For a landing ([`skip_wc_back`]): the stale pages (copy, page) to fetch
+/// whatever the compares say, all of them in a check landing (`check`).
+/// `None` if there are none.
+pub(crate) fn refetch_due(check: bool) -> Option<HashSet<(u64, usize)>> {
+    if skip_wc_back() == Skip::Off || (!check && REFETCH.load(Ordering::Relaxed) == 0) {
+        return None;
+    }
+    let mut p = pages();
+    if check {
+        let stale: Vec<(u64, usize)> = p.written.iter().filter(|(_, w)| w.stale).map(|(&page, w)| (w.owner, page)).collect();
+        p.refetch.extend(stale);
+        noted(&p);
+    }
+    (!p.refetch.is_empty()).then(|| p.refetch.clone())
+}
+
+/// Tests: copy `id` left title bytes `[a, b)` on the card, or is done with.
+#[cfg(test)]
+pub(crate) fn left_for_test(id: u64, range: Option<(usize, usize)>) {
+    let mut p = pages();
+    match range {
+        Some((a, b)) => p.left(id, a, b),
+        None => {
+            p.gone(id);
+        }
+    }
+    noted(&p);
+}
+
+/// Whether the piece at offset `lo` of copy `which` is in `due`
+/// ([`refetch_due`]).
+pub(crate) fn due(due: &HashSet<(u64, usize)>, which: Which, lo: usize) -> bool {
+    due.contains(&(which.id, (which.start as usize + lo) / PAGE))
 }
 
 /// `taker` (a copy's number or a [`texture_taker`]) is brought up to date
@@ -367,7 +732,14 @@ pub(crate) fn asked(taker: u64, kind: Taker, from: usize, to: usize) {
         1 if SOLE_OWNER.load(Ordering::Relaxed) == taker => return,
         _ => {}
     }
-    let took = pages().took(taker, from, to);
+    let took = {
+        let mut p = pages();
+        let took = p.took(taker, from, to);
+        if took.stale > 0 {
+            noted(&p);
+        }
+        took
+    };
     if took.bytes == 0 {
         return;
     }
@@ -379,12 +751,27 @@ pub(crate) fn asked(taker: u64, kind: Taker, from: usize, to: usize) {
     };
     count(i, took.bytes as u64);
     count(n::TAKEN_PAGES, took.pages as u64);
+    if took.stale > 0 {
+        count(n::STALE_TAKEN, took.stale as u64);
+        let times = COUNTS[n::STALE_TAKEN_PAGES].fetch_add(1, Ordering::Relaxed) + 1;
+        if times.is_power_of_two() {
+            tracing::warn!(
+                taker = format_args!("{taker:#x}"),
+                ?kind,
+                at = format_args!("{from:#x}..{to:#x}"),
+                bytes = took.stale,
+                "VICTORY_SKIP_WC_BACK: another copy took bytes left on the card from title memory (older ones); {times} times so \
+                 far. The page comes back with its next flight and is not left again"
+            );
+        }
+    }
 }
 
 /// Copy `id`, in the card's memory, took title memory `[from, to)` into its
 /// CPU side again (and up to the card).
 pub(crate) fn recopied(id: u64, from: usize, to: usize) {
-    if !tracking() || from >= to || OWNERS.load(Ordering::Relaxed) == 0 {
+    // Counted only for the census: a refresh's lock less with the switch alone.
+    if !on() || from >= to || OWNERS.load(Ordering::Relaxed) == 0 {
         return;
     }
     count(n::ECHO, pages().recopied(id, from, to) as u64);
@@ -442,44 +829,64 @@ pub(crate) fn compared(which: Which, declared: (usize, usize), pieces: u64) {
 /// Offsets `[lo, hi)` of copy `which` came back from the card and its
 /// merge stored `written` bytes of them into title memory. For a piece
 /// taken from an in-flight slot, `[lo, hi)` is what of the slot is merged
-/// (bytes a newer fetch brought are left out).
-pub(crate) fn merged(which: Which, lo: usize, hi: usize, written: usize) {
-    if !on() || lo >= hi {
+/// (bytes a newer fetch brought are left out). `check`: in a check landing
+/// ([`check_landing`]).
+pub(crate) fn merged(which: Which, lo: usize, hi: usize, written: usize, check: bool) {
+    if !tracking() || lo >= hi {
         return;
     }
     let (a, b) = (which.start as usize + lo, which.start as usize + hi);
     let bytes = (hi - lo) as u64;
     count(n::FETCHED, bytes);
     count(n::WRITTEN, written as u64);
-    row(which, |r| {
-        r.fetched += bytes;
-        r.fetched_pieces += 1;
-        r.written += written as u64;
-    });
+    if on() {
+        row(which, |r| {
+            r.fetched += bytes;
+            r.fetched_pieces += 1;
+            r.written += written as u64;
+        });
+    }
     if all_wc(&[(a, b)]) {
         count(n::FETCHED_WC, bytes);
         count(n::WRITTEN_WC, written as u64);
         let multi = crate::inplace::view_census(a, b - a).1 > 0;
+        let page = a / PAGE;
         let mut p = pages();
-        if multi {
+        // What the rules of `skip_wc_back` would leave of the bytes fetched.
+        let mut would = false;
+        if which.window {
+            count(n::WC_WINDOW, bytes);
+        } else if multi {
             count(n::WC_MULTI, bytes);
         } else {
-            let page = a / PAGE;
-            if p.covered(page) <= 1 {
+            if p.may_skip(Skip::Alone, which.id, page) {
                 count(n::WC_ALONE, bytes);
             }
-            if !p.taken.contains(&page) {
+            if p.may_skip(Skip::Untaken, which.id, page) {
                 count(n::WC_UNTAKEN, bytes);
             }
+            would = p.may_skip(skip_wc_back(), which.id, page);
         }
-        if written > 0 {
-            if p.wrote(which.id, a, b) {
-                count(n::TWO_WRITERS, 1);
+        let (two, back) = p.merged(which.id, a, b, written > 0);
+        noted(&p);
+        drop(p);
+        if two {
+            count(n::TWO_WRITERS, 1);
+        }
+        if back {
+            count(n::BROUGHT_BACK, written as u64);
+        }
+        if check && (would || back) {
+            count(n::CHECK_FETCHED, bytes);
+            count(n::CHECK_WRITTEN, written as u64);
+            if back {
+                count(n::CHECK_STALE, written as u64);
             }
-            owners_now(&p);
         }
     }
-    report_if_due();
+    if on() {
+        report_if_due();
+    }
 }
 
 /// A copy in the PC's memory: shaders' declared title range `[from, to)`
@@ -583,15 +990,17 @@ fn report_if_due() {
     );
     tracing::info!(
         target: "census",
-        "census of the WC bytes fetched, per frame: {:.1} MB in pages no other live copy covers, {:.1} MB in pages no other copy took \
-         after a card write so far, {:.1} MB in pages shown at more than one address. Taken again after their write-back: by the copy \
-         that wrote them (the upload echo) {:.1} MB, by other copies {:.2} MB, windows {:.2} MB, copies in place {:.2} MB, textures \
-         {:.2} MB; {:.1} pages a frame taken by another for the first time, {taken_since_start} pages since the start, {:.2} pages a \
-         frame written back through two copies in turn ({noted} WC pages noted, {covered_pages} pages under copies). The title's CPU \
-         reads are not seen",
+        "census of the WC bytes fetched, per frame: of title buffers' copies, at one address, {:.1} MB in pages no other live copy \
+         covers (what VICTORY_SKIP_WC_BACK=1 leaves on the card), {:.1} MB in pages no other copy took after a card write so far \
+         (=2); {:.1} MB in pages shown at more than one address, {:.1} MB of windows (never left). Taken again after their \
+         write-back: by the copy that wrote them (the upload echo) {:.1} MB, by other copies {:.2} MB, windows {:.2} MB, copies in \
+         place {:.2} MB, textures {:.2} MB; {:.1} pages a frame taken by another for the first time, {taken_since_start} pages \
+         since the start, {:.2} pages a frame written back through two copies in turn ({noted} WC pages noted, {covered_pages} \
+         pages under copies). The title's CPU reads are not seen",
         mb(d[n::WC_ALONE]),
         mb(d[n::WC_UNTAKEN]),
         mb(d[n::WC_MULTI]),
+        mb(d[n::WC_WINDOW]),
         mb(d[n::ECHO]),
         mb(d[n::TAKEN_COPY]),
         mb(d[n::TAKEN_WINDOW]),
@@ -609,6 +1018,31 @@ fn report_if_due() {
         mb(d[n::PC_WRITTEN]),
         mb(d[n::PC_WRITTEN_WC]),
     );
+    if skip_wc_back() != Skip::Off {
+        tracing::info!(
+            target: "census",
+            "census of VICTORY_SKIP_WC_BACK={:?}, per frame: {:.1} pieces ({:.1} MB) left on the card; {} pages hold bytes title \
+             memory lacks now; other copies took {:.3} MB of such bytes ({} times since the start); {:.3} MB a frame brought back \
+             by later fetches; the title wrote such pages again {:.2} times a frame ({:.3} MB of its bytes went up there, the \
+             card's kept beside them); {} pages lost with their copy since the start. Check landings (VICTORY_SKIP_WC_BACK_CHECK={}, \
+             0: none): {:.2} MB a frame fetched of pieces the rules leave, {:.3} MB written into title memory, {:.3} MB of it left by \
+             earlier landings",
+            skip_wc_back(),
+            d[n::LEFT_PIECES],
+            mb(d[n::LEFT]),
+            STALE.load(Ordering::Relaxed),
+            mb(d[n::STALE_TAKEN]),
+            counts[n::STALE_TAKEN_PAGES],
+            mb(d[n::BROUGHT_BACK]),
+            d[n::TITLE_OVER],
+            mb(d[n::TITLE_OVER_UP]),
+            counts[n::LOST],
+            check_every(),
+            mb(d[n::CHECK_FETCHED]),
+            mb(d[n::CHECK_WRITTEN]),
+            mb(d[n::CHECK_STALE]),
+        );
+    }
     {
         let parts: Vec<String> = KINDS
             .iter()
@@ -666,8 +1100,95 @@ fn report_if_due() {
 
 #[cfg(test)]
 mod tests {
-    use super::{PAGE, Pages, Reservation, Took, all_wc_in};
+    use super::{PAGE, Pages, Reservation, Skip, Took, all_wc_in, check_due};
     use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn a_page_is_left_only_where_the_rules_allow() {
+        let mut p = Pages::default();
+        let (alone, shared, taken, other) = (1, 2, 3, 4);
+        p.cover(alone * PAGE, PAGE, true);
+        p.cover(shared * PAGE, PAGE, true);
+        p.cover(shared * PAGE, 2 * PAGE, true);
+        p.cover(taken * PAGE, PAGE, true);
+        p.cover(other * PAGE, PAGE, true);
+        // Taken by another copy after a write-back of copy 1.
+        p.wrote(1, taken * PAGE, taken * PAGE + 8);
+        p.took(9, taken * PAGE, taken * PAGE + PAGE);
+        // Written back by copy 2 before.
+        p.wrote(2, other * PAGE, other * PAGE + 8);
+        for mode in [Skip::Alone, Skip::Untaken] {
+            assert!(p.may_skip(mode, 1, alone));
+            assert!(!p.may_skip(mode, 1, taken));
+            assert!(!p.may_skip(mode, 1, other), "another copy wrote it back");
+            assert!(p.may_skip(mode, 2, other));
+        }
+        assert!(!p.may_skip(Skip::Alone, 1, shared), "another copy covers it");
+        assert!(p.may_skip(Skip::Untaken, 1, shared));
+        assert!(!p.may_skip(Skip::Off, 1, alone));
+    }
+
+    #[test]
+    fn a_stale_page_another_copy_takes_is_counted_fetched_again_and_never_left_again() {
+        let mut p = Pages::default();
+        let page = 5 * PAGE;
+        p.left(1, page + 100, page + 200);
+        p.left(1, page, page + 50);
+        assert_eq!(p.stale, 1);
+        assert_eq!(p.stale_in(1, page, page + PAGE), vec![5]);
+        assert!(p.stale_in(2, page, page + PAGE).is_empty());
+        // The owner asking takes nothing; another copy takes old bytes.
+        assert_eq!(p.took(1, page, page + PAGE), Took::default());
+        assert_eq!(p.took(2, page + 40, page + 120), Took { bytes: 80, pages: 1, stale: 80 });
+        assert!(p.refetch.contains(&(1, 5)));
+        assert!(!p.may_skip(Skip::Untaken, 1, 5));
+        // A piece that does not hold all that was left brings back part of it.
+        assert_eq!(p.merged(1, page + 100, page + 200, true), (false, false));
+        assert_eq!(p.stale, 1);
+        // The whole piece: all of it.
+        assert_eq!(p.merged(1, page, page + PAGE, true), (false, true));
+        assert_eq!((p.stale, p.refetch.len()), (0, 0));
+        assert!(p.stale_in(1, page, page + PAGE).is_empty());
+    }
+
+    #[test]
+    fn a_write_back_through_another_copy_keeps_the_first_copys_stale_bytes_noted() {
+        let mut p = Pages::default();
+        let page = 6 * PAGE;
+        p.left(1, page, page + 64);
+        assert!(p.wrote(2, page + 32, page + 96));
+        assert_eq!(p.stale_in(1, page, page + PAGE), vec![6]);
+        assert!(p.taken.contains(&6));
+    }
+
+    #[test]
+    fn a_copy_that_goes_loses_what_it_left_and_the_pages_are_never_left_again() {
+        let mut p = Pages::default();
+        p.left(1, 2 * PAGE, 2 * PAGE + 8);
+        p.left(1, 3 * PAGE, 3 * PAGE + 8);
+        p.left(2, 4 * PAGE, 4 * PAGE + 8);
+        p.took(7, 3 * PAGE, 4 * PAGE);
+        assert_eq!(p.gone(1), 2);
+        assert_eq!(p.gone(1), 0);
+        assert_eq!(p.stale, 1);
+        assert!(p.refetch.iter().all(|r| r.0 != 1));
+        assert!(!p.may_skip(Skip::Untaken, 1, 2));
+        assert!(p.may_skip(Skip::Untaken, 2, 4));
+    }
+
+    #[test]
+    fn one_check_landing_per_n_frames() {
+        let last = AtomicU64::new(0);
+        assert!(check_due(&last, 0, 30));
+        assert!(!check_due(&last, 0, 30));
+        assert!(!check_due(&last, 29, 30));
+        assert!(check_due(&last, 30, 30));
+        assert!(!check_due(&last, 45, 30));
+        // Frames skipped over: one check, not one per period missed.
+        assert!(check_due(&last, 200, 30));
+        assert!(!check_due(&last, 209, 30));
+    }
 
     fn reservation(len: usize, protect: u32) -> Reservation {
         Reservation { len, kind: 0, flags: 0, protect }
@@ -712,16 +1233,16 @@ mod tests {
         // The owner asking is no other taker.
         assert_eq!(p.took(1, page, page + PAGE), Took::default());
         // Another copy over part of the written bytes: those bytes, once.
-        assert_eq!(p.took(2, page + 32, page + PAGE), Took { bytes: 32, pages: 1 });
+        assert_eq!(p.took(2, page + 32, page + PAGE), Took { bytes: 32, pages: 1, stale: 0 });
         assert_eq!(p.took(2, page, page + PAGE), Took::default());
         // A third taker counts its bytes, not the page again.
-        assert_eq!(p.took(3, page, page + PAGE), Took { bytes: 48, pages: 0 });
+        assert_eq!(p.took(3, page, page + PAGE), Took { bytes: 48, pages: 0, stale: 0 });
         // Asks beside the written bytes take nothing.
         assert_eq!(p.took(4, page + 64, page + PAGE), Took::default());
         assert!(p.taken.contains(&7));
         // A new write: taken again.
         assert!(!p.wrote(1, page, page + 8));
-        assert_eq!(p.took(2, page, page + PAGE), Took { bytes: 8, pages: 1 });
+        assert_eq!(p.took(2, page, page + PAGE), Took { bytes: 8, pages: 1, stale: 0 });
     }
 
     #[test]

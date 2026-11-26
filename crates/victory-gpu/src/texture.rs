@@ -461,6 +461,8 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // Not a copy the census numbers: nothing of it is left on the card.
+        crate::census::copy_gone(0, self.memory as u64, self.layout.size);
         // Nothing holds the staging any more (lists keep it until they are
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
@@ -1482,6 +1484,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    // `crate::census`: another copy of the title memory it is read from.
+    crate::census::copy_made(memory as u64, layout.size);
     let s = Arc::new(Staging {
         buffer,
         #[cfg(feature = "diagnostics")]

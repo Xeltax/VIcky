@@ -5405,6 +5405,12 @@ impl Host {
                 return;
             }
         }
+        // `VICTORY_SKIP_WC_BACK` (`crate::census::skip_wc_back`): whether this
+        // landing is a check, which leaves nothing on the card, and the
+        // pieces left before that come back with these flights.
+        let check = crate::census::check_landing();
+        let due = crate::census::refetch_due(check);
+        let due = due.as_ref();
         let lane = crate::queue2::second().filter(|s| s.fetches());
         // The pieces fetched beside flights that had started, as noted by
         // earlier landings: looked at for these plans, renewed below.
@@ -5436,6 +5442,13 @@ impl Host {
                     .flat_map(|r| {
                         (0..r.span.pieces).map(move |p| {
                             let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| d != 0);
+                            // `VICTORY_SKIP_WC_BACK`: a piece left on the card
+                            // that comes back with this flight, whatever its
+                            // compare says (`crate::census::refetch_due`).
+                            let flagged = flagged
+                                || due.is_some_and(|due| {
+                                    crate::census::due(due, r.shadow.census(), r.shadow.card_piece(&r.span, p).0)
+                                });
                             (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, flagged)
                         })
                     })
@@ -5457,7 +5470,12 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo < hi && seen.insert((copy, lo, hi)) {
+                        // `VICTORY_SKIP_WC_BACK`: left on the card, unless
+                        // another range has it fetched (as fork PR #868).
+                        if lo < hi
+                            && !crate::census::skip_back(r.shadow.census(), r.declared, lo, hi, check)
+                            && seen.insert((copy, lo, hi))
+                        {
                             pieces.push((r.shadow.clone(), lo, hi, total));
                             total += (hi - lo) as u64;
                         }
@@ -5593,7 +5611,7 @@ impl Host {
             let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
             let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
             shadow.walls_merged(gpu.len(), merged);
-            crate::census::merged(shadow.census(), *lo, *hi, merged);
+            crate::census::merged(shadow.census(), *lo, *hi, merged, check);
             written += merged;
         }
         copy_back(1, written as u64);
@@ -5739,7 +5757,7 @@ impl Host {
             let merged = shadow.card_merge_relay(*lo, gpu, *after, &mut title);
             // What of the slot is merged: bytes a newer fetch brought are
             // left out (iGoldenNinja, fork `b57479c`).
-            crate::census::merged(shadow.census(), *lo, *hi, merged);
+            crate::census::merged(shadow.census(), *lo, *hi, merged, false);
             written += merged;
             bytes += (hi - lo) as u64;
         }
@@ -5914,13 +5932,23 @@ impl Host {
         // where the bytes come down.
         let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
+        // `VICTORY_SKIP_WC_BACK` (`crate::census::skip_wc_back`), as in
+        // `Host::relay_card_back`.
+        let check = crate::census::check_landing();
+        let due = crate::census::refetch_due(check);
         for (i, r) in plan.ranges.iter().enumerate() {
             for p in 0..r.span.pieces {
-                if r.compared && differs[(r.at + p) as usize] == 0 {
+                let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                if r.compared
+                    && differs[(r.at + p) as usize] == 0
+                    && due.as_ref().is_none_or(|due| !crate::census::due(due, r.shadow.census(), lo))
+                {
                     continue;
                 }
-                let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
+                if lo < hi
+                    && !crate::census::skip_back(r.shadow.census(), r.declared, lo, hi, check)
+                    && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
+                {
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;
                 }
@@ -6011,7 +6039,7 @@ impl Host {
                                 let gpu = unsafe { std::slice::from_raw_parts((fetched + at as usize) as *const u8, hi - lo) };
                                 let merged = shadow.card_merge(lo, gpu, &mut title);
                                 shadow.walls_merged(gpu.len(), merged);
-                                crate::census::merged(shadow.census(), lo, hi, merged);
+                                crate::census::merged(shadow.census(), lo, hi, merged, check);
                                 counts[i].fetch_add(merged, Ordering::Relaxed);
                             }
                         }) as Box<dyn FnOnce() + Send>
@@ -6029,7 +6057,7 @@ impl Host {
                     let gpu = unsafe { std::slice::from_raw_parts((*data + at as usize) as *const u8, hi - lo) };
                     let merged = plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
                     plan.ranges[i].shadow.walls_merged(gpu.len(), merged);
-                    crate::census::merged(plan.ranges[i].shadow.census(), lo, hi, merged);
+                    crate::census::merged(plan.ranges[i].shadow.census(), lo, hi, merged, check);
                     written[i] += merged;
                 }
             }
