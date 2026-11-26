@@ -1149,6 +1149,51 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     }
 }
 
+/// VIcky (`crate::draw::heap_pass`): the three words of the record at
+/// `handle`, read in place, as `host::HostHeap::mirror` reads them.
+pub(crate) fn record_words(handle: u64) -> [u32; 3] {
+    // SAFETY: the handle is a descriptor slot in title memory, of a heap the
+    // caller holds.
+    unsafe { (handle as *const [u32; 3]).read_unaligned() }
+}
+
+/// VIcky (`crate::draw::heap_pass`): the view the record `words` names, as
+/// `host::HostHeap::mirror` finds it: none for a record that is not ours or
+/// whose view went with its resource.
+pub(crate) fn record_view([tag, i, generation]: [u32; 3]) -> Option<View> {
+    if tag != VIEW_TAG {
+        return None;
+    }
+    view_at(i, generation)
+}
+
+/// Tests: writes the record of `view` at `handle` and mirrors it, as a
+/// title's call that makes a view there does.
+#[cfg(test)]
+pub(crate) fn write_view(handle: u64, view: View) {
+    record(handle, view);
+}
+
+/// VIcky (`crate::draw::heap_pass`): `f` given the title heap at `at` (its
+/// address) if it is still there with its first descriptor at `start`, with
+/// the list of heaps held for reading while `f` runs. The title's release
+/// of the heap (`Heap`'s `Drop`, which takes the list for writing) waits
+/// for it, as for [`sync_heaps`], and nothing `f` may call takes the list
+/// again. `None` if the heap went.
+#[cfg(windows)]
+pub(crate) fn with_heap<R>(at: usize, start: u64, f: impl FnOnce(&Heap) -> R) -> Option<R> {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    if !heaps.iter().any(|&(first, _, h)| h == at && first == start) {
+        return None;
+    }
+    // SAFETY: registered heaps are live (removed when dropped), and this
+    // one stays registered while the list is held.
+    let heap = unsafe { &*(at as *const Heap) };
+    let out = f(heap);
+    drop(heaps);
+    Some(out)
+}
+
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {

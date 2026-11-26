@@ -2721,6 +2721,17 @@ impl HostHeap {
             .is_some_and(|&key| key != 0)
     }
 
+    /// The host resource title slot `index`'s host slot shows, as a raw
+    /// pointer; `None` if it shows none (tests).
+    #[cfg(test)]
+    pub(crate) fn shown_raw(&self, index: u32) -> Option<usize> {
+        let host = self.made.lock().unwrap_or_else(|e| e.into_inner()).host(index)?;
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        kept.get(host as usize)?
+            .as_ref()
+            .map(|b| windows::core::Interface::as_raw(b) as usize)
+    }
+
     /// Whether title slot `index`'s host slot shows `buffer`; `None` if it
     /// shows no resource (diagnostics: a buffer view's slot must show the
     /// host copy that is brought up to date for it).

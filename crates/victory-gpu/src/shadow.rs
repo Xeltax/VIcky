@@ -2877,8 +2877,14 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
-        let len = len.min(self.start + self.len - address);
+        let len = self.refresh_len(address, len);
         list.defer_refresh(self, address as usize, len as usize);
+    }
+
+    /// The bytes [`Shadow::refresh`] brings up to date for `len` bytes at
+    /// `address`: no further than the copy's end.
+    pub(crate) fn refresh_len(&self, address: u64, len: u64) -> u64 {
+        len.min(self.start + self.len - address)
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {

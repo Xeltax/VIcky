@@ -257,7 +257,7 @@ struct Progress {
 
 /// One job's [`Progress`], shared by the lane and the waiting thread.
 #[derive(Clone, Default)]
-struct Ticket(Arc<(Mutex<Progress>, Condvar)>);
+pub(crate) struct Ticket(Arc<(Mutex<Progress>, Condvar)>);
 
 impl Ticket {
     /// Changes the progress, and wakes whoever waits.
@@ -278,11 +278,12 @@ impl Ticket {
     }
 }
 
-type Job = Box<dyn FnOnce(&Ticket) + Send>;
+pub(crate) type Job = Box<dyn FnOnce(&Ticket) + Send>;
 
 /// A thread kept for one kind of work, which does the jobs given to it one
-/// after the other.
-pub(super) struct Lane {
+/// after the other (also the pass over buffer views beside,
+/// `crate::draw::heap_pass`, on a lane of its own).
+pub(crate) struct Lane {
     jobs: Mutex<VecDeque<(Job, Ticket)>>,
     more: Condvar,
 }
@@ -290,7 +291,7 @@ pub(super) struct Lane {
 impl Lane {
     /// A lane and its thread, named `name`; `None` if no thread could be
     /// made. The thread stays for the run.
-    pub(super) fn new(name: &str) -> Option<Arc<Lane>> {
+    pub(crate) fn new(name: &str) -> Option<Arc<Lane>> {
         let lane = Arc::new(Lane {
             jobs: Mutex::new(VecDeque::new()),
             more: Condvar::new(),
@@ -329,7 +330,7 @@ impl Lane {
     }
 
     /// Gives `job` to the lane.
-    fn give(&self, job: Job) -> Ticket {
+    pub(crate) fn give(&self, job: Job) -> Ticket {
         let ticket = Ticket::default();
         self.jobs
             .lock()

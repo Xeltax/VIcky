@@ -1936,6 +1936,11 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// VIcky (`VICTORY_HEAP_PASS_BESIDE=1`): where the pass over the heap's
+    /// buffer views, running beside (`crate::draw::heap_pass`), recorded
+    /// its refreshes in place. They take its place once it has ended,
+    /// before anything reads the steps ([`HostList::join_heap_passes`]).
+    HeapPass(std::sync::Arc<crate::draw::heap_pass::Pending>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1973,6 +1978,11 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// VIcky (`VICTORY_HEAP_PASS_BESIDE=1`): the passes over the heap's
+    /// buffer views that must have ended before the list runs: the one
+    /// whose step it holds, or the one of the frame its shaders pick from
+    /// ([`HostList::after_heap_pass`]).
+    heap_passes: Vec<std::sync::Arc<crate::draw::heap_pass::Pending>>,
 }
 
 impl Deferred {
@@ -2671,7 +2681,9 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                // (A pass beside stands for refreshes: put in their place
+                // before this is asked, `HostList::join_heap_passes`.)
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) | Step::HeapPass(_) => {}
             }
         }
     }
@@ -5439,6 +5451,15 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
+        // VIcky (`VICTORY_HEAP_PASS_BESIDE=1`): the passes over the heap's
+        // buffer views these lists wait for have ended, and their refreshes
+        // stand in their lists' steps, before anything below reads those
+        // steps or sends the lists (`crate::draw::heap_pass`).
+        if crate::draw::heap_pass::beside() {
+            for list in runs {
+                list.join_heap_passes();
+            }
+        }
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
@@ -6694,6 +6715,94 @@ impl HostList {
         }
     }
 
+    /// VIcky (`VICTORY_HEAP_PASS_BESIDE=1`): the pass over the heap's buffer
+    /// views runs beside (`crate::draw::heap_pass`); its refreshes go here,
+    /// at this point of the list, and the list waits for it at its
+    /// submission ([`HostList::join_heap_passes`]).
+    pub(crate) fn defer_heap_pass(&self, pass: &std::sync::Arc<crate::draw::heap_pass::Pending>) {
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::HeapPass(pass.clone()));
+        deferred.heap_passes.push(pass.clone());
+    }
+
+    /// VIcky: the list's shaders pick buffers from the heap that `pass`
+    /// makes ready (the frame's pass beside, started by another list): the
+    /// list waits for it at its submission, as it ran after it when the
+    /// pass ran on the recording thread.
+    pub(crate) fn after_heap_pass(&self, pass: &std::sync::Arc<crate::draw::heap_pass::Pending>) {
+        let mut deferred = self.deferred();
+        if !deferred.heap_passes.iter().any(|p| std::sync::Arc::ptr_eq(p, pass)) {
+            deferred.heap_passes.push(pass.clone());
+        }
+    }
+
+    /// VIcky: before anything reads the list's steps for a submission,
+    /// waits for the passes beside it waits for, and puts the refreshes of
+    /// the one whose step it holds in that step's place, as
+    /// [`HostList::defer_refresh`] would have recorded them there
+    /// (`crate::draw::heap_pass::splice`). Once done, nothing is left to
+    /// wait for if the list is submitted again.
+    pub(crate) fn join_heap_passes(&self) {
+        use crate::draw::heap_pass::{Seen, splice};
+        let passes = {
+            let deferred = self.deferred();
+            if deferred.heap_passes.is_empty() {
+                return;
+            }
+            deferred.heap_passes.clone()
+        };
+        // Without the list's lock: nothing a pass does takes it.
+        for pass in &passes {
+            pass.wait();
+        }
+        let seen = |step: &Step| match step {
+            Step::Copy(..) | Step::Run(_) => Seen::Barrier,
+            Step::Refresh(shadow, address, len) => {
+                Seen::Refresh((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
+            }
+            _ => Seen::Other,
+        };
+        let mut deferred = self.deferred();
+        while let Some(at) = deferred.copies.iter().position(|step| matches!(step, Step::HeapPass(_))) {
+            let Step::HeapPass(pass) = &deferred.copies[at] else {
+                break;
+            };
+            let pass = pass.clone();
+            let refreshes = pass
+                .take_refreshes()
+                .into_iter()
+                .map(|(shadow, from, to)| {
+                    // As `Shadow::refresh` records it.
+                    let len = shadow.refresh_len(from, to - from) as usize;
+                    let key = (std::sync::Arc::as_ptr(&shadow) as usize, from as usize, len);
+                    (key, Step::Refresh(shadow, from as usize, len))
+                })
+                .collect();
+            splice(&mut deferred.copies, at, refreshes, seen);
+        }
+        deferred.heap_passes.clear();
+    }
+
+    /// The ranges the list's refresh steps bring up to date (copy, address,
+    /// bytes), in order (tests).
+    #[cfg(test)]
+    pub(crate) fn refresh_keys(&self) -> Vec<(usize, usize, usize)> {
+        self.deferred()
+            .copies
+            .iter()
+            .filter_map(|step| match step {
+                Step::Refresh(shadow, address, len) => Some((std::sync::Arc::as_ptr(shadow) as usize, *address, *len)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Steps of passes beside the list still holds (tests).
+    #[cfg(test)]
+    pub(crate) fn heap_pass_steps(&self) -> usize {
+        self.deferred().copies.iter().filter(|step| matches!(step, Step::HeapPass(_))).count()
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
     pub(crate) fn defer_gpu_write(
@@ -7088,6 +7197,16 @@ impl HostList {
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
                         staging.refresh();
+                    }
+                    continue;
+                }
+                // Put in place at the start of the submission
+                // (`HostList::join_heap_passes`), so not met here; if it
+                // were, its refreshes are done as refresh steps are.
+                Step::HeapPass(pass) => {
+                    for (shadow, from, to) in pass.take_refreshes() {
+                        let len = shadow.refresh_len(from, to - from) as usize;
+                        batch.add(&shadow, from as usize, len);
                     }
                     continue;
                 }
@@ -7765,6 +7884,7 @@ impl Meter {
                 slots as f64 / frames
             );
         }
+        crate::draw::heap_pass::line(frames);
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
