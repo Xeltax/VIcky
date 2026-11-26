@@ -133,8 +133,68 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// The guards' answers for view memory (`watch::guard`, part of
+    /// `GuardUs`): askings that came to look at the range's blocks; of
+    /// them, the ones found all clean at once (with
+    /// `VICTORY_GUARD_SUMMARY=1`, by the summary alone); and the blocks the
+    /// others walked one by one.
+    GuardAsked,
+    GuardAllClean,
+    GuardWalked,
+    /// Takings of the guards' lock by those askings that had to wait (a
+    /// title thread's write fault, or another asking, held it), and the
+    /// nanoseconds waited.
+    GuardWaits,
+    GuardWaitNs,
+    /// Nanoseconds the askings held the lock: finding whether the range is
+    /// all clean, and walking the ranges that were not (guarding their
+    /// written blocks again).
+    GuardCheckNs,
+    GuardWalkNs,
+    /// What those walks found, block by block: blocks reported written; of
+    /// them, the ones still read-only by our hand (written through the
+    /// runtime, or another view of pages guarded at its own), noted clean
+    /// again with no call; and blocks noted absent and still uncommitted
+    /// (passed over). The other blocks walked were clean.
+    GuardWritten,
+    GuardWrittenGuarded,
+    GuardAbsentSkipped,
+    /// The walks' calls making blocks read-only again (one a run of written
+    /// blocks, then one a block where the run's would not), their
+    /// nanoseconds, the blocks they made read-only, and the committed
+    /// blocks that would not be (reported written at every asking).
+    GuardProtects,
+    GuardProtectNs,
+    GuardProtected,
+    GuardProtectFailed,
+    /// The walks' questions to Windows whether memory is still uncommitted
+    /// (`watch::uncommitted_end`: blocks noted absent, and blocks that would
+    /// not be made read-only), and their nanoseconds.
+    GuardQueries,
+    GuardQueryNs,
+    /// The walks' lookups of the other views of the pages they guard
+    /// (`inplace::views_between` once a run, `inplace::pages_of` once a
+    /// block of a view), and their nanoseconds; the calls making those
+    /// other views read-only, and their nanoseconds.
+    GuardViewLookups,
+    GuardViewLookupNs,
+    GuardViewProtects,
+    GuardViewProtectNs,
+    /// With `VICTORY_GUARD_HOT`: blocks reported written at an asking
+    /// because they are hot (left writable), blocks made hot, hot blocks
+    /// guarded again to see whether they went cold, and hot blocks guarded
+    /// again for being reported too often (`VICTORY_GUARD_HOT_RATIO`).
+    GuardHotReported,
+    GuardHotMade,
+    GuardHotRetests,
+    GuardHotCooled,
+    /// Questions whether memory is uncommitted answered by a run asked
+    /// about before (`VICTORY_GUARD_ABSENT_KNOWN`), and blocks noted absent
+    /// that a question found committed (nobody told us of the commit).
+    GuardQueriesSaved,
+    GuardAbsentFound,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 128;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1130,7 +1190,14 @@ pub(crate) fn log(frames: f64) {
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
          refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
-         guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
+         guards {:.1} ms ({:.0} askings, {:.0} found all clean at once{}, {:.0} blocks walked: \
+         {:.0} written ({:.0} of them still read-only), {:.0} absent, {:.0} clean; \
+         {:.0} waits for their lock {:.2} ms, held {:.2} ms finding all clean and {:.2} ms \
+         walking: {:.0} calls making {:.0} blocks read-only {:.2} ms ({:.0} blocks would not), \
+         {:.0} questions whether memory is uncommitted {:.2} ms{}, {:.0} lookups of other views \
+         {:.2} ms, {:.0} other views made read-only {:.2} ms, the rest {:.2} ms{}; \
+         summary checks since the start: {} of {} differed); \
+         {:.1} MB copied whole (memory not watched); {:.1} frame waits \
          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
          {:.0} steps {:.1} MB left out",
         c[C::RecordCalls as usize],
@@ -1146,6 +1213,44 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::BackCompared as usize]),
         ms(c[C::SparseUs as usize]),
         ms(c[C::GuardUs as usize]),
+        c[C::GuardAsked as usize],
+        c[C::GuardAllClean as usize],
+        if crate::watch::guard_summary() { " by the summary" } else { "" },
+        c[C::GuardWalked as usize],
+        c[C::GuardWritten as usize],
+        c[C::GuardWrittenGuarded as usize],
+        c[C::GuardAbsentSkipped as usize],
+        (c[C::GuardWalked as usize] - c[C::GuardWritten as usize] - c[C::GuardAbsentSkipped as usize]).max(0.0),
+        c[C::GuardWaits as usize],
+        c[C::GuardWaitNs as usize] / 1e6,
+        c[C::GuardCheckNs as usize] / 1e6,
+        c[C::GuardWalkNs as usize] / 1e6,
+        c[C::GuardProtects as usize],
+        c[C::GuardProtected as usize],
+        c[C::GuardProtectNs as usize] / 1e6,
+        c[C::GuardProtectFailed as usize],
+        c[C::GuardQueries as usize],
+        c[C::GuardQueryNs as usize] / 1e6,
+        crate::watch::absent_clause(c[C::GuardQueriesSaved as usize], c[C::GuardAbsentFound as usize]),
+        c[C::GuardViewLookups as usize],
+        c[C::GuardViewLookupNs as usize] / 1e6,
+        c[C::GuardViewProtects as usize],
+        c[C::GuardViewProtectNs as usize] / 1e6,
+        (c[C::GuardWalkNs as usize]
+            - c[C::GuardProtectNs as usize]
+            - c[C::GuardQueryNs as usize]
+            - c[C::GuardViewLookupNs as usize]
+            - c[C::GuardViewProtectNs as usize])
+            .max(0.0)
+            / 1e6,
+        crate::watch::hot_clause(
+            c[C::GuardHotMade as usize],
+            c[C::GuardHotReported as usize],
+            c[C::GuardHotRetests as usize],
+            c[C::GuardHotCooled as usize]
+        ),
+        crate::watch::SUMMARY_CHECKS[1].load(Relaxed),
+        crate::watch::SUMMARY_CHECKS[0].load(Relaxed),
         mb(c[C::WholeBytes as usize]),
         c[C::PaceWaits as usize],
         ms(c[C::PaceUs as usize]),
