@@ -11,8 +11,8 @@
 | | |
 |---|---|
 | Frame rate | **about 6.2 fps** with the settings in [VICKY-RT.md](VICKY-RT.md) ("Fastest measured"): three runs at 6.00, 6.37 and 6.18 fps (host `fps` lines, long frames included) |
-| Picture | prologue lit and textured, ray-traced light on, the bottom mosaic strip fixed |
-| Known problems | a dark lower-right quarter in some rooms; stair-step edges on some shadows (a fix is being tested); Series S mode (`--console series-s`) renders 960×540 upscaled and looks grainy |
+| Picture | prologue lit and textured, ray-traced light on, the bottom mosaic strip and the stair-step shadow edges fixed, characters' heads and skin drawn |
+| Known problems | a dark lower-right quarter in some rooms; Series S mode (`--console series-s`) renders 960×540 upscaled and looks grainy |
 | Memory | entering the world takes up to about 30 GB of commit; on a 32 GB PC, give Windows a large page file |
 
 [VICKY-RT.md](VICKY-RT.md) lists every switch, the measurements behind them and what was tried and dropped. [VICKY.md](VICKY.md) documents the heap-map base.

@@ -2863,13 +2863,18 @@ fn bit_exact_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
 }
 
 /// The format the host makes a typed buffer view of `format` in:
-/// [`bit_exact_format`] with `VICTORY_TYPED_BIT_EXACT=1` (opt-in), else the
-/// title's. A store of `CS_ShadowRenderTiledCascadesAlphaCBPPPC` (#f133e35e)
-/// sets bit 14 of a per-tile word this way (0x2957c); RT88a lost the
-/// characters' heads once that program ran.
+/// [`bit_exact_format`] by default, the title's with
+/// `VICTORY_TYPED_BIT_EXACT=0`. The translator declares typed accesses as
+/// float, so through a view of a 32-bit integer format the bits were
+/// converted (most became 0). A store of
+/// `CS_ShadowRenderTiledCascadesAlphaCBPPPC` (#f133e35e) sets bit 14 of a
+/// per-tile word this way (0x2957c): with the title's format the tile's
+/// other flags were wiped and the characters' heads and skin vanished once
+/// that program ran (RT88a); with the float format of the same width they
+/// stay (F1). After fork #684 (GamingRipperDoc, `bit_exact_format`).
 fn typed_view_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("VICTORY_TYPED_BIT_EXACT").is_some_and(|v| v == "1")) {
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_TYPED_BIT_EXACT").is_none_or(|v| v != "0")) {
         bit_exact_format(format)
     } else {
         format
