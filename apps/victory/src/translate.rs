@@ -461,7 +461,9 @@ fn translate(
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
-    translate_programs(&container, &hash, programs, &example, t, checks);
+    // (all of it by the container's hash, as at run time: structurisation reads per-program
+    // switches too, `VICTORY_WAVE_MASK_COPIES`)
+    emit::for_program(&hash, || translate_programs(&container, &hash, programs, &example, t, checks));
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
