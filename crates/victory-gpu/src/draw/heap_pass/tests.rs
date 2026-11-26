@@ -1185,3 +1185,266 @@ fn a_pass_counts_what_its_slots_came_to() {
     assert_eq!(release(object), 0);
     TEST_FAST.set(None);
 }
+
+/// What a pass on one thread over `heap`'s slot `slot` finds of it (the
+/// heap's slots made already: nothing is made).
+fn f1_for(heap: &(This, &'static Heap, &'static HostHeap), slot: u32) -> Found {
+    let mut found = Vec::new();
+    buffers_taken(heap.1, heap.2, &mut [slot], &mut Ranges::new(), Some(&mut found), true);
+    found.pop().expect("the slot")
+}
+
+/// What the passes kept for `host`'s slots and left in them: per slot,
+/// whether its host slot is made and the buffer it shows.
+fn left(host: &HostHeap, slots: u32) -> Vec<(bool, Option<usize>)> {
+    (0..slots).map(|slot| (host.made(slot), host.shown_raw(slot))).collect()
+}
+
+/// Two heaps written alike, one passed over on one thread and the other on
+/// four (`VICTORY_HEAP_PASS_THREADS`), round after round (every slot looked
+/// at; buffer views moved, emptied and turned into constant views, memory
+/// outside the title's buffers), with the cache of made views and without,
+/// and with a heap map whose pool the threads take slots from at once: the
+/// passes keep the same ranges and find the same views, copies and ranges,
+/// every slot is made alike and shows the same buffer, no two title slots
+/// share a pool slot, and the check finds nothing that differs.
+#[test]
+fn the_pass_on_threads_makes_and_keeps_what_the_pass_on_one_thread_does() {
+    const SLOTS: u32 = 1024;
+    if crate::host::host().is_none() {
+        return;
+    }
+    for (cache, map) in [(0usize, None), (1 << 10, None), (1 << 10, Some((64u32, 64 + 960))), (0, Some((64, 64 + 960)))] {
+        TEST_FAST.set(Some((cache, false, false)));
+        crate::descriptor::host::TEST_MAP.set(map);
+        let (Some(one), Some(four)) = (title_heap(SLOTS), title_heap(SLOTS)) else {
+            crate::descriptor::host::TEST_MAP.set(None);
+            TEST_FAST.set(None);
+            return;
+        };
+        crate::descriptor::host::TEST_MAP.set(None);
+        let tag = cache as u64 + u64::from(map.is_some()) * 7;
+        let base = 0x62_0000_0000u64 + (tag << 28);
+        let (b1, b2) = (0x7e57_6201 + tag as usize, 0x7e57_6202 + tag as usize);
+        crate::shadow::register(b1, base, 0x10_0000);
+        crate::shadow::register(b2, base + 0x100_0000, 0x4_0000);
+        let both = |slot: u32, view: View| {
+            write(one.1, slot, view.clone());
+            write(four.1, slot, view);
+        };
+        let view_of = |k: u32| match k % 9 {
+            0 => View::Constant(base + 0x200 + u64::from(k % 16) * 0x100, 256),
+            1 => buffer_view(base + 0x800_0000 + u64::from(k % 5) * 0x1_0000, 0x2000, 0, 16),
+            2 | 3 => buffer_view(base + 0x100_0000, 0x4_0000, 16 * (k % 64), 32),
+            _ => buffer_view(base + u64::from(k % 13) * 0x1_0000, 0x1_0000, 4 * (k % 32), 8),
+        };
+        for slot in 1..SLOTS {
+            if slot % 11 != 0 {
+                both(slot, view_of(slot));
+            }
+        }
+        let (mut r1, mut r4) = (Ranges::new(), Ranges::new());
+        for round in 0..4u32 {
+            if round > 0 {
+                for slot in (round..SLOTS).step_by(7) {
+                    match (slot + round) % 5 {
+                        0 => both(slot, View::NullConstant),
+                        _ => both(slot, view_of(slot * 3 + round)),
+                    }
+                }
+            }
+            let all: Vec<u32> = (0..SLOTS).collect();
+            let (mut f1, mut f4) = (Vec::new(), Vec::new());
+            threads::TEST_THREADS.set(Some(1));
+            buffers(one.1, one.2, &mut all.clone(), &mut r1, Some(&mut f1), true);
+            threads::TEST_THREADS.set(Some(4));
+            assert_eq!(threads::wanted(all.len()), Some(4));
+            buffers(four.1, four.2, &mut all.clone(), &mut r4, Some(&mut f4), true);
+            threads::TEST_THREADS.set(None);
+            let what = format!("round {round}, cache {cache}, map {map:?}");
+            assert_eq!(f1, f4, "{what}: what each slot came to");
+            let keys = |r: &Ranges| -> std::collections::BTreeMap<u32, (u64, u64, u64)> {
+                r.iter().map(|(&i, (s, from, to))| (i, (s.id(), *from, *to))).collect()
+            };
+            assert!(!r1.is_empty(), "{what}");
+            assert_eq!(keys(&r1), keys(&r4), "{what}: the ranges kept");
+            assert_eq!(left(one.2, SLOTS), left(four.2, SLOTS), "{what}: the slots made");
+            let mut pooled: Vec<u32> = (0..SLOTS).filter_map(|slot| four.2.host_of(slot)).collect();
+            let n = pooled.len();
+            pooled.sort_unstable();
+            pooled.dedup();
+            assert_eq!(pooled.len(), n, "{what}: a host slot for each title slot");
+            let checked = threads::check(four.1, four.2, &all, &f4, true);
+            assert_eq!(checked.slots, f4.len() as u64, "{what}");
+            assert_eq!((checked.differed, checked.changed, checked.made), (0, 0, 0), "{what}: {checked:?}");
+        }
+        // A slot left unmade (its host view dropped as if its memory went):
+        // the check finds it, and the pass on one thread makes it again.
+        let slot = (1..SLOTS).find(|&slot| four.2.made(slot)).expect("a made slot");
+        assert!(four.2.texture_slot_gone(slot));
+        let all: Vec<u32> = (0..SLOTS).collect();
+        let mut f4 = Vec::new();
+        threads::TEST_THREADS.set(Some(4));
+        let mut slots = all.clone();
+        // Not this slot: the threads would make it again.
+        slots.retain(|&s| s != slot);
+        buffers(four.1, four.2, &mut slots, &mut r4, Some(&mut f4), true);
+        threads::TEST_THREADS.set(None);
+        f4.push(f1_for(&one, slot));
+        f4.sort_by_key(|f| f.index);
+        let checked = threads::check(four.1, four.2, &all, &f4, true);
+        assert_eq!((checked.differed, checked.changed, checked.made), (1, 0, 1), "cache {cache}, map {map:?}: {checked:?}");
+        assert!(four.2.made(slot), "made again");
+        crate::shadow::unregister(b1, base);
+        crate::shadow::unregister(b2, base + 0x100_0000);
+        forget(one.2);
+        forget(four.2);
+        assert_eq!(release(one.0), 0);
+        assert_eq!(release(four.0), 0);
+    }
+    TEST_FAST.set(None);
+}
+
+/// With a heap map whose pool is used up, a thread of the pass gives back
+/// no other slot's pool slot: the slots that wanted one are made once the
+/// threads are done, after the pool slots of title slots without a live
+/// view (overwritten as bytes, not in the pass) were given back.
+#[test]
+fn the_threads_leave_a_used_up_pool_to_the_pass_after_them() {
+    const SLOTS: u32 = 512;
+    if crate::host::host().is_none() {
+        return;
+    }
+    TEST_FAST.set(Some((1 << 10, false, false)));
+    // The identity window up to 16, a pool of 8.
+    crate::descriptor::host::TEST_MAP.set(Some((16, 24)));
+    let Some((object, heap, host)) = title_heap(SLOTS) else {
+        crate::descriptor::host::TEST_MAP.set(None);
+        TEST_FAST.set(None);
+        return;
+    };
+    crate::descriptor::host::TEST_MAP.set(None);
+    let base = 0x63_0000_0000u64;
+    crate::shadow::register(0x7e57_6301, base, 0x10_0000);
+    let view = |k: u32| buffer_view(base + u64::from(k) * 0x1000, 0x1000, 0, 8);
+    let held: Vec<u32> = (100..108).collect();
+    for &slot in &held {
+        write(heap, slot, view(slot));
+    }
+    let mut ranges = Ranges::new();
+    threads::TEST_THREADS.set(Some(4));
+    buffers(heap, host, &mut held.clone(), &mut ranges, None, true);
+    assert!(held.iter().all(|&slot| host.host_of(slot).is_some()), "the pool's 8 slots held");
+    // Four of them overwritten as bytes; four new slots past the window,
+    // their records copied in as bytes too (from slots below the window: a
+    // call there takes no pool slot, which past it would give the dead ones
+    // back at once).
+    for &slot in &held[..4] {
+        // SAFETY: a descriptor slot of the title heap.
+        unsafe { (heap.handle(slot).expect("a slot") as *mut u8).write_bytes(0, 32) };
+    }
+    let new: Vec<u32> = (300..304).collect();
+    for (k, &slot) in new.iter().enumerate() {
+        let below = 1 + k as u32;
+        write(heap, below, view(slot));
+        // SAFETY: two descriptor slots of the title heap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                heap.handle(below).expect("a slot") as *const u8,
+                heap.handle(slot).expect("a slot") as *mut u8,
+                32,
+            )
+        };
+    }
+    // A pass over the new slots and others with nothing written, on four
+    // threads (more than two chunks).
+    let mut slots: Vec<u32> = new.iter().copied().chain(376..SLOTS).collect();
+    buffers(heap, host, &mut slots, &mut ranges, None, true);
+    threads::TEST_THREADS.set(None);
+    assert!(held[..4].iter().all(|&slot| host.host_of(slot).is_none()), "given back after the threads");
+    assert!(held[4..].iter().all(|&slot| host.host_of(slot).is_some()), "still held");
+    // The new slots take the ones given back once no submission that may
+    // read them runs (other tests' may); made or not, each is the slot's own.
+    let mut pooled: Vec<u32> = (0..SLOTS).filter_map(|slot| host.host_of(slot)).collect();
+    let n = pooled.len();
+    pooled.sort_unstable();
+    pooled.dedup();
+    assert_eq!(pooled.len(), n, "a host slot for each title slot");
+    for &slot in &new {
+        assert_eq!(host.made(slot), host.host_of(slot).is_some(), "slot {slot}");
+        assert!(ranges.contains_key(&slot), "slot {slot}: its range kept all the same");
+    }
+    crate::shadow::unregister(0x7e57_6301, base);
+    forget(host);
+    assert_eq!(release(object), 0);
+    TEST_FAST.set(None);
+}
+
+/// Passes on four threads while another thread writes slots all the while
+/// (each call takes the heap's slot state alone, between the threads'
+/// chunks): nothing waits for ever, no two title slots share a pool slot,
+/// and once the writes stop, a pass on the threads leaves every slot as a
+/// pass on one thread leaves it (the check finds nothing that differs).
+#[test]
+fn the_threads_and_the_title_s_writes_take_turns() {
+    const SLOTS: u32 = 2048;
+    if crate::host::host().is_none() {
+        return;
+    }
+    TEST_FAST.set(Some((1 << 10, true, false)));
+    crate::descriptor::host::TEST_MAP.set(Some((64, 64 + 1984)));
+    let Some((object, heap, host)) = title_heap(SLOTS) else {
+        crate::descriptor::host::TEST_MAP.set(None);
+        TEST_FAST.set(None);
+        return;
+    };
+    crate::descriptor::host::TEST_MAP.set(None);
+    let base = 0x64_0000_0000u64;
+    crate::shadow::register(0x7e57_6401, base, 0x10_0000);
+    let view = move |k: u64| buffer_view(base + (k % 61) * 0x4000, 0x4000, (k % 7) as u32, 8);
+    for slot in 1..SLOTS {
+        write(heap, slot, view(u64::from(slot)));
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let heap_at = std::ptr::from_ref(heap) as usize;
+    let writer = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            // SAFETY: the heap lives until the thread is joined.
+            let heap = unsafe { &*(heap_at as *const Heap) };
+            let mut next = draws(0x6401);
+            let mut writes = 0u64;
+            while !stop.load(Relaxed) {
+                let k = next();
+                let slot = 1 + (k % u64::from(SLOTS - 1)) as u32;
+                write(heap, slot, if k % 13 == 0 { View::NullConstant } else { view(k >> 8) });
+                writes += 1;
+            }
+            writes
+        })
+    };
+    let mut ranges = Ranges::new();
+    threads::TEST_THREADS.set(Some(4));
+    for _ in 0..12 {
+        let mut slots: Vec<u32> = (0..SLOTS).collect();
+        buffers(heap, host, &mut slots, &mut ranges, None, true);
+    }
+    stop.store(true, Relaxed);
+    let writes = writer.join().expect("the writing thread");
+    assert!(writes > 0);
+    let all: Vec<u32> = (0..SLOTS).collect();
+    let mut found = Vec::new();
+    buffers(heap, host, &mut all.clone(), &mut ranges, Some(&mut found), true);
+    threads::TEST_THREADS.set(None);
+    let mut pooled: Vec<u32> = (0..SLOTS).filter_map(|slot| host.host_of(slot)).collect();
+    let n = pooled.len();
+    pooled.sort_unstable();
+    pooled.dedup();
+    assert_eq!(pooled.len(), n, "a host slot for each title slot");
+    let checked = threads::check(heap, host, &all, &found, true);
+    assert_eq!((checked.differed, checked.changed, checked.made), (0, 0, 0), "{checked:?} after {writes} writes");
+    crate::shadow::unregister(0x7e57_6401, base);
+    forget(host);
+    assert_eq!(release(object), 0);
+    TEST_FAST.set(None);
+}

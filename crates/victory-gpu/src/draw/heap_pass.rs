@@ -24,7 +24,9 @@
 //! With VIcky's `VICTORY_HEAP_PASS_ONE_LOOK=1` ([`one_look`]) a slot the
 //! pass makes is not marked as written again by that making, and with
 //! `VICTORY_HEAP_PASS_DUE=1` ([`due_window`]) the spread's window holds only
-//! the buffer slots no pass looked at in the last 16.
+//! the buffer slots no pass looked at in the last 16. With
+//! `VICTORY_HEAP_PASS_THREADS=<n>` the pass's slots are made on `n` threads
+//! ([`threads`]).
 //!
 //! What the pass reads, and when:
 //! - Title memory: only the record of each slot it looks at, three words
@@ -108,6 +110,7 @@
 //! slots came to ([`parts`]).
 
 pub(crate) mod parts;
+pub(crate) mod threads;
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -158,7 +161,8 @@ pub(crate) struct Found {
 /// `slots`, up to the ranges, kept in `ranges`. With `found`, what each
 /// slot came to is noted there too (the check). `marks`: whether the making
 /// of a slot marks it as written for the next pass (without
-/// `VICTORY_HEAP_PASS_ONE_LOOK=1`, [`one_look`]).
+/// `VICTORY_HEAP_PASS_ONE_LOOK=1`, [`one_look`]). With
+/// `VICTORY_HEAP_PASS_THREADS=<n>`, on `n` threads ([`threads`]).
 pub(crate) fn buffers(
     heap: &Heap,
     host: &HostHeap,
@@ -168,6 +172,11 @@ pub(crate) fn buffers(
     marks: bool,
 ) {
     let began = Instant::now();
+    super::HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Relaxed);
+    if let Some(n) = threads::wanted(slots.len()) {
+        threads::buffers(heap, host, slots, ranges, found, marks, n, began);
+        return;
+    }
     let took = buffers_taken(heap, host, slots, ranges, found, marks);
     parts::add(&[took], began.elapsed(), std::time::Duration::ZERO);
 }
@@ -194,7 +203,6 @@ pub(crate) fn buffers_taken(
     }
     let mut taking = parts::Taking::begin();
     let mut alive = !GONE.load(Relaxed) && crate::descriptor::host::device_removed().is_none();
-    super::HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Relaxed);
     // VIcky (`VICTORY_HEAP_SYNC_CACHE`): the copies a slot's making
     // looks up are the ones `buffer_copy` asks for again: each looked
     // up once (`descriptor::host::Lookups`). And the slots are made a
@@ -1348,6 +1356,7 @@ static CHECKS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 pub(crate) fn line(frames: f64) {
     spread_line();
     parts::line();
+    threads::line();
     if !beside() {
         return;
     }

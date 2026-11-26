@@ -255,7 +255,6 @@ pub(crate) struct Took {
 
 impl Took {
     /// The count of `what`.
-    #[cfg(test)]
     pub(crate) fn of(&self, what: Count) -> u64 {
         self.counts[what as usize]
     }

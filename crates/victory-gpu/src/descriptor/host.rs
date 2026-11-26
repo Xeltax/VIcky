@@ -37,7 +37,10 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each host slot of the
     /// title's slots was last made from, and the heap map's bookkeeping.
-    made: Mutex<Made>,
+    /// Held alone (its write lock) by all but the threads of the pass over
+    /// buffer views with VIcky's `VICTORY_HEAP_PASS_THREADS`, which hold it
+    /// together (its read lock; [`Made`]).
+    made: std::sync::RwLock<Made>,
     /// The heap map of a view heap capped below the title's slots
     /// ([`MapLayout`]); `None` for the others.
     map: Option<HeapMap>,
@@ -186,26 +189,50 @@ pub(crate) fn levels_waiting(start: u64) {
 /// Host-slot state behind one lock: every write of a host slot for a title
 /// slot takes it, so a pool slot is taken, made and published (or given
 /// back) at once.
+///
+/// VIcky (`VICTORY_HEAP_PASS_THREADS`): everyone holds it alone (the write
+/// lock of [`HostHeap::made`]) as before, but the threads of the pass over
+/// buffer views, which hold it together (its read lock), each for title
+/// slots none of the others makes ([`HostHeap::mirror_shared`]). What the
+/// making of one title slot changes here is its host slot's key and its
+/// heap map entry, which only the thread making that slot touches (atomics,
+/// for the threads' sake: under the write lock they are plain loads and
+/// stores), and the heap map's pool and the cache, each behind a lock of
+/// its own taken inside this one. A pool slot given back goes through the
+/// pool's lock before another thread can take it, its key zeroed first.
 struct Made {
     /// The record (view index and generation) each host slot of the title's
     /// (`count`, and in a heap with a heap map its pool's) was last made
     /// from; 0 for none.
-    keys: Vec<u64>,
+    keys: Vec<std::sync::atomic::AtomicU64>,
     /// Which pool slot each title slot past the identity window holds (a
     /// view heap with a heap map).
     map: Option<SlotMap>,
     /// VIcky (`VICTORY_HEAP_SYNC_CACHE`): buffer views made before, by
-    /// record ([`RecordCache`]); made on first use, and only tried once.
-    cache: Option<RecordCache>,
-    cache_tried: bool,
+    /// record ([`RecordCache`]).
+    cache: Mutex<CacheSlot>,
+}
+
+/// [`Made::cache`]: made on first use, and only tried once.
+#[derive(Default)]
+struct CacheSlot {
+    table: Option<RecordCache>,
+    tried: bool,
 }
 
 /// [`HostHeap::made`] locked by the pass over buffer views
 /// ([`HostHeap::made_counted`]): on a pass's thread, how long it was held is
 /// counted when it goes.
 struct MadeCounted<'a> {
-    made: std::sync::MutexGuard<'a, Made>,
+    made: MadeHeld<'a>,
     held: Option<std::time::Instant>,
+}
+
+/// [`HostHeap::made`] held alone, or with the other threads of the pass over
+/// buffer views ([`Made`]).
+enum MadeHeld<'a> {
+    Alone(std::sync::RwLockWriteGuard<'a, Made>),
+    Shared(std::sync::RwLockReadGuard<'a, Made>),
 }
 
 impl Drop for MadeCounted<'_> {
@@ -220,13 +247,10 @@ impl std::ops::Deref for MadeCounted<'_> {
     type Target = Made;
 
     fn deref(&self) -> &Made {
-        &self.made
-    }
-}
-
-impl std::ops::DerefMut for MadeCounted<'_> {
-    fn deref_mut(&mut self) -> &mut Made {
-        &mut self.made
+        match &self.made {
+            MadeHeld::Alone(made) => made,
+            MadeHeld::Shared(made) => made,
+        }
     }
 }
 
@@ -239,6 +263,32 @@ impl Made {
             None => ((title as usize) < self.keys.len()).then_some(title),
         }
     }
+
+    /// The record host slot `host` was last made from (0: none).
+    fn key(&self, host: u32) -> u64 {
+        self.keys[host as usize].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// [`Made::key`], `None` past the host slots it has keys for.
+    fn key_of(&self, host: u32) -> Option<u64> {
+        self.keys.get(host as usize).map(|k| k.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn set_key(&self, host: u32, key: u64) {
+        self.keys[host as usize].store(key, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The made state held alone, poisoned or not.
+fn held_alone(made: &std::sync::RwLock<Made>) -> std::sync::RwLockWriteGuard<'_, Made> {
+    made.write().unwrap_or_else(|e| e.into_inner())
+}
+
+thread_local! {
+    /// VIcky (`VICTORY_HEAP_PASS_THREADS`): the title slots past the
+    /// identity window that a thread of the pass over buffer views found
+    /// no pool slot for, the pool used up ([`HostHeap::take_room_wanted`]).
+    static ROOM_WANTED: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The heap map of a view heap with a [`MapLayout`]: an upload buffer of one
@@ -1264,13 +1314,12 @@ impl HostHeap {
             dynamic_first,
             title_count,
             sampler,
-            made: Mutex::new(Made {
-                keys: vec![0; (count + pool) as usize],
+            made: std::sync::RwLock::new(Made {
+                keys: (0..count + pool).map(|_| AtomicU64::new(0)).collect(),
                 map: map
                     .is_some()
                     .then(|| SlotMap::new(count, title_count, count, pool)),
-                cache: None,
-                cache_tried: false,
+                cache: Mutex::new(CacheSlot::default()),
             }),
             map,
             copied: Mutex::new(Vec::new()),
@@ -1465,7 +1514,7 @@ impl HostHeap {
     /// map entry once the slot is made). `None` past the title's slots, or
     /// with the pool used up even after [`HostHeap::reclaim`] (the title
     /// slot then reads the guard slot).
-    fn host_slot(&self, made: &mut Made, title: u32) -> Option<(u32, bool)> {
+    fn host_slot(&self, made: &Made, title: u32, alone: bool) -> Option<(u32, bool)> {
         if title < self.count {
             return Some((title, false));
         }
@@ -1473,17 +1522,23 @@ impl HostHeap {
             return None;
         }
         crate::draw::heap_pass::parts::count(crate::draw::heap_pass::parts::Count::Mapped);
-        {
-            let map = made.map.as_mut()?;
-            if let Some(host) = map.host(title) {
-                return Some((host, false));
-            }
-            if let Some(host) = map.assign(title, crate::host::submissions().1) {
-                return Some((host, true));
-            }
+        let map = made.map.as_ref()?;
+        if let Some(host) = map.host(title) {
+            return Some((host, false));
+        }
+        if let Some(host) = map.assign(title, crate::host::submissions().1) {
+            return Some((host, true));
+        }
+        // VIcky (`VICTORY_HEAP_PASS_THREADS`): a thread of the pass over
+        // buffer views gives back no other title slot's pool slot (another
+        // thread may be making that slot); the slot is made once the
+        // pass's threads are done ([`HostHeap::make_room`]).
+        if !alone {
+            ROOM_WANTED.with_borrow_mut(|wanted| wanted.push(title));
+            return None;
         }
         if self.reclaim(made) > 0
-            && let Some(host) = made.map.as_mut()?.assign(title, crate::host::submissions().1)
+            && let Some(host) = map.assign(title, crate::host::submissions().1)
         {
             return Some((host, true));
         }
@@ -1513,20 +1568,22 @@ impl HostHeap {
     /// one: its map entry is zeroed (the guard slot), and the slot is
     /// handed out again once the submissions that may have read the old
     /// entry are done. Its view stays, held, until it is made again.
-    fn unmap(&self, made: &mut Made, title: u32) {
-        let (Some(map), Some(m)) = (made.map.as_mut(), &self.map) else {
+    fn unmap(&self, made: &Made, title: u32) {
+        let (Some(map), Some(m)) = (made.map.as_ref(), &self.map) else {
             return;
         };
         let Some(host) = map.host(title).filter(|_| title >= map.window()) else {
             return;
         };
+        // (The key before the slot is given back: once it is, a thread
+        // making another title slot may take it, `VICTORY_HEAP_PASS_THREADS`.)
+        made.set_key(host, 0);
         let i = title - map.window();
         // SAFETY: entry `i` of the mapped heap map (`title` is mapped).
         unsafe { (m.at as *mut u32).add(i as usize).write_volatile(0) };
         // The entry is out before the submissions running are counted.
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         map.free(title, crate::host::submissions().0);
-        made.keys[host as usize] = 0;
     }
 
     /// Title slot `title` holds no view (`made` locked): its host slot reads
@@ -1534,11 +1591,11 @@ impl HostHeap {
     /// the fork did), and a pool slot is given back. `for_draw`: the slot
     /// leaves the sets even if its host slot was never made. `marks` as for
     /// [`HostHeap::note_buffer_marking`].
-    fn empty_slot(&self, made: &mut Made, title: u32, for_draw: bool, marks: bool) {
+    fn empty_slot(&self, made: &Made, title: u32, for_draw: bool, marks: bool) {
         use crate::draw::heap_pass::parts::{Part, enter};
         match made.host(title) {
-            Some(host) if made.keys[host as usize] != 0 => {
-                made.keys[host as usize] = 0;
+            Some(host) if made.key(host) != 0 => {
+                made.set_key(host, 0);
                 {
                     let _create = enter(Part::Create);
                     self.make_null(host);
@@ -1565,7 +1622,7 @@ impl HostHeap {
     /// slots again. At most once every two seconds; the slots given back
     /// are handed out once the submissions running now are done. Returns
     /// how many.
-    fn reclaim(&self, made: &mut Made) -> usize {
+    fn reclaim(&self, made: &Made) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         const EVERY_MS: u64 = 2000;
         let now = crate::host::now_ms();
@@ -1793,11 +1850,11 @@ impl HostHeap {
         // as `mirror` takes them.
         // (With a heap map, title slot `index` past the window is made in
         // its pool slot, if it holds one.)
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let made = held_alone(&self.made);
         let Some(host) = made.host(index) else {
             return false;
         };
-        made.keys.get(host as usize).is_some_and(|&made| made != 0 && made == key)
+        made.key_of(host).is_some_and(|made| made != 0 && made == key)
             && self
                 .kept
                 .lock()
@@ -1881,7 +1938,7 @@ impl HostHeap {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
         };
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let made = held_alone(&self.made);
         let mut remade = 0;
         for slot in slots {
             // Title slot `slot`'s host slot (with a heap map, past the
@@ -1889,7 +1946,7 @@ impl HostHeap {
             let Some(host) = made.host(slot) else {
                 continue;
             };
-            let Some(&key) = made.keys.get(host as usize) else {
+            let Some(key) = made.key_of(host) else {
                 continue;
             };
             if key == 0 {
@@ -1913,28 +1970,29 @@ impl HostHeap {
     /// (With a heap map, a title slot past the window keeps its pool slot:
     /// it still holds the view, made again once its memory is mapped.)
     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let made = held_alone(&self.made);
         if made
             .host(index)
-            .and_then(|host| made.keys.get(host as usize))
-            .is_none_or(|&key| key == 0)
+            .and_then(|host| made.key_of(host))
+            .is_none_or(|key| key == 0)
         {
             return false;
         }
-        self.unmake(&mut made, index);
+        self.unmake(&made, index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
     }
 
     /// Makes title slot `index`'s host slot null again, as it is before its
     /// view is made: a null view of the kind it held.
-    fn unmake(&self, made: &mut Made, index: u32) {
+    fn unmake(&self, made: &Made, index: u32) {
         let Some(host) = made.host(index) else {
             return;
         };
-        let Some(key) = made.keys.get_mut(host as usize).map(std::mem::take) else {
+        let Some(key) = made.key_of(host) else {
             return;
         };
+        made.set_key(host, 0);
         if key == 0 {
             return;
         }
@@ -2584,10 +2642,10 @@ impl HostHeap {
         for chunk in due.chunks(MIRROR_CHUNK) {
             RETIRE_LATER.set(Some(Vec::new()));
             {
-                let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                let made = held_alone(&self.made);
                 for &(index, handle) in chunk {
                     if let Some(record) = self.record_at(index, handle, false) {
-                        self.mirror_made(&mut made, (index, handle, false, true), record, &mut Lookups::each());
+                        self.mirror_made(&made, true, (index, handle, false, true), record, &mut Lookups::each());
                     }
                 }
             }
@@ -2604,8 +2662,25 @@ impl HostHeap {
     /// where they waited for a slot. `lookups` has one for each slot;
     /// `marks` as for [`HostHeap::mirror_with`].
     pub(crate) fn mirror_chunk(&self, slots: &[(u32, u64)], lookups: &mut [Lookups], marks: bool) -> Vec<Option<View>> {
+        self.mirror_held(true, slots, lookups, marks)
+    }
+
+    /// VIcky (`VICTORY_HEAP_PASS_THREADS`): [`HostHeap::mirror_chunk`] for
+    /// one of the threads of the pass over buffer views, with `made` held
+    /// together with the pass's other threads (its read lock), which make
+    /// other title slots ([`Made`]). What each slot's making does is the
+    /// same, but that a pool slot is not won by giving back others'
+    /// ([`HostHeap::reclaim`]): the title slots that wanted one are noted
+    /// for [`HostHeap::make_room`] ([`take_room_wanted`]).
+    pub(crate) fn mirror_shared(&self, slots: &[(u32, u64)], lookups: &mut [Lookups], marks: bool) -> Vec<Option<View>> {
+        self.mirror_held(false, slots, lookups, marks)
+    }
+
+    /// [`HostHeap::mirror_chunk`] with `made` held `alone` or with the
+    /// pass's other threads.
+    fn mirror_held(&self, alone: bool, slots: &[(u32, u64)], lookups: &mut [Lookups], marks: bool) -> Vec<Option<View>> {
         use crate::draw::heap_pass::parts::{Part, enter};
-        let mut made = self.made_counted();
+        let made = self.made_counted(alone);
         slots
             .iter()
             .zip(lookups)
@@ -2615,31 +2690,67 @@ impl HostHeap {
                     self.record_at(index, handle, true)?
                 };
                 let _decide = enter(Part::Decide);
-                self.mirror_made(&mut made, (index, handle, true, marks), record, lookups)
+                self.mirror_made(&made, alone, (index, handle, true, marks), record, lookups)
             })
             .collect()
     }
 
-    /// `made` locked by the pass over buffer views: on a pass's thread, the
-    /// wait for the lock and how long it is held are counted
-    /// (`crate::draw::heap_pass::parts`).
-    fn made_counted(&self) -> MadeCounted<'_> {
-        use crate::draw::heap_pass::parts;
-        if !parts::counting() {
-            return MadeCounted { made: self.made.lock().unwrap_or_else(|e| e.into_inner()), held: None };
+    /// VIcky (`VICTORY_HEAP_PASS_THREADS`): once the threads of a pass over
+    /// buffer views are done, with `made` held alone, the slots (title slot,
+    /// handle) they found no pool slot for: if the pool slots of title slots
+    /// without a live view are given back now ([`HostHeap::reclaim`], at
+    /// most once every two seconds), they are made as the pass makes them,
+    /// as the pass on one thread made them when the first of them gave
+    /// those back. Returns how many were made.
+    pub(crate) fn make_room(&self, slots: &[(u32, u64)], marks: bool) -> usize {
+        if slots.is_empty() {
+            return 0;
         }
-        let made = match self.made.try_lock() {
-            Ok(made) => made,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
+        let made = held_alone(&self.made);
+        if self.reclaim(&made) == 0 {
+            return 0;
+        }
+        for &(index, handle) in slots {
+            if let Some(record) = self.record_at(index, handle, true) {
+                self.mirror_made(&made, true, (index, handle, true, marks), record, &mut Lookups::kept());
+            }
+        }
+        slots.len()
+    }
+
+    /// `made` locked by the pass over buffer views, `alone` or with the
+    /// pass's other threads: on a pass's thread, the wait for the lock and
+    /// how long it is held are counted (`crate::draw::heap_pass::parts`).
+    fn made_counted(&self, alone: bool) -> MadeCounted<'_> {
+        use crate::draw::heap_pass::parts;
+        let tried = if alone {
+            match self.made.try_write() {
+                Ok(made) => Some(MadeHeld::Alone(made)),
+                Err(std::sync::TryLockError::Poisoned(e)) => Some(MadeHeld::Alone(e.into_inner())),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            }
+        } else {
+            match self.made.try_read() {
+                Ok(made) => Some(MadeHeld::Shared(made)),
+                Err(std::sync::TryLockError::Poisoned(e)) => Some(MadeHeld::Shared(e.into_inner())),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            }
+        };
+        let made = match tried {
+            Some(made) => made,
+            None => {
                 let _wait = parts::enter(parts::Part::Wait);
                 let began = std::time::Instant::now();
-                let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                let made = if alone {
+                    MadeHeld::Alone(held_alone(&self.made))
+                } else {
+                    MadeHeld::Shared(self.made.read().unwrap_or_else(|e| e.into_inner()))
+                };
                 parts::waited(began.elapsed());
                 made
             }
         };
-        MadeCounted { made, held: Some(std::time::Instant::now()) }
+        MadeCounted { made, held: parts::counting().then(std::time::Instant::now) }
     }
 
     /// Makes title slot `index`'s host slot (its own, or with a heap map
@@ -2649,8 +2760,8 @@ impl HostHeap {
     /// copy their data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         let record = self.record_at(index, handle, for_draw)?;
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        self.mirror_made(&mut made, (index, handle, for_draw, true), record, &mut Lookups::each())
+        let made = held_alone(&self.made);
+        self.mirror_made(&made, true, (index, handle, for_draw, true), record, &mut Lookups::each())
     }
 
     /// [`HostHeap::mirror`] for a draw, with the host copies its making
@@ -2664,9 +2775,9 @@ impl HostHeap {
             let _read = enter(Part::Read);
             self.record_at(index, handle, true)?
         };
-        let mut made = self.made_counted();
+        let made = self.made_counted(true);
         let _decide = enter(Part::Decide);
-        self.mirror_made(&mut made, (index, handle, true, marks), record, lookups)
+        self.mirror_made(&made, true, (index, handle, true, marks), record, lookups)
     }
 
     /// The part of [`HostHeap::mirror`] before `made` is locked: `None` if
@@ -2705,10 +2816,13 @@ impl HostHeap {
     /// (one lock for several slots: [`HostHeap::mirror_due`],
     /// [`HostHeap::mirror_chunk`]): title slot `index` at `handle`, which
     /// held `record` when [`HostHeap::record_at`] read it; `marks` as for
-    /// [`HostHeap::mirror_with`].
+    /// [`HostHeap::mirror_with`]. `alone`: `made` is held alone, not with
+    /// the other threads of the pass over buffer views
+    /// ([`HostHeap::mirror_shared`]).
     fn mirror_made(
         &self,
-        made: &mut Made,
+        made: &Made,
+        alone: bool,
         (index, handle, for_draw, marks): (u32, u64, bool, bool),
         [tag, i, generation]: [u32; 3],
         lookups: &mut Lookups,
@@ -2729,7 +2843,7 @@ impl HostHeap {
         };
         let host = {
             let _map = enter(Part::Map);
-            self.host_slot(made, index)
+            self.host_slot(made, index, alone)
         };
         let Some((host, taken)) = host else {
             // Past the window with the pool used up: the slot reads the
@@ -2748,7 +2862,7 @@ impl HostHeap {
         if taken {
             count(Count::Taken);
         }
-        if taken || made.keys[host as usize] != key {
+        if taken || made.key(host) != key {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -2777,7 +2891,7 @@ impl HostHeap {
             // one and uploads what it shows. Made null here, the texture
             // read as nothing for as long as it waited in the queue, every
             // time it got sharper.
-            let old = made.keys[host as usize];
+            let old = made.key(host);
             // (With `VICTORY_HEAP_BUFFERS_SKIP_SAME=1` the old view is not
             // looked up for a view that is no placed texture's: no old view
             // is the same placed texture as it.)
@@ -2790,11 +2904,11 @@ impl HostHeap {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
-            made.keys[host as usize] = if later { 0 } else { key };
+            made.set_key(host, if later { 0 } else { key });
             let kept = if later {
                 None
             } else {
-                self.make_slot(made, &view, key, host, lookups)
+                self.make_slot(made, alone, &view, key, host, lookups)
             };
             if kept.is_none() && !later {
                 count(Count::Unmade);
@@ -2820,7 +2934,8 @@ impl HostHeap {
     /// does; with `VICTORY_HEAP_SYNC_CACHE`, a buffer view made before is
     /// copied from the cache ([`RecordCache`]) when it would be made on the
     /// same host copies.
-    fn make_slot(&self, made: &mut Made, view: &View, key: u64, host: u32, lookups: &mut Lookups) -> Option<Kept> {
+    /// (`alone` as for [`HostHeap::mirror_made`].)
+    fn make_slot(&self, made: &Made, alone: bool, view: &View, key: u64, host: u32, lookups: &mut Lookups) -> Option<Kept> {
         let at = self.cpu(host);
         let size = cache_size();
         if size == 0 || self.sampler {
@@ -2830,31 +2945,69 @@ impl HostHeap {
             FAST[Fast::NotCacheable as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return made_otherwise(view, at, lookups);
         };
-        if !made.cache_tried {
-            made.cache_tried = true;
-            made.cache = RecordCache::new(size, self.step);
+        // VIcky (`VICTORY_HEAP_PASS_THREADS`): the threads of the pass take
+        // the cache's lock in turn, so the copies its making asks for are
+        // looked up before it (the same asks, kept in `lookups`).
+        if !alone && lookups.kept {
+            let _ = shown_copy(view, extent.0, extent.1, lookups);
         }
-        let Some(cache) = made.cache.as_mut() else {
+        let mut cache = made.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if !cache.tried {
+            cache.tried = true;
+            cache.table = RecordCache::new(size, self.step);
+        }
+        let Some(table) = cache.table.as_mut() else {
+            drop(cache);
             return made_otherwise(view, at, lookups);
         };
-        cache.make(view, key, extent, at, lookups)
+        table.make(view, key, extent, at, lookups)
+    }
+
+    /// VIcky (`VICTORY_HEAP_PASS_THREADS_CHECK`): of each of `slots`, the
+    /// record its host slot was last made from (0: none, or no host slot)
+    /// and the host resource the slot holds (as a raw pointer).
+    pub(crate) fn slots_seen(&self, slots: &[u32]) -> Vec<(u64, Option<usize>)> {
+        slots
+            .chunks(1024)
+            .flat_map(|chunk| {
+                let made = held_alone(&self.made);
+                let hosts: Vec<Option<u32>> = chunk.iter().map(|&index| made.host(index)).collect();
+                let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+                hosts
+                    .into_iter()
+                    .map(|host| {
+                        let Some(host) = host else {
+                            return (0, None);
+                        };
+                        let shown = kept.get(host as usize).and_then(Option::as_ref);
+                        (made.key_of(host).unwrap_or(0), shown.map(|b| windows::core::Interface::as_raw(b) as usize))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// Whether title slot `index`'s host slot is backed by a made host
     /// descriptor (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let made = held_alone(&self.made);
         made.host(index)
-            .and_then(|host| made.keys.get(host as usize))
-            .is_some_and(|&key| key != 0)
+            .and_then(|host| made.key_of(host))
+            .is_some_and(|key| key != 0)
+    }
+
+    /// The host slot title slot `index` is made in, if it has one (tests).
+    #[cfg(test)]
+    pub(crate) fn host_of(&self, index: u32) -> Option<u32> {
+        held_alone(&self.made).host(index)
     }
 
     /// The host resource title slot `index`'s host slot shows, as a raw
     /// pointer; `None` if it shows none (tests).
     #[cfg(test)]
     pub(crate) fn shown_raw(&self, index: u32) -> Option<usize> {
-        let host = self.made.lock().unwrap_or_else(|e| e.into_inner()).host(index)?;
+        let host = held_alone(&self.made).host(index)?;
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         kept.get(host as usize)?
             .as_ref()
@@ -2866,12 +3019,12 @@ impl HostHeap {
     /// host copy that is brought up to date for it).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
-        let made = match self.made.try_lock() {
+        let made = match self.made.try_write() {
             Ok(made) => made,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
                 crate::draw::heap_pass::parts::count(crate::draw::heap_pass::parts::Count::ShowsWaited);
-                self.made.lock().unwrap_or_else(|e| e.into_inner())
+                held_alone(&self.made)
             }
         };
         let host = made.host(index);
@@ -2880,6 +3033,30 @@ impl HostHeap {
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         let shown = kept.get(host as usize)?.as_ref()?;
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+    }
+
+    /// VIcky (`VICTORY_HEAP_PASS_THREADS`, diagnostics): of `slots` (title
+    /// slot, the buffer its range is brought up to date in), how many show
+    /// another buffer ([`HostHeap::shows`] false), for a thread of the pass:
+    /// `made` held with the other threads, once for all of them.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn shows_elsewhere(&self, slots: &[(u32, &ID3D12Resource)]) -> u64 {
+        if slots.is_empty() {
+            return 0;
+        }
+        let hosts: Vec<Option<u32>> = {
+            let made = self.made.read().unwrap_or_else(|e| e.into_inner());
+            slots.iter().map(|&(index, _)| made.host(index)).collect()
+        };
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        slots
+            .iter()
+            .zip(hosts)
+            .filter(|&(&(_, buffer), host)| {
+                host.and_then(|host| kept.get(host as usize)?.as_ref())
+                    .is_some_and(|shown| windows::core::Interface::as_raw(shown) != windows::core::Interface::as_raw(buffer))
+            })
+            .count() as u64
     }
 
     /// What the queue of textures picked by index knows of title slot
@@ -2905,7 +3082,7 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).keys.get(index as usize)?;
+        let key = held_alone(&self.made).key_of(index)?;
         if key == 0 {
             return Some("null".into());
         }
@@ -3177,6 +3354,12 @@ impl Lookups {
         }
         found
     }
+}
+
+/// VIcky (`VICTORY_HEAP_PASS_THREADS`): the title slots this thread's
+/// [`HostHeap::mirror_shared`] found no pool slot for since the last call.
+pub(crate) fn take_room_wanted() -> Vec<u32> {
+    ROOM_WANTED.with_borrow_mut(std::mem::take)
 }
 
 /// `look(address, len)`, timed and counted for the pass over buffer views
@@ -5191,7 +5374,7 @@ mod tests {
         assert_eq!((mapped.count(), mapped.title_count, mapped.dynamic_first), (16, 64, 25));
         assert!(mapped.map.is_some());
         {
-            let made = mapped.made.lock().unwrap();
+            let made = mapped.made.read().unwrap();
             assert_eq!(made.keys.len(), 16 + 8, "the window's and the pool's");
             assert_eq!(made.map.as_ref().map(SlotMap::len), Some(48));
         }
@@ -5201,7 +5384,7 @@ mod tests {
         assert_eq!(mapped.dynamic(DYNAMIC), Some(25));
         assert_eq!(mapped.dynamic(1), None);
         assert_eq!((fits.count(), fits.dynamic_first), (8, 8));
-        assert!(fits.map.is_none() && fits.made.lock().unwrap().map.is_none());
+        assert!(fits.map.is_none() && fits.made.read().unwrap().map.is_none());
         assert_eq!(fits.dynamic(1), Some(8));
     }
 
@@ -5248,7 +5431,7 @@ mod tests {
         let at = heap.map.as_ref().unwrap().at;
         // SAFETY: an entry of the mapped heap map.
         let entry = unsafe { (at as *const u32).add((title - window) as usize).read_volatile() };
-        let pool = heap.made.lock().unwrap().map.as_ref().unwrap().host(title);
+        let pool = heap.made.read().unwrap().map.as_ref().unwrap().host(title);
         (entry, pool)
     }
 
@@ -5274,7 +5457,7 @@ mod tests {
         assert!((16..24).contains(&pooled), "{pooled}");
         assert_eq!(e40, !pooled);
         assert_eq!(entry(heap, 41), (0, None));
-        assert_eq!(heap.made.lock().unwrap().host(3), Some(3), "below the window: its own");
+        assert_eq!(heap.made.read().unwrap().host(3), Some(3), "below the window: its own");
         assert_eq!(heap.title_start.load(std::sync::atomic::Ordering::Relaxed), start);
 
         // Written again: the same pool slot. Another slot: another one.
@@ -5291,7 +5474,7 @@ mod tests {
         unsafe { (handle as *mut u8).write_bytes(0, 32) };
         assert!(heap.mirror(40, handle, false).is_none());
         assert_eq!(entry(heap, 40), (0, None));
-        let stats = heap.made.lock().unwrap().map.as_ref().unwrap().stats();
+        let stats = heap.made.read().unwrap().map.as_ref().unwrap().stats();
         assert_eq!((stats.mapped, stats.quarantined), (1, 1));
         assert_eq!(release(title), 0);
     }
@@ -5460,7 +5643,7 @@ mod fast_tests {
 
     /// The buffer title slot `index`'s host slot holds, as a raw pointer.
     fn shown(heap: &HostHeap, index: u32) -> Option<usize> {
-        let host = heap.made.lock().unwrap().host(index)?;
+        let host = heap.made.read().unwrap().host(index)?;
         let kept = heap.kept.lock().unwrap();
         kept.get(host as usize)?
             .as_ref()
@@ -5481,8 +5664,9 @@ mod fast_tests {
         write_record(start, 2, &view);
         assert!(heap.mirror(1, start + TITLE_SLOT_BYTES, true).is_some());
         let entry = {
-            let made = heap.made.lock().unwrap();
-            let cache = made.cache.as_ref().expect("a cache");
+            let made = heap.made.read().unwrap();
+            let cache = made.cache.lock().unwrap();
+            let cache = cache.table.as_ref().expect("a cache");
             cache.entries[cache.find(key).expect("kept")]
         };
         let whole = crate::shadow::find(base, 0x1_0000).unwrap();
@@ -5492,8 +5676,9 @@ mod fast_tests {
         let used = entry.used;
         assert!(heap.mirror(2, start + 2 * TITLE_SLOT_BYTES, true).is_some());
         {
-            let made = heap.made.lock().unwrap();
-            let cache = made.cache.as_ref().unwrap();
+            let made = heap.made.read().unwrap();
+            let cache = made.cache.lock().unwrap();
+            let cache = cache.table.as_ref().unwrap();
             let e = cache.find(key).unwrap();
             assert_ne!(cache.entries[e].used, used, "used again");
         }
@@ -5526,8 +5711,9 @@ mod fast_tests {
         write_record(start, 6, &view);
         heap.mirror(6, start + 6 * TITLE_SLOT_BYTES, true);
         let entry = {
-            let made = heap.made.lock().unwrap();
-            let cache = made.cache.as_ref().unwrap();
+            let made = heap.made.read().unwrap();
+            let cache = made.cache.lock().unwrap();
+            let cache = cache.table.as_ref().unwrap();
             cache.entries[cache.find(key).unwrap()]
         };
         assert_eq!(entry.whole, new.id(), "made again on the new copy");
@@ -5686,8 +5872,8 @@ mod fast_tests {
     fn state(heap: &HostHeap, slots: u32) -> (Vec<u64>, Vec<bool>, Vec<u32>, Vec<u32>) {
         let keys = (0..slots)
             .map(|i| {
-                let made = heap.made.lock().unwrap();
-                made.keys[made.host(i).unwrap() as usize]
+                let made = heap.made.read().unwrap();
+                made.key(made.host(i).unwrap())
             })
             .collect();
         let kept = (0..slots).map(|i| shown(heap, i).is_some()).collect();
@@ -5895,7 +6081,7 @@ mod fast_tests {
                     let t = Instant::now();
                     for &s in &slots {
                         let [_, i, g] = unsafe { ((start + u64::from(s) * TITLE_SLOT_BYTES) as *const [u32; 3]).read_unaligned() };
-                        let _made = heap.made.lock().unwrap();
+                        let _made = heap.made.write().unwrap();
                         std::hint::black_box(super::super::view_at(i, g));
                     }
                     eprintln!("    record read, lock, view_at: {:.0} ns", each(t));
@@ -5906,9 +6092,9 @@ mod fast_tests {
                     eprintln!("    note (skipped): {:.0} ns", each(t));
                     let t = Instant::now();
                     for &s in &slots {
-                        let mut made = heap.made.lock().unwrap();
+                        let made = heap.made.write().unwrap();
                         let key = unsafe { ((start + u64::from(s) * TITLE_SLOT_BYTES + 4) as *const u64).read_unaligned() };
-                        std::hint::black_box(heap.make_slot(&mut made, &views[s as usize], key, s, &mut Lookups::kept()));
+                        std::hint::black_box(heap.make_slot(&made, true, &views[s as usize], key, s, &mut Lookups::kept()));
                     }
                     eprintln!("    make_slot (cache hit): {:.0} ns", each(t));
                     let t = Instant::now();
@@ -5922,8 +6108,9 @@ mod fast_tests {
                         .map(|&s| unsafe { ((start + u64::from(s) * TITLE_SLOT_BYTES + 4) as *const u64).read_unaligned() })
                         .collect();
                     {
-                        let made = heap.made.lock().unwrap();
-                        let cache = made.cache.as_ref().unwrap();
+                        let made = heap.made.read().unwrap();
+                        let cache = made.cache.lock().unwrap();
+                        let cache = cache.table.as_ref().unwrap();
                         let t = Instant::now();
                         for &k in &keys {
                             std::hint::black_box(cache.find(k));

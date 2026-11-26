@@ -14,8 +14,17 @@
 //! it through the old map entry has finished: the caller passes the number
 //! of submissions started when it gives a slot back and the number finished
 //! when it asks for one.
+//!
+//! VIcky (`VICTORY_HEAP_PASS_THREADS`): each title slot's entry is an atomic,
+//! read without a lock, and the pool's bookkeeping is behind a lock of its
+//! own, so that threads that make different title slots at once take and
+//! give back pool slots one at a time and look their own entries up freely.
+//! Whoever changes a title slot's entry holds that slot (the heap's slot
+//! state, `host::HostHeap::made`), as before.
 
 use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 /// The map buffer's entry for `host`: its bitwise not, 0 for none. A zeroed
 /// buffer, and a read past its end (which returns 0), then give `u32::MAX`,
@@ -37,7 +46,14 @@ pub(crate) struct SlotMap {
     first: u32,
     pool: u32,
     /// Per title slot from the window on: its host slot as an [`entry`].
-    entries: Vec<u32>,
+    entries: Vec<AtomicU32>,
+    /// The pool's bookkeeping.
+    state: Mutex<Pool>,
+}
+
+/// Which pool slots are handed out, free or waiting ([`SlotMap::state`]).
+#[derive(Debug, Default)]
+struct Pool {
     /// Pool slots never handed out start at `first + fresh`.
     fresh: u32,
     /// Pool slots given back that no submission can still read.
@@ -46,7 +62,7 @@ pub(crate) struct SlotMap {
     /// oldest first.
     quarantine: VecDeque<(u64, u32)>,
     /// Title slots refused a host slot because the pool was used up.
-    pub(crate) refused: u64,
+    refused: u64,
 }
 
 /// What [`SlotMap::stats`] counts.
@@ -67,12 +83,19 @@ impl SlotMap {
             window,
             first,
             pool,
-            entries: vec![0; title_count.saturating_sub(window) as usize],
-            fresh: 0,
-            free: Vec::new(),
-            quarantine: VecDeque::new(),
-            refused: 0,
+            entries: (0..title_count.saturating_sub(window)).map(|_| AtomicU32::new(0)).collect(),
+            state: Mutex::new(Pool::default()),
         }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, Pool> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Title slots refused a host slot because the pool was used up.
+    #[cfg(test)]
+    pub(crate) fn refused(&self) -> u64 {
+        self.state().refused
     }
 
     /// The first title slot mapped.
@@ -90,7 +113,7 @@ impl SlotMap {
     pub(crate) fn host(&self, title: u32) -> Option<u32> {
         match title.checked_sub(self.window) {
             None => Some(title),
-            Some(at) => decode(*self.entries.get(at as usize)?),
+            Some(at) => decode(self.entries.get(at as usize)?.load(Relaxed)),
         }
     }
 
@@ -100,51 +123,51 @@ impl SlotMap {
         title
             .checked_sub(self.window)
             .and_then(|at| self.entries.get(at as usize))
-            .copied()
-            .unwrap_or(0)
+            .map_or(0, |e| e.load(Relaxed))
     }
 
     /// The host slot of title slot `title`, taking a pool slot for a mapped
     /// one that has none. `finished`: the submissions finished so far, which
     /// releases the quarantined slots no running submission can read.
     /// `None` past the title's slots, or when the pool is used up.
-    pub(crate) fn assign(&mut self, title: u32, finished: u64) -> Option<u32> {
+    pub(crate) fn assign(&self, title: u32, finished: u64) -> Option<u32> {
         let Some(at) = title.checked_sub(self.window) else {
             return Some(title);
         };
-        let held = *self.entries.get(at as usize)?;
-        if let Some(host) = decode(held) {
+        let slot = self.entries.get(at as usize)?;
+        if let Some(host) = decode(slot.load(Relaxed)) {
             return Some(host);
         }
-        while let Some(&(started, host)) = self.quarantine.front()
+        let mut pool = self.state();
+        while let Some(&(started, host)) = pool.quarantine.front()
             && started <= finished
         {
-            self.quarantine.pop_front();
-            self.free.push(host);
+            pool.quarantine.pop_front();
+            pool.free.push(host);
         }
-        let host = match self.free.pop() {
+        let host = match pool.free.pop() {
             Some(host) => host,
-            None if self.fresh < self.pool => {
-                self.fresh += 1;
-                self.first + self.fresh - 1
+            None if pool.fresh < self.pool => {
+                pool.fresh += 1;
+                self.first + pool.fresh - 1
             }
             None => {
-                self.refused += 1;
+                pool.refused += 1;
                 return None;
             }
         };
-        self.entries[at as usize] = entry(Some(host));
+        slot.store(entry(Some(host)), Relaxed);
         Some(host)
     }
 
     /// Gives back the host slot of mapped title slot `title`, if it has
     /// one: quarantined until the submissions `started` so far finish.
-    pub(crate) fn free(&mut self, title: u32, started: u64) -> Option<u32> {
+    pub(crate) fn free(&self, title: u32, started: u64) -> Option<u32> {
         let at = title.checked_sub(self.window)?;
-        let slot = self.entries.get_mut(at as usize)?;
-        let host = decode(*slot)?;
-        *slot = 0;
-        self.quarantine.push_back((started, host));
+        let slot = self.entries.get(at as usize)?;
+        let host = decode(slot.load(Relaxed))?;
+        slot.store(0, Relaxed);
+        self.state().quarantine.push_back((started, host));
         Some(host)
     }
 
@@ -153,18 +176,19 @@ impl SlotMap {
         self.entries
             .iter()
             .enumerate()
-            .filter_map(|(at, &e)| Some((self.window + at as u32, decode(e)?)))
+            .filter_map(|(at, e)| Some((self.window + at as u32, decode(e.load(Relaxed))?)))
     }
 
     /// Mapped title slots, free and quarantined pool slots, refusals.
     #[cfg(any(test, feature = "diagnostics"))]
     pub(crate) fn stats(&self) -> Stats {
-        let held = self.fresh as usize - self.free.len() - self.quarantine.len();
+        let pool = self.state();
+        let held = pool.fresh as usize - pool.free.len() - pool.quarantine.len();
         Stats {
             mapped: held as u32,
-            free: self.pool - self.fresh + self.free.len() as u32,
-            quarantined: self.quarantine.len() as u32,
-            refused: self.refused,
+            free: self.pool - pool.fresh + pool.free.len() as u32,
+            quarantined: pool.quarantine.len() as u32,
+            refused: pool.refused,
         }
     }
 }
@@ -177,7 +201,7 @@ mod tests {
     /// take pool slots in order, keep them, and none past the title's.
     #[test]
     fn title_slots_past_the_window_take_pool_slots_and_keep_them() {
-        let mut m = SlotMap::new(16, 64, 20, 8);
+        let m = SlotMap::new(16, 64, 20, 8);
         assert_eq!(m.len(), 48);
         assert_eq!(m.host(3), Some(3));
         assert_eq!(m.assign(3, 0), Some(3));
@@ -214,7 +238,7 @@ mod tests {
         assert_eq!(decode(entry(Some(999_997))), Some(999_997));
         assert_eq!(decode(0), None);
         assert_eq!(!0u32, u32::MAX, "what a shader makes of an empty entry");
-        let mut m = SlotMap::new(16, 64, 20, 8);
+        let m = SlotMap::new(16, 64, 20, 8);
         assert_eq!(m.entry(40), 0);
         m.assign(40, 0);
         assert_eq!(m.entry(40), !20);
@@ -227,7 +251,7 @@ mod tests {
     /// before it was given back may still run.
     #[test]
     fn freed_slots_wait_for_the_submissions_running_when_freed() {
-        let mut m = SlotMap::new(0, 8, 100, 2);
+        let m = SlotMap::new(0, 8, 100, 2);
         assert_eq!(m.assign(0, 0), Some(100));
         assert_eq!(m.assign(1, 0), Some(101));
         // Submission 5 had started (4 finished) when slot 0 emptied.
@@ -235,7 +259,7 @@ mod tests {
         assert_eq!(m.free(0, 5), None, "given back once");
         assert_eq!(m.stats().quarantined, 1);
         assert_eq!(m.assign(2, 4), None, "submission 5 may still read it");
-        assert_eq!(m.refused, 1);
+        assert_eq!(m.refused(), 1);
         assert_eq!(m.assign(2, 5), Some(100), "submission 5 finished");
         assert_eq!(m.stats().quarantined, 0);
         // Given back in order, released in order.
@@ -250,12 +274,12 @@ mod tests {
     /// the guard), and the held ones are not moved.
     #[test]
     fn a_used_up_pool_refuses_and_moves_nothing() {
-        let mut m = SlotMap::new(4, 12, 4, 3);
+        let m = SlotMap::new(4, 12, 4, 3);
         let held: Vec<_> = (4..7).map(|t| m.assign(t, 0)).collect();
         assert_eq!(held, [Some(4), Some(5), Some(6)]);
         assert_eq!(m.assign(7, u64::MAX), None);
         assert_eq!(m.assign(8, u64::MAX), None);
-        assert_eq!(m.refused, 2);
+        assert_eq!(m.refused(), 2);
         assert_eq!((4..7).map(|t| m.host(t)).collect::<Vec<_>>(), held);
         assert_eq!(m.entry(7), 0);
         assert_eq!(m.stats().free, 0);
@@ -269,7 +293,7 @@ mod tests {
     /// order; a slot given back is not.
     #[test]
     fn mapped_lists_the_title_slots_holding_host_slots() {
-        let mut m = SlotMap::new(16, 64, 20, 8);
+        let m = SlotMap::new(16, 64, 20, 8);
         m.assign(40, 0);
         m.assign(17, 0);
         m.assign(63, 0);
@@ -281,7 +305,7 @@ mod tests {
     /// An empty pool (a window that leaves no room) maps nothing.
     #[test]
     fn an_empty_pool_maps_nothing() {
-        let mut m = SlotMap::new(10, 20, 10, 0);
+        let m = SlotMap::new(10, 20, 10, 0);
         assert_eq!(m.assign(9, 0), Some(9));
         assert_eq!(m.assign(10, 0), None);
         assert_eq!(m.entry(10), 0);
