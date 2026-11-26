@@ -3382,7 +3382,10 @@ impl State {
         };
         // (`VICTORY_DISPATCH_PLAIN`, with `seen`) What a single record that
         // is not parted does instead of the plain path of before.
-        let plain = if single && !parted { crate::indirect::plain_mode() } else { crate::indirect::Plain::default() };
+        let plain = match p.stages.first() {
+            Some(stage) if single && !parted => crate::indirect::plain_for(&stage.shader.hash),
+            _ => crate::indirect::Plain::default(),
+        };
         // The parts' command signature, and where it sets the number of
         // each part's first group (none: from the records' second words).
         let split = if parted {
@@ -3390,7 +3393,10 @@ impl State {
                 Some(base) => crate::indirect::split_signature(&p.root, base).map(|s| (s, Some(base))),
                 None => host_signature(DISPATCH, crate::indirect::PART_STRIDE).map(|s| (s, None)),
             }
-        } else if plain.split {
+        } else if plain.rootsig && base.is_some() {
+            // One part, through the signature that sets the base.
+            base.and_then(|base| crate::indirect::split_signature(&p.root, base).map(|s| (s, Some(base))))
+        } else if plain.split || plain.rootsig {
             host_signature(DISPATCH, crate::indirect::PART_STRIDE).map(|s| (s, None))
         } else {
             None
@@ -3617,7 +3623,7 @@ impl State {
         list.note_op(|| {
             let parts = match (&split, parted) {
                 (Some(_), true) => " in parts",
-                (Some(_), false) => " as one part (VICTORY_DISPATCH_PLAIN=split)",
+                (Some(_), false) => " as one part (VICTORY_DISPATCH_PLAIN split or rootsig)",
                 (None, _) => "",
             };
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}{parts}"), kind == DISPATCH)
@@ -3654,6 +3660,10 @@ impl State {
                     counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
                 )
             },
+        }
+        if plain.after {
+            // SAFETY: an open list; barriers that name no resource.
+            unsafe { list.list.ResourceBarrier(&crate::indirect::full_wait()) };
         }
         if kind == MESH {
             self.mesh_scissor(list, false);

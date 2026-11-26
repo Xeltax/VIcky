@@ -642,11 +642,32 @@ pub(crate) fn parts_on() -> bool {
 /// - `wait`: a full wait (every shader write, and an aliasing barrier on
 ///   every resource) right before the execution, after the program's bind,
 ///   as a driver may wait before an execution whose command signature sets
-///   root constants (RT64's about 20 microseconds of card time for each).
+///   root constants (RT64's about 20 microseconds of card time for each);
+/// - `after`: the same full wait right after the execution, for what reads
+///   its output next (RT70 and RT71, `split` and `wait`, left the quarter
+///   dark);
+/// - `rootsig`: `split`, and a program that takes its first group's number
+///   runs through the parted path's command signature, which sets it (to 0,
+///   one part): the parted path for a record within one dispatch, x cut
+///   past it. It should light the quarter at the parted path's cost if the
+///   signature's root constant is what does it.
+///
+/// `VICTORY_DISPATCH_PLAIN_ONLY` (hash beginnings, comma-separated) limits
+/// them to those programs, to find the pass by halving the list.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Plain {
     pub(crate) split: bool,
     pub(crate) wait: bool,
+    pub(crate) after: bool,
+    pub(crate) rootsig: bool,
+}
+
+impl Plain {
+    /// The variants' names, comma-separated (for the line).
+    fn names(self) -> String {
+        let names = [(self.split, "split"), (self.wait, "wait"), (self.after, "after"), (self.rootsig, "rootsig")];
+        names.iter().filter(|n| n.0).map(|n| n.1).collect::<Vec<_>>().join(",")
+    }
 }
 
 /// `VICTORY_DISPATCH_PLAIN`'s variants. Pure, for testing.
@@ -656,6 +677,8 @@ fn parse_plain(value: Option<&str>) -> Plain {
         match word {
             "split" => plain.split = true,
             "wait" => plain.wait = true,
+            "after" => plain.after = true,
+            "rootsig" => plain.rootsig = true,
             _ => {}
         }
     }
@@ -672,6 +695,28 @@ pub(crate) fn plain_mode() -> Plain {
         }
         parse_plain(std::env::var("VICTORY_DISPATCH_PLAIN").ok().as_deref())
     })
+}
+
+/// The hash beginnings of `VICTORY_DISPATCH_PLAIN_ONLY` (none: every
+/// program). Pure, for testing.
+fn parse_only(value: Option<&str>) -> Vec<String> {
+    value.unwrap_or("").split(',').map(str::trim).filter(|w| !w.is_empty()).map(str::to_owned).collect()
+}
+
+fn plain_only() -> &'static [String] {
+    static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    ONLY.get_or_init(|| parse_only(std::env::var("VICTORY_DISPATCH_PLAIN_ONLY").ok().as_deref()))
+}
+
+/// [`plain_mode`] for the program with hash `hash`: none if
+/// `VICTORY_DISPATCH_PLAIN_ONLY` leaves it out.
+pub(crate) fn plain_for(hash: &str) -> Plain {
+    let only = plain_only();
+    if only.is_empty() || only.iter().any(|w| hash.starts_with(w.as_str())) {
+        plain_mode()
+    } else {
+        Plain::default()
+    }
 }
 
 /// A full wait: every earlier shader write done, and an aliasing barrier
@@ -862,12 +907,14 @@ pub(crate) fn parts_line(frames: f64) {
          single-record indirect dispatches {:.2} through the parted path, {:.2} through the plain one; {} programs \
          seen asking for more in x",
         match (parts_mode(), plain_mode()) {
-            (Parts::Off, _) => "off",
-            (Parts::All, _) => "on",
-            (Parts::Seen, Plain { split: false, wait: false }) => "seen",
-            (Parts::Seen, Plain { split: true, wait: false }) => "seen, VICTORY_DISPATCH_PLAIN split",
-            (Parts::Seen, Plain { split: false, wait: true }) => "seen, VICTORY_DISPATCH_PLAIN wait",
-            (Parts::Seen, Plain { split: true, wait: true }) => "seen, VICTORY_DISPATCH_PLAIN split,wait",
+            (Parts::Off, _) => "off".to_owned(),
+            (Parts::All, _) => "on".to_owned(),
+            (Parts::Seen, plain) if plain == Plain::default() => "seen".to_owned(),
+            (Parts::Seen, plain) => format!(
+                "seen, VICTORY_DISPATCH_PLAIN {}{}",
+                plain.names(),
+                if plain_only().is_empty() { String::new() } else { format!(" for {} hash beginnings", plain_only().len()) }
+            ),
         },
         split as f64 / frames,
         parts as f64 / frames,
@@ -3275,14 +3322,66 @@ void main(uint3 g : SV_GroupID) {
         }
     }
 
-    /// `VICTORY_DISPATCH_PLAIN`: `split`, `wait`, both, or nothing.
+    /// `VICTORY_DISPATCH_PLAIN`: any of `split`, `wait`, `after`, `rootsig`,
+    /// or nothing; `VICTORY_DISPATCH_PLAIN_ONLY`: hash beginnings.
     #[test]
-    fn the_plain_switch_reads_split_and_wait() {
+    fn the_plain_switch_reads_its_variants() {
         assert_eq!(parse_plain(None), Plain::default());
-        assert_eq!(parse_plain(Some("split")), Plain { split: true, wait: false });
-        assert_eq!(parse_plain(Some("wait")), Plain { split: false, wait: true });
-        assert_eq!(parse_plain(Some(" wait , split ")), Plain { split: true, wait: true });
+        assert_eq!(parse_plain(Some("split")), Plain { split: true, ..Plain::default() });
+        assert_eq!(parse_plain(Some("wait")), Plain { wait: true, ..Plain::default() });
+        assert_eq!(parse_plain(Some("after")), Plain { after: true, ..Plain::default() });
+        assert_eq!(parse_plain(Some("rootsig")), Plain { rootsig: true, ..Plain::default() });
+        let all = parse_plain(Some(" wait , split,after,rootsig "));
+        assert_eq!(all, Plain { split: true, wait: true, after: true, rootsig: true });
+        assert_eq!(all.names(), "split,wait,after,rootsig");
         assert_eq!(parse_plain(Some("nothing")), Plain::default());
+        assert!(parse_only(None).is_empty());
+        assert_eq!(parse_only(Some(" 2dc364df, ab ,")), ["2dc364df", "ab"]);
+    }
+
+    /// `VICTORY_DISPATCH_PLAIN=rootsig`: the one-part records
+    /// (`bound_split_one`) run through the parted path's command signature,
+    /// which sets the first group's number to 0: a small record runs every
+    /// group once, a record past one dispatch runs its first 65,535 groups
+    /// once (cut, as without the parts).
+    #[test]
+    fn warp_one_part_through_the_root_constant_signature_runs_its_groups_once() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let counter = compile_cs(&warp.device, PARTS_CS).expect("the counting shader must compile");
+        let signature = make_split_signature(&warp.device, &counter.root, (0, 2)).expect("the split command signature");
+        // (asked, groups that run in x)
+        for (asked, run) in [([1_000u32, 3, 1], 1_000u32), ([98_000, 1, 1], PART)] {
+            let all = (asked[0] * asked[1] * asked[2]) as usize;
+            let total = (run * asked[1] * asked[2]) as usize;
+            let (src, src_ptr, _) = warp.shared_buffer(16);
+            let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+            let (_hits, hits_ptr, hits_gpu) = warp.shared_buffer(4 * (all as u64 + 1));
+            let dst = warp.default_uav(SPLIT_BYTES);
+            // SAFETY: mappings of these sizes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(asked.as_ptr().cast(), src_ptr, 12);
+                std::ptr::write_bytes(budget_ptr, 0, 256);
+                std::ptr::write_bytes(hits_ptr, 0, 4 * (all + 1));
+            }
+            let common = D3D12_RESOURCE_STATE_COMMON;
+            assert!(record_clamp_how(&warp.clamp, &warp.list, (&dst, common), budget_gpu, (&src, 0), None, (2, 12, 1), IN_PARTS | ONE_PART));
+            // SAFETY: our open list; the counter's own root signature and
+            // pipeline; the clamp left `dst` readable as arguments.
+            unsafe {
+                warp.list.SetComputeRootSignature(&counter.root);
+                warp.list.SetPipelineState(&counter.pso);
+                let constants = [run, asked[1], 0];
+                warp.list.SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootUnorderedAccessView(1, hits_gpu);
+            }
+            execute_parts(&warp.list, &signature, Some((0, 2)), &dst, 0);
+            warp.submit_and_wait();
+            let (wrong, past) = not_once(hits_ptr, total);
+            assert!(wrong.is_empty(), "{asked:?}: slots that did not count one group: {wrong:?}");
+            assert!(past, "{asked:?}: a group past what runs ran");
+        }
     }
 
     /// After an execution of parts whose command signature sets the number
