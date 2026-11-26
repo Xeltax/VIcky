@@ -374,6 +374,22 @@ pub(crate) fn builder_off(why: &'static str) {
     }
 }
 
+/// For the window caption: `RT on`, `RT off` (`VICTORY_BVH_BUILDER` is not
+/// `1`) or `RT stopped` (allowed, but one of its programs had no host
+/// pipeline, so it stays off for the run).
+#[cfg(windows)]
+pub(crate) fn builder_caption() -> &'static str {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+        return "RT off";
+    }
+    if BUILDER.lock().unwrap_or_else(|e| e.into_inner()).off {
+        "RT stopped"
+    } else {
+        "RT on"
+    }
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
