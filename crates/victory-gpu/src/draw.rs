@@ -3367,9 +3367,20 @@ impl State {
         // setting the number of its part's first group if the program
         // reads its x number ([`group_base`]; `crate::indirect::bound_split`).
         // (myokex's fix, ZSlayerHQ/victory-world-runtime 4436f8f, ran two
-        // executions, the constant set between them.)
+        // executions, the constant set between them.) With
+        // `VICTORY_DISPATCH_PARTS=seen` only a program seen asking for more
+        // (`crate::indirect::program_parts`, by its hash); the others go
+        // the plain way, their program numbered for the clamp to note.
         let base = if kind == DISPATCH { group_base(p) } else { None };
-        let split = (kind == DISPATCH && max == 1 && crate::indirect::parts_on())
+        let single = kind == DISPATCH && max == 1;
+        let (program, parted) = match crate::indirect::parts_mode() {
+            crate::indirect::Parts::All => (0, single),
+            crate::indirect::Parts::Seen if single => {
+                p.stages.first().map_or((0, false), |stage| crate::indirect::program_parts(&stage.shader.hash))
+            }
+            _ => (0, false),
+        };
+        let split = parted
             .then(|| match base {
                 Some(base) => crate::indirect::split_signature(&p.root, base),
                 None => host_signature(DISPATCH, crate::indirect::PART_STRIDE),
@@ -3526,6 +3537,8 @@ impl State {
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if split.is_some() {
                     crate::indirect::bound_split(list, (&args.buffer, offset), count_arg, stride)
+                } else if single && program != 0 {
+                    crate::indirect::bound_noted(list, (&args.buffer, offset), count_arg, (kind, step, records), program)
                 } else if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
@@ -3629,6 +3642,9 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            if single {
+                crate::indirect::note_path(split.is_some());
+            }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }

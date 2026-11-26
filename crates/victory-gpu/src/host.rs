@@ -1371,9 +1371,9 @@ pub(crate) fn dred_on() -> bool {
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The words of a list's budget buffer the clamp writes: the budget, the
-/// mesh records' notes (2), the dispatch records' (4,
-/// `crate::indirect::note_budget_words`).
-const BUDGET_WORDS: usize = 7;
+/// mesh records' notes (2), the dispatch records' (13: counts and the
+/// programs noted, `crate::indirect::note_budget_words`).
+const BUDGET_WORDS: usize = 3 + crate::indirect::DISPATCH_WORDS;
 
 /// Whether a list's indirect-work budget lives in the card's own memory
 /// (`VICTORY_INDIRECT_CARD_BUDGET=0` keeps it in memory the CPU maps, as
@@ -6815,7 +6815,7 @@ impl HostList {
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                crate::indirect::note_budget_words([3, 4, 5, 6].map(|k| words.add(k).read_volatile()));
+                crate::indirect::note_budget_words(std::array::from_fn(|k| words.add(3 + k).read_volatile()));
                 for k in 0..BUDGET_WORDS {
                     words.add(k).write_volatile(0);
                 }

@@ -56,6 +56,8 @@ cbuffer Record : register(b0) {
     // groups in x as asked, up to what PARTS parts of 65,535 run, written
     // as PARTS records of four words (the number of the part's first group
     // in x, then its groups) and after them the number of parts to run.
+    // From bit 8 on: the number of the dispatch's program (`bound_noted`),
+    // noted when a record asks for more groups in x than one dispatch runs.
     uint has_count;
     uint count_offset;
 };
@@ -74,6 +76,8 @@ static const uint GROUPS = 1u << 20;
 // a dimension of one part (what the host runs).
 static const uint PARTS = 16;
 static const uint PART = 65535;
+// Programs noted (`NOTED`), after the count of notes in the budget's word 7.
+static const uint NOTED = 8;
 // Each group charges the budget once: the costs of its records go here,
 // one thread charges their sum, saturating as each record would in lane
 // order, and every thread then reads whether its own record fitted. A
@@ -265,6 +269,16 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (beyond) {
         uint was;
         budget.InterlockedAdd(24, 1u, was);
+        // The program, if given, when the parts would have run it all: its
+        // dispatches run in parts from then on (VICTORY_DISPATCH_PARTS=seen).
+        uint program = has_count >> 8;
+        if (program != 0 && asked > PART && asked <= PARTS * PART) {
+            uint slot;
+            budget.InterlockedAdd(28, 1u, slot);
+            if (slot < NOTED) {
+                budget.Store(32u + slot * 4u, program);
+            }
+        }
     }
     if (kind <= 1) {
         if (over) {
@@ -456,11 +470,38 @@ pub(crate) fn bound_split(
     clamp_into(list, c, &dst, budget, src, count, spec, IN_PARTS).then_some(dst)
 }
 
+/// [`bound`] for dispatch records of the program numbered `program`
+/// ([`program_parts`]): a record asking for more groups in x than one
+/// dispatch runs, and no more than the parts run, is clamped as before and
+/// its program noted in the list's budget words 7 to 15, which
+/// [`note_budget_words`] takes a list late (`VICTORY_DISPATCH_PARTS=seen`).
+pub(crate) fn bound_noted(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    program: u32,
+) -> Option<ID3D12Resource> {
+    if program == 0 || program > MOST_PROGRAMS {
+        return bound(list, src, count, spec);
+    }
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    clamp_into(list, c, &dst, budget, src, count, spec, program << PROGRAM_SHIFT).then_some(dst)
+}
+
 /// Bits of the clamp's `has_count` ([`record_clamp_how`]): a window
 /// clamped ahead of its draws ([`bound_ahead`]); one dispatch in parts
-/// ([`bound_split`]).
+/// ([`bound_split`]); from [`PROGRAM_SHIFT`] on, the program to note
+/// ([`bound_noted`]).
 const AHEAD: u32 = 2;
 const IN_PARTS: u32 = 8;
+const PROGRAM_SHIFT: u32 = 8;
+/// The most programs numbered for the clamp's notes.
+const MOST_PROGRAMS: u32 = (1 << (32 - PROGRAM_SHIFT)) - 1;
+/// The programs one list's clamps note (the budget's words 8 to 15); more
+/// are counted (word 7) and noted by later lists.
+const NOTED: usize = 8;
 
 /// The most thread groups the host runs in a dimension of one dispatch.
 /// The console runs any number: a larger dispatch runs here in parts of
@@ -490,13 +531,118 @@ pub(crate) const PARTS_COUNT_AT: u64 = MOST_PARTS as u64 * PART_STRIDE as u64;
 /// Scratch bytes of a split dispatch.
 const SPLIT_BYTES: u64 = PARTS_COUNT_AT + 4;
 
-/// Whether dispatches of more groups in a dimension than the host runs
-/// run in parts (`VICTORY_DISPATCH_PARTS=0`: no, cut as before; the
-/// translated programs read their group base either way).
-pub(crate) fn parts_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DISPATCH_PARTS").is_none_or(|v| v != "0"))
+/// Which dispatches run in parts (`VICTORY_DISPATCH_PARTS`; the translated
+/// programs read their group base whatever it says).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Parts {
+    /// `0`: none; cut as before.
+    Off,
+    /// Unset (or anything else): direct dispatches past [`PART`] groups in
+    /// x, and every indirect dispatch of one record through the parted
+    /// path ([`bound_split`]), whose command signature and count cost every
+    /// such dispatch a little (RT64b: about 20 ms of card time a frame
+    /// more, part of it the work the cut pass now does).
+    All,
+    /// `seen`: direct dispatches as with [`Parts::All`]; an indirect
+    /// dispatch of one record through the parted path only if its program
+    /// (by its hash, whatever pipeline or record it comes from) has been
+    /// seen asking for more groups in x than one dispatch runs (noted by
+    /// the clamp, [`bound_noted`], and known a list late: its first such
+    /// dispatch runs cut, as before); the others through the plain path,
+    /// as before the parts.
+    Seen,
 }
+
+/// `VICTORY_DISPATCH_PARTS`'s mode. Pure, for testing.
+fn parse_parts(value: Option<&str>) -> Parts {
+    match value.map(str::trim) {
+        Some("0") => Parts::Off,
+        Some("seen") => Parts::Seen,
+        _ => Parts::All,
+    }
+}
+
+/// The mode `VICTORY_DISPATCH_PARTS` sets ([`Parts`]).
+pub(crate) fn parts_mode() -> Parts {
+    static MODE: std::sync::OnceLock<Parts> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| parse_parts(std::env::var("VICTORY_DISPATCH_PARTS").ok().as_deref()))
+}
+
+/// Whether dispatches of more groups in x than the host runs run in parts
+/// at all ([`Parts::Off`]: no).
+pub(crate) fn parts_on() -> bool {
+    parts_mode() != Parts::Off
+}
+
+/// The programs of indirect dispatches numbered for the clamp's notes
+/// ([`Parts::Seen`]): number by hash (from 1), hash by number, and whether
+/// the program was seen asking for more groups in x than one dispatch runs.
+#[derive(Default)]
+struct Programs {
+    numbers: std::collections::HashMap<String, u32>,
+    hashes: Vec<String>,
+    seen: Vec<bool>,
+}
+
+static PROGRAMS: std::sync::Mutex<Option<Programs>> = std::sync::Mutex::new(None);
+
+/// The number of the program with hash `hash` for the clamp's notes
+/// ([`bound_noted`]; 0 past [`MOST_PROGRAMS`]), and whether it was seen
+/// asking for more groups in x than one dispatch runs: then its indirect
+/// dispatches run in parts ([`Parts::Seen`]).
+pub(crate) fn program_parts(hash: &str) -> (u32, bool) {
+    let mut programs = PROGRAMS.lock().unwrap_or_else(|e| e.into_inner());
+    let programs = programs.get_or_insert_with(Programs::default);
+    if let Some(&number) = programs.numbers.get(hash) {
+        return (number, programs.seen[number as usize - 1]);
+    }
+    if programs.hashes.len() >= MOST_PROGRAMS as usize {
+        return (0, false);
+    }
+    programs.hashes.push(hash.to_owned());
+    programs.seen.push(false);
+    let number = programs.hashes.len() as u32;
+    programs.numbers.insert(hash.to_owned(), number);
+    (number, false)
+}
+
+/// Marks the programs the clamp noted ([`bound_noted`]) as seen asking for
+/// more groups in x than one dispatch runs; the first time, said.
+fn programs_seen(noted: &[u32]) {
+    let mut programs = PROGRAMS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(programs) = programs.as_mut() else {
+        return;
+    };
+    for &number in noted {
+        let Some(seen) = number.checked_sub(1).and_then(|i| programs.seen.get_mut(i as usize)) else {
+            continue;
+        };
+        if !*seen {
+            *seen = true;
+            tracing::info!(
+                program = %programs.hashes[number as usize - 1],
+                "an indirect dispatch asked for more than {PART} groups in x: its program's indirect dispatches \
+                 run in parts from now on (VICTORY_DISPATCH_PARTS=seen)"
+            );
+        }
+    }
+}
+
+/// The programs seen asking for more groups in x than one dispatch runs.
+fn programs_seen_count() -> usize {
+    let programs = PROGRAMS.lock().unwrap_or_else(|e| e.into_inner());
+    programs.as_ref().map_or(0, |p| p.seen.iter().filter(|&&s| s).count())
+}
+
+/// Counts a single-record indirect dispatch run through the parted path
+/// ([`bound_split`]) or the plain one, for the line ([`parts_line`]).
+pub(crate) fn note_path(parted: bool) {
+    PATHS[usize::from(!parted)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Single-record indirect dispatches since the last line: through the
+/// parted path, through the plain one.
+static PATHS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The parts [`record_parts`] runs `x` groups in: 1 up to [`PART`], at most
 /// [`MOST_PARTS`].
@@ -566,13 +712,24 @@ static PARTS_DIRECT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::ato
 /// more in a dimension than one dispatch runs that ran cut.
 static PARTS_INDIRECT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// Takes what the clamp noted in a list's budget words 3 to 6 (`words`).
-pub(crate) fn note_budget_words([largest, split, parts, cut]: [u32; 4]) {
+/// Words of a list's budget buffer from word 3 on that the clamp writes
+/// for dispatches ([`note_budget_words`]).
+pub(crate) const DISPATCH_WORDS: usize = 5 + NOTED;
+
+/// Takes what the clamp noted in a list's budget words 3 to 15 (`words`):
+/// the largest group count a record asked for in x, the records run in
+/// parts, their parts, the records cut, the count of programs noted
+/// ([`bound_noted`]) and the first [`NOTED`] of them.
+pub(crate) fn note_budget_words(words: [u32; DISPATCH_WORDS]) {
     use std::sync::atomic::Ordering::Relaxed;
+    let [largest, split, parts, cut, noted] = [0, 1, 2, 3, 4].map(|i| words[i]);
     PARTS_INDIRECT[0].fetch_max(u64::from(largest), Relaxed);
     PARTS_INDIRECT[1].fetch_add(u64::from(split), Relaxed);
     PARTS_INDIRECT[2].fetch_add(u64::from(parts), Relaxed);
     PARTS_INDIRECT[3].fetch_add(u64::from(cut), Relaxed);
+    if noted > 0 {
+        programs_seen(&words[5..5 + (noted as usize).min(NOTED)]);
+    }
 }
 
 /// The frame line of dispatches in parts, per frame over `frames`.
@@ -580,17 +737,27 @@ pub(crate) fn parts_line(frames: f64) {
     use std::sync::atomic::Ordering::Relaxed;
     let [split, parts, largest, cut] = [0, 1, 2, 3].map(|i| PARTS_DIRECT[i].swap(0, Relaxed));
     let [i_largest, i_split, i_parts, i_cut] = [0, 1, 2, 3].map(|i| PARTS_INDIRECT[i].swap(0, Relaxed));
+    let [parted, plain] = [0, 1].map(|i| PATHS[i].swap(0, Relaxed));
     tracing::info!(
         "dispatches in parts (VICTORY_DISPATCH_PARTS {}) per frame: direct {:.2} split into {:.2} parts, {:.2} cut, \
          the largest group count asked for in x {largest}; indirect {:.2} split into {:.2} parts, {:.2} cut, the \
-         largest group count asked for in x {i_largest} (a list late; one dispatch runs at most {PART})",
-        if parts_on() { "on" } else { "off" },
+         largest group count asked for in x {i_largest} (a list late; one dispatch runs at most {PART}); \
+         single-record indirect dispatches {:.2} through the parted path, {:.2} through the plain one; {} programs \
+         seen asking for more in x",
+        match parts_mode() {
+            Parts::Off => "off",
+            Parts::All => "on",
+            Parts::Seen => "seen",
+        },
         split as f64 / frames,
         parts as f64 / frames,
         cut as f64 / frames,
         i_split as f64 / frames,
         i_parts as f64 / frames,
         i_cut as f64 / frames,
+        parted as f64 / frames,
+        plain as f64 / frames,
+        programs_seen_count(),
     );
 }
 
@@ -2896,6 +3063,95 @@ void main(uint3 g : SV_GroupID) {
             // SAFETY: the mapping holds 98,001 words.
             let counted: u32 = unsafe { std::slice::from_raw_parts(hits_ptr.cast::<u32>(), 98_001) }.iter().sum();
             assert_eq!(counted, ran * 98_000, "count {records}");
+        }
+    }
+
+    /// `VICTORY_DISPATCH_PARTS`: `0` none, `seen` only programs seen asking
+    /// for more, anything else (or unset) every single-record dispatch.
+    #[test]
+    fn the_parts_switch_reads_off_seen_and_on() {
+        assert_eq!(parse_parts(None), Parts::All);
+        assert_eq!(parse_parts(Some("1")), Parts::All);
+        assert_eq!(parse_parts(Some("0")), Parts::Off);
+        assert_eq!(parse_parts(Some("seen")), Parts::Seen);
+        assert_eq!(parse_parts(Some(" seen ")), Parts::Seen);
+    }
+
+    /// A program keeps its number; once the clamp notes it (budget words 7
+    /// and on, a list late), its dispatches run in parts; a program not
+    /// noted does not, nor does a number past the notes the list kept.
+    #[test]
+    fn a_program_the_clamp_noted_runs_in_parts_from_then_on() {
+        let (a, seen) = program_parts("test program a, noted");
+        assert!(!seen && a != 0);
+        assert_eq!(program_parts("test program a, noted"), (a, false));
+        let (b, _) = program_parts("test program b, not noted");
+        let (c, _) = program_parts("test program c, past the kept notes");
+        assert!(b != a && c != a && c != b);
+        let mut words = [0u32; DISPATCH_WORDS];
+        // Nine noted, the first eight kept: `a` and seven of nobody's.
+        words[4] = 9;
+        words[5] = a;
+        words[6..].fill(u32::MAX);
+        note_budget_words(words);
+        assert_eq!(program_parts("test program a, noted"), (a, true));
+        assert_eq!(program_parts("test program b, not noted"), (b, false));
+        assert_eq!(program_parts("test program c, past the kept notes"), (c, false));
+    }
+
+    /// The clamp, told a program (`bound_noted`), clamps a record as
+    /// before and notes the program (budget word 7 counts, words 8 to 15
+    /// keep the first eight) when the record asks for more groups in x than
+    /// one dispatch runs and no more than the parts run; not for a record
+    /// within one dispatch, past the parts, or past it in y only, nor when
+    /// told no program.
+    #[test]
+    fn warp_clamp_notes_the_program_of_a_record_past_one_dispatch() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const PROGRAM: u32 = 5;
+        const LAST: u32 = MOST_PARTS * PART;
+        // (records, each asking, the program told, records cut, notes
+        // counted, the record clamped)
+        let cases: [(u32, [u32; 3], u32, u32, u32, [u32; 3]); 6] = [
+            (1, [98_000, 1, 1], PROGRAM, 1, 1, [PART, 1, 1]),
+            (1, [65_535, 1, 1], PROGRAM, 0, 0, [PART, 1, 1]),
+            (1, [LAST + 1, 1, 1], PROGRAM, 1, 0, [PART, 1, 1]),
+            (1, [5, 70_000, 1], PROGRAM, 1, 0, [5, PART, 1]),
+            (1, [98_000, 1, 1], 0, 1, 0, [PART, 1, 1]),
+            (10, [98_000, 1, 1], PROGRAM, 10, 10, [PART, 1, 1]),
+        ];
+        for (records, asked, program, cut, noted, clamped) in cases {
+            let (src, src_ptr, _) = warp.shared_buffer(12 * u64::from(records));
+            let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+            let (readback, readback_ptr, _) = warp.shared_buffer(12);
+            let dst = warp.default_uav(12 * u64::from(records));
+            // SAFETY: mappings of these sizes.
+            unsafe {
+                for r in 0..records as usize {
+                    std::ptr::copy_nonoverlapping(asked.as_ptr().cast(), src_ptr.add(12 * r), 12);
+                }
+                std::ptr::write_bytes(budget_ptr, 0, 256);
+            }
+            let common = D3D12_RESOURCE_STATE_COMMON;
+            let how = program << PROGRAM_SHIFT;
+            assert!(record_clamp_how(&warp.clamp, &warp.list, (&dst, common), budget_gpu, (&src, 0), None, (2, 12, records), how));
+            // SAFETY: our open list; the clamp left `dst` readable as arguments.
+            unsafe {
+                warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                warp.list.CopyBufferRegion(&readback, 0, &dst, 0, 12);
+            }
+            warp.submit_and_wait();
+            // SAFETY: the mappings hold what the clamp and the copy wrote.
+            let (words, made) = unsafe { (budget_ptr.cast::<[u32; 17]>().read_volatile(), readback_ptr.cast::<[u32; 3]>().read_volatile()) };
+            let case = format!("{records} x {asked:?}, program {program}");
+            assert_eq!(made, clamped, "{case}: clamped as before");
+            assert_eq!(words[6], cut, "{case}: cut");
+            assert_eq!(words[7], noted, "{case}: notes counted");
+            let kept = (noted as usize).min(NOTED);
+            assert!(words[8..8 + kept].iter().all(|&w| w == PROGRAM), "{case}: notes kept {:?}", &words[8..16]);
+            assert!(words[8 + kept..17].iter().all(|&w| w == 0), "{case}: nothing past the notes {:?}", &words[8..17]);
         }
     }
 
