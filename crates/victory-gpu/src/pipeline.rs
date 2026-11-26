@@ -507,13 +507,40 @@ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
+    parse_skips(value).into_iter().map(|s| s.hash).collect()
+}
+
+/// One entry of `VICTORY_SKIP_PIPELINES`: the draws and dispatches of the
+/// pipelines with this shader are dropped, all of them or (`<hash>@<n>`)
+/// all after the first `n` (since the start: whether what a program wrote
+/// once stays wrong, or what it writes each frame).
+#[cfg(all(windows, feature = "diagnostics"))]
+struct Skip {
+    hash: String,
+    after: Option<u64>,
+    seen: std::sync::atomic::AtomicU64,
+}
+
+/// `VICTORY_SKIP_PIPELINES=<hash>[@<n>],...` (16-digit shader hashes).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn parse_skips(value: &str) -> Vec<Skip> {
     value
         .split(',')
         .map(str::trim)
-        .filter(|hash| !hash.is_empty())
-        .filter_map(|hash| {
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let (hash, after) = match entry.split_once('@') {
+                Some((hash, n)) => match n.trim().parse::<u64>() {
+                    Ok(n) => (hash.trim(), Some(n)),
+                    Err(_) => {
+                        tracing::warn!(entry, "VICTORY_SKIP_PIPELINES expects <hash>@<count>");
+                        return None;
+                    }
+                },
+                None => (entry, None),
+            };
             if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                Some(hash.to_ascii_lowercase())
+                Some(Skip { hash: hash.to_ascii_lowercase(), after, seen: std::sync::atomic::AtomicU64::new(0) })
             } else {
                 tracing::warn!(
                     hash,
@@ -525,20 +552,74 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// The shader of `p` whose draws and dispatches `VICTORY_SKIP_PIPELINES`
+/// drops, if any. `count`: this is a draw or dispatch about to run (a
+/// `<hash>@<n>` entry counts it), not a question about the last one.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
+fn skipped_shader(p: &Pipeline, count: bool) -> Option<&str> {
+    use std::sync::atomic::Ordering::Relaxed;
+    static SKIPS: OnceLock<Vec<Skip>> = OnceLock::new();
+    let skips = SKIPS.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        parse_skips(&value)
     });
-    if hashes.is_empty() {
+    if skips.is_empty() {
         return None;
     }
-    p.shaders
-        .iter()
-        .find(|shader| hashes.contains(&shader.hash))
-        .map(|shader| shader.hash.as_str())
+    p.shaders.iter().find_map(|shader| {
+        let skip = skips.iter().find(|s| s.hash == shader.hash)?;
+        let skipped = match skip.after {
+            None => true,
+            Some(n) if count => {
+                let before = skip.seen.fetch_add(1, Relaxed);
+                if before == n {
+                    tracing::info!(
+                        hash = %skip.hash,
+                        runs = n,
+                        frame = crate::queue::presented() + 1,
+                        "VICTORY_SKIP_PIPELINES: its draws and dispatches dropped from now on"
+                    );
+                }
+                before >= n
+            }
+            Some(n) => skip.seen.load(Relaxed) > n,
+        };
+        skipped.then_some(shader.hash.as_str())
+    })
+}
+
+/// `VICTORY_CAPTURE_ON=<hash>,...` (diagnostics, with `VICTORY_CAPTURE`):
+/// the first time a dispatch of a pipeline with one of these shaders
+/// is recorded, the next two frames are captured, pictures and operations
+/// (`frame-<n>-ops.txt`: the program's own lines, with the views it is
+/// bound to). For a program that starts to run late, after the frames
+/// `VICTORY_CAPTURE_WORLD` captures (its host pipeline made late).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_ran(this: This) {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if this.is_null() || DONE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let hashes = HASHES.get_or_init(|| parse_skip_hashes(&std::env::var("VICTORY_CAPTURE_ON").unwrap_or_default()));
+    if hashes.is_empty() {
+        DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    let p = pipeline(this);
+    if let Some(shader) = p.shaders.iter().find(|s| hashes.contains(&s.hash))
+        && !DONE.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        let frame = crate::queue::presented() + 1;
+        crate::capture::capture_soon(frame + 1, frame + 2);
+        tracing::info!(
+            hash = %shader.hash,
+            frame,
+            "VICTORY_CAPTURE_ON: the program runs; frames {} and {} are captured",
+            frame + 1,
+            frame + 2
+        );
+    }
 }
 
 /// `VICTORY_BVH_SKIP=3,10-12`: the builder pipelines (by creation order,
@@ -578,7 +659,7 @@ fn skipped_builder_index(p: &Pipeline) -> Option<usize> {
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && {
         let p = pipeline(this);
-        skipped_shader(p).is_some() || skipped_builder_index(p).is_some()
+        skipped_shader(p, true).is_some() || skipped_builder_index(p).is_some()
     }
 }
 
@@ -590,7 +671,7 @@ pub(crate) fn note_drop(this: This) {
         Some("no pipeline set".to_owned())
     } else {
         let p = pipeline(this);
-        skipped_shader(p)
+        skipped_shader(p, false)
             .map(|hash| format!("skipped shader {hash}"))
             .or_else(|| skipped_builder_index(p).map(|i| format!("skipped builder pipeline {i}")))
             .or_else(|| make::missing(&p.host))
@@ -891,6 +972,15 @@ mod tests {
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn skip_hashes_take_a_count_of_runs_before_the_skip() {
+        let skips = super::parse_skips("f133e35efed2a48a@1, 0011223344556677, 0123456789abcdef@x, 0123456789abcdef@0");
+        let got: Vec<(&str, Option<u64>)> = skips.iter().map(|s| (s.hash.as_str(), s.after)).collect();
+        assert_eq!(got, [("f133e35efed2a48a", Some(1)), ("0011223344556677", None), ("0123456789abcdef", Some(0))]);
+        assert_eq!(super::parse_skip_hashes("f133e35efed2a48a@3"), ["f133e35efed2a48a"]);
     }
 
     #[cfg(all(windows, feature = "diagnostics"))]

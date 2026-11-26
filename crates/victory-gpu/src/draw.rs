@@ -2311,6 +2311,8 @@ impl State {
             return;
         }
         #[cfg(feature = "diagnostics")]
+        crate::pipeline::note_ran(self.pipeline as This);
+        #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             let parts = if gx > crate::indirect::PART && crate::indirect::parts_on() {
                 format!(" in {} parts", crate::indirect::parts_of(gx))
@@ -3482,6 +3484,10 @@ impl State {
         if !ran {
             why("prepare failed");
             return false;
+        }
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH {
+            crate::pipeline::note_ran(self.pipeline as This);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {

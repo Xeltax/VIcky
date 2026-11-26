@@ -47,7 +47,21 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    let soon = (SOON_FROM.load(std::sync::atomic::Ordering::Relaxed)..=SOON_TO.load(std::sync::atomic::Ordering::Relaxed)).contains(&n);
+    named || soon || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+}
+
+/// Frames asked for while running (`capture_soon`): from, to.
+static SOON_FROM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static SOON_TO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Frames `from` to `to` are captured too, as [`listed`] ones (pictures and
+/// operations): asked for while running (`VICTORY_CAPTURE_ON`,
+/// `crate::pipeline::note_ran`). The last such request wins.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn capture_soon(from: u64, to: u64) {
+    SOON_TO.store(to, std::sync::atomic::Ordering::Relaxed);
+    SOON_FROM.store(from, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to

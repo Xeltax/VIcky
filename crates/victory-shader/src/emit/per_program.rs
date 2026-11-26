@@ -56,6 +56,17 @@
 //! the programs whose decision it changes. For the mask copies the key says
 //! whether the translation ran with them, so a second attempt is filed
 //! where `all` files that program, never where its first attempt would be.
+//!
+//! And one to bisect what a program's writes do (diagnostics): its store
+//! instructions at the listed console offsets are left out of its
+//! translation, as if what they write went nowhere (a store to a null
+//! view):
+//! - `VICTORY_STORE_DROP=<hash>:<offset>+<offset>...,<hash>:...` (offsets
+//!   in hex, with or without `0x`, as `victory shader-info --disasm` lists
+//!   them; `buffer_`, `image_`, `global_` and `scratch_` stores, not
+//!   atomics or exports). Run 2026-11-26: the stores of
+//!   `CS_ShadowRenderTiledCascadesAlphaCBPPPC` (#f133e35e), to find which of
+//!   its outputs costs the characters their skin.
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -91,13 +102,84 @@ pub(crate) fn current() -> Option<String> {
 /// decision into its own key) and so left out of the translator's
 /// fingerprint ([`super::translation_fingerprint`]): a new list translates
 /// again only the programs whose decision it changes.
-pub(super) const PER_PROGRAM_SWITCHES: [&str; 5] = [
+pub(super) const PER_PROGRAM_SWITCHES: [&str; 6] = [
     "VICTORY_WAVE_DEEP_SKIPS_NOT",
     "VICTORY_WAVE_DEEP_SKIPS_ONLY",
     "VICTORY_SHADER_OPT_NOT",
     "VICTORY_SHADER_OPT_ONLY",
     "VICTORY_WAVE_MASK_COPIES",
+    "VICTORY_STORE_DROP",
 ];
+
+/// The console offsets of the stores `VICTORY_STORE_DROP` (module notes)
+/// leaves out of the translation of the program whose hash is `hash`
+/// (`None`: not known), in increasing order; empty for most.
+pub fn dropped_stores(hash: Option<&str>) -> Vec<usize> {
+    #[cfg(test)]
+    if let Some(value) = TEST_STORE_DROP.get() {
+        return stores_for(&parse_store_drop(value), hash);
+    }
+    static LIST: OnceLock<Vec<(String, Vec<usize>)>> = OnceLock::new();
+    let list = LIST.get_or_init(|| parse_store_drop(&std::env::var(PER_PROGRAM_SWITCHES[5]).unwrap_or_default()));
+    stores_for(list, hash)
+}
+
+/// Whether the store at console offset `offset` of the program being
+/// translated on this thread ([`for_program`]) is left out
+/// (`VICTORY_STORE_DROP`).
+pub(crate) fn store_dropped_here(offset: usize) -> bool {
+    dropped_stores(current().as_deref()).contains(&offset)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's value of `VICTORY_STORE_DROP`, for its thread only.
+    pub(crate) static TEST_STORE_DROP: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_STORE_DROP`'s entries: (hash or its first digits, offsets).
+/// An entry it cannot read is left out with a warning. Pure, for testing.
+fn parse_store_drop(value: &str) -> Vec<(String, Vec<usize>)> {
+    value
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let read = || -> Option<(String, Vec<usize>)> {
+                let (hash, offsets) = entry.split_once(':')?;
+                let hash = hash.trim_start_matches('#').to_ascii_lowercase();
+                if hash.is_empty() || hash.len() > 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return None;
+                }
+                let offsets = offsets
+                    .split('+')
+                    .map(|o| {
+                        let o = o.trim();
+                        let o = o.strip_prefix("0x").or_else(|| o.strip_prefix("0X")).unwrap_or(o);
+                        usize::from_str_radix(o, 16).ok()
+                    })
+                    .collect::<Option<Vec<usize>>>()?;
+                (!offsets.is_empty()).then_some((hash, offsets))
+            };
+            let parsed = read();
+            if parsed.is_none() {
+                eprintln!("VICTORY_STORE_DROP: an entry it cannot read, left out: {entry} (<hash>:<offset>+<offset>, in hex)");
+            }
+            parsed
+        })
+        .collect()
+}
+
+/// The offsets `list` names for the program `hash`, sorted and each once.
+fn stores_for(list: &[(String, Vec<usize>)], hash: Option<&str>) -> Vec<usize> {
+    let mut out: Vec<usize> = list
+        .iter()
+        .filter(|(entry, _)| listed(std::slice::from_ref(entry), hash))
+        .flat_map(|(_, offsets)| offsets.iter().copied())
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
 
 /// What `VICTORY_WAVE_MASK_COPIES` asks of a program's translation (module
 /// notes): whether a wave64 lane mask restored from scalar copies is taken
@@ -419,5 +501,28 @@ mod tests {
         TEST_MASK_COPIES.set(Some(Some("0")));
         assert!(!for_program(SHADOW, || mask_copies_retry_here(MASK_COPIES_RETRY_ON)));
         TEST_MASK_COPIES.set(was);
+    }
+
+    #[test]
+    fn dropped_stores_go_by_hash_and_offset() {
+        const SHADOW: &str = "f133e35efed2a48a";
+        let list = parse_store_drop("f133e35e:2957c+0x294b8, #0123456789abcdef:10 f133e35efed2a48a:2957C");
+        assert_eq!(list.len(), 3);
+        assert_eq!(stores_for(&list, Some(SHADOW)), vec![0x294b8, 0x2957c], "sorted, once each, by prefix");
+        assert_eq!(stores_for(&list, Some(A)), vec![0x10]);
+        assert_eq!(stores_for(&list, Some(B)), Vec::<usize>::new());
+        assert_eq!(stores_for(&list, None), Vec::<usize>::new(), "an unknown program is not listed");
+        // Entries it cannot read are left out, the others kept.
+        let bad = parse_store_drop("f133e35e,f133e35e:,zz:10,f133e35e:12+xy,0123:20");
+        assert_eq!(bad, vec![("0123".to_owned(), vec![0x20])]);
+        assert!(parse_store_drop("").is_empty());
+        // The test override, and the program on this thread.
+        let was = TEST_STORE_DROP.replace(Some("f133e35e:2957c"));
+        assert_eq!(dropped_stores(Some(SHADOW)), vec![0x2957c]);
+        assert!(for_program(SHADOW, || store_dropped_here(0x2957c)));
+        assert!(!for_program(SHADOW, || store_dropped_here(0x294b8)));
+        assert!(!for_program(A, || store_dropped_here(0x2957c)));
+        assert!(!store_dropped_here(0x2957c), "outside a program's translation");
+        TEST_STORE_DROP.set(was);
     }
 }

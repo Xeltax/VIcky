@@ -122,7 +122,8 @@ fn translation(cache: Option<&Cache>, container: &[u8], ran: &AtomicBool) -> Res
                 // program a list names, or with `VICTORY_WAVE_DEEP_SKIPS=0`
                 // any, gets there)
                 let off = !emit::deep_skips_allowed(Some(&hash)) && emit::wave64_retried(container);
-                let key = program_key(&build(), off, opt_off(&hash), copies);
+                let dropped = emit::dropped_stores(Some(&hash));
+                let key = program_key(&build(), off, opt_off(&hash), copies, &dropped);
                 cached(cache, &key, container, translate)
             }
             None => translate(container),
@@ -173,12 +174,14 @@ fn attempts<T>(
 ///   `victory_shader::emit::mask_copies`; by default only a second attempt
 ///   after a refusal, [`translation`]). Only for a console wave64 program,
 ///   the only ones it can change.
+/// - Stores left out of the program (`VICTORY_STORE_DROP`, diagnostics:
+///   `victory_shader::emit::dropped_stores`): their console offsets.
 ///
 /// So the lists are in no key: changing one translates again only the
 /// programs whose decision it changes, and a program the lists leave alone
 /// keeps the key it had without any list.
-fn program_key(build: &[u8; 32], deep_skips_off: bool, opt_off: bool, mask_copies: bool) -> [u8; 32] {
-    if !deep_skips_off && !opt_off && !mask_copies {
+fn program_key(build: &[u8; 32], deep_skips_off: bool, opt_off: bool, mask_copies: bool, dropped: &[usize]) -> [u8; 32] {
+    if !deep_skips_off && !opt_off && !mask_copies && dropped.is_empty() {
         return *build;
     }
     let mut h = blake3::Hasher::new();
@@ -191,6 +194,12 @@ fn program_key(build: &[u8; 32], deep_skips_off: bool, opt_off: bool, mask_copie
     }
     if mask_copies {
         h.update(b"VICTORY_WAVE_MASK_COPIES on for this program");
+    }
+    if !dropped.is_empty() {
+        h.update(b"VICTORY_STORE_DROP for this program:");
+        for offset in dropped {
+            h.update(&(*offset as u64).to_le_bytes());
+        }
     }
     *h.finalize().as_bytes()
 }
@@ -510,11 +519,11 @@ mod tests {
     #[test]
     fn a_program_kept_out_of_the_deep_skips_form_has_a_key_of_its_own() {
         let build = [7u8; 32];
-        assert_eq!(program_key(&build, false, false, false), build, "allowed: the build's key, as without lists");
-        let off = program_key(&build, true, false, false);
+        assert_eq!(program_key(&build, false, false, false, &[]), build, "allowed: the build's key, as without lists");
+        let off = program_key(&build, true, false, false, &[]);
         assert_ne!(off, build);
-        assert_eq!(program_key(&build, true, false, false), off, "the same decision, the same key");
-        assert_ne!(program_key(&[8; 32], true, false, false), off, "and still the build's");
+        assert_eq!(program_key(&build, true, false, false, &[]), off, "the same decision, the same key");
+        assert_ne!(program_key(&[8; 32], true, false, false, &[]), off, "and still the build's");
 
         // So only the program whose decision changed is translated again.
         let dir = tempfile::tempdir().unwrap();
@@ -526,16 +535,16 @@ mod tests {
         };
         let [a, b] = [b"program a".as_slice(), b"program b"];
         for c in [a, b] {
-            cached(&cache, &program_key(&build, false, false, false), c, translate).unwrap();
+            cached(&cache, &program_key(&build, false, false, false, &[]), c, translate).unwrap();
         }
         assert_eq!(runs.load(Ordering::Relaxed), 2);
         // a listed: a translated again, b from the cache
-        cached(&cache, &program_key(&build, true, false, false), a, translate).unwrap();
-        cached(&cache, &program_key(&build, false, false, false), b, translate).unwrap();
+        cached(&cache, &program_key(&build, true, false, false, &[]), a, translate).unwrap();
+        cached(&cache, &program_key(&build, false, false, false, &[]), b, translate).unwrap();
         assert_eq!(runs.load(Ordering::Relaxed), 3);
         // the list emptied again: both from the cache
         for c in [a, b] {
-            cached(&cache, &program_key(&build, false, false, false), c, translate).unwrap();
+            cached(&cache, &program_key(&build, false, false, false, &[]), c, translate).unwrap();
         }
         assert_eq!(runs.load(Ordering::Relaxed), 3);
     }
@@ -543,10 +552,10 @@ mod tests {
     #[test]
     fn a_program_kept_out_of_the_clean_up_has_a_key_of_its_own() {
         let build = [7u8; 32];
-        assert_eq!(program_key(&build, false, false, false), build);
-        let opt = program_key(&build, false, true, false);
-        let deep = program_key(&build, true, false, false);
-        let both = program_key(&build, true, true, false);
+        assert_eq!(program_key(&build, false, false, false, &[]), build);
+        let opt = program_key(&build, false, true, false, &[]);
+        let deep = program_key(&build, true, false, false, &[]);
+        let both = program_key(&build, true, true, false, &[]);
         assert_ne!(opt, build);
         // Each decision a key of its own, the deep-skips one as before.
         assert!(opt != deep && opt != both && deep != both);
@@ -555,22 +564,22 @@ mod tests {
         h.update(b"VICTORY_WAVE_DEEP_SKIPS off for this program");
         let unchanged = *h.finalize().as_bytes();
         assert_eq!(deep, unchanged, "the deep-skips key is unchanged");
-        let again = program_key(&build, false, true, false);
+        let again = program_key(&build, false, true, false, &[]);
         assert_eq!(again, opt, "the same decision, the same key");
-        let other = program_key(&[8; 32], false, true, false);
+        let other = program_key(&[8; 32], false, true, false, &[]);
         assert_ne!(other, opt, "and still the build's");
     }
 
     #[test]
     fn a_program_that_takes_mask_copies_has_a_key_of_its_own() {
         let build = [7u8; 32];
-        let copies = program_key(&build, false, false, true);
+        let copies = program_key(&build, false, false, true, &[]);
         assert_ne!(copies, build, "the build's key is for the programs that do not");
-        assert_eq!(program_key(&build, false, false, true), copies, "the same decision, the same key");
-        assert_ne!(program_key(&[8; 32], false, false, true), copies, "and still the build's");
+        assert_eq!(program_key(&build, false, false, true, &[]), copies, "the same decision, the same key");
+        assert_ne!(program_key(&[8; 32], false, false, true, &[]), copies, "and still the build's");
         // Each combination a key of its own; the earlier ones unchanged.
         let all: Vec<[u8; 32]> = (0..8u8)
-            .map(|n| program_key(&build, n & 1 != 0, n & 2 != 0, n & 4 != 0))
+            .map(|n| program_key(&build, n & 1 != 0, n & 2 != 0, n & 4 != 0, &[]))
             .collect();
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
@@ -580,7 +589,19 @@ mod tests {
         let mut h = blake3::Hasher::new();
         h.update(&build);
         h.update(b"VICTORY_WAVE_DEEP_SKIPS off for this program");
-        assert_eq!(program_key(&build, true, false, false), *h.finalize().as_bytes());
+        assert_eq!(program_key(&build, true, false, false, &[]), *h.finalize().as_bytes());
+    }
+
+    #[test]
+    fn a_program_with_dropped_stores_has_a_key_per_list_of_stores() {
+        let build = [7u8; 32];
+        let one = program_key(&build, false, false, false, &[0x2957c]);
+        let two = program_key(&build, false, false, false, &[0x294b8, 0x29598]);
+        assert_ne!(one, build);
+        assert_ne!(one, two);
+        assert_eq!(program_key(&build, false, false, false, &[0x2957c]), one, "the same stores, the same key");
+        assert_ne!(program_key(&build, false, false, true, &[0x2957c]), one, "with the other decisions too");
+        assert_eq!(program_key(&build, false, false, false, &[]), build, "none: the build's key");
     }
 
     #[test]
@@ -601,7 +622,7 @@ mod tests {
                     Err(format!("GFX10 code at 0x1eb4: {MASK_COPIES_RETRY_ON} is not supported"))
                 }
             };
-            cached(&cache, &program_key(&build, false, false, copies), b"program", translate)
+            cached(&cache, &program_key(&build, false, false, copies, &[]), b"program", translate)
         };
         let (r, again) = attempts(MaskCopies::Retry, wave64, attempt);
         assert_eq!((r, again), (Ok(shader()), true));

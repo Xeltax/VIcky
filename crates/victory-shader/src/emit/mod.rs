@@ -122,9 +122,9 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use per_program::{
     MASK_COPIES_RETRY_ON, MaskCopies, deep_skips_allowed, for_program, mask_copies, mask_copies_retried, shader_opt_allowed,
-    wave64_program, wave64_retried, with_mask_copies,
+    dropped_stores, wave64_program, wave64_retried, with_mask_copies,
 };
-pub(crate) use per_program::{current as program_hash, mask_copies_here};
+pub(crate) use per_program::{current as program_hash, mask_copies_here, store_dropped_here};
 #[cfg(test)]
 pub(crate) use per_program::TEST_MASK_COPIES;
 pub use rect::rect_list_gs;
@@ -1093,6 +1093,11 @@ mod tests {
 
     /// A wave64 compute program: `body`, then a store of v1 to a UAV.
     fn stores_v1(body: &[u32]) -> Result<(), ShaderError> {
+        stores_v1_shader(body).map(|_| ())
+    }
+
+    /// [`stores_v1`]'s translation. The store is at byte `12 + 4 * body.len() + 4`.
+    fn stores_v1_shader(body: &[u32]) -> Result<HostShader, ShaderError> {
         use crate::native::RootParam;
         use crate::{ResourceType, RootType, UsedResource};
         // s_mov_b32 s1, 0; s_load_dwordx4 s[8:11], s[0:1], 0
@@ -1135,7 +1140,26 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
-        emit(&c, &native, &p, &st, &io, &res).map(|_| ())
+        emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// `VICTORY_STORE_DROP`: the store at the listed offset of the listed program is left
+    /// out of its translation, and only there.
+    #[test]
+    fn a_dropped_store_is_left_out_of_that_programs_translation() {
+        const PROGRAM: &str = "0123456789abcdef";
+        let was = per_program::TEST_STORE_DROP.replace(Some("01234567:10"));
+        let plain = stores_v1_shader(&[]).unwrap();
+        let other = for_program("fedcba9876543210", || stores_v1_shader(&[])).unwrap();
+        let dropped = for_program(PROGRAM, || stores_v1_shader(&[])).unwrap();
+        // (one instruction more before it: the store is at 0x14, not listed)
+        let moved = for_program(PROGRAM, || stores_v1_shader(&[0xBF80_0000])).unwrap();
+        let moved_plain = stores_v1_shader(&[0xBF80_0000]).unwrap();
+        per_program::TEST_STORE_DROP.set(was);
+        assert_eq!(other.dxil, plain.dxil, "another program keeps its store");
+        assert_ne!(dropped.dxil, plain.dxil, "the listed one loses it");
+        assert!(dropped.dxil.len() < plain.dxil.len());
+        assert_eq!(moved.dxil, moved_plain.dxil, "a store at another offset stays");
     }
 
     /// The high dword of a wave64 mask rewritten alone (`s_mov_b32 vcc_hi`
