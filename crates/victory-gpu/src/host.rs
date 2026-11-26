@@ -1600,6 +1600,9 @@ struct CardWork {
     /// The fetch inside flights ([`inflight_fetch`]), if it is on and was
     /// made.
     inflight: Option<CardInflight>,
+    /// VIcky: [`CARD_PATCH`]'s root signature and pipeline, with
+    /// `crate::shadow::dense_patch_asked`, if they were made.
+    patch: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
 }
 
 /// What the fetch inside flights needs ([`inflight_fetch`], [`CARD_FETCH`]).
@@ -1680,6 +1683,222 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 }
 "#;
+
+/// VIcky (`crate::shadow::dense_patch`): a page's masked patch on a copy in
+/// the card's memory, one thread per 4-byte word of its window: where the
+/// mask has bytes, `copy = (copy & ~mask) | (title & mask)`; words with
+/// none are left alone. `src` holds the window's title words, then its
+/// mask words (`crate::shadow::PatchPage::fill`).
+pub(crate) const CARD_PATCH: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), UAV(u0)"
+cbuffer Window : register(b0) {
+    uint first;  // the window's first byte in the copy (a multiple of 4)
+    uint words;  // its words
+};
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer copy : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= words) return;
+    uint mask = src.Load((words + id.x) * 4u);
+    if (mask == 0u) return;
+    uint at = first + id.x * 4u;
+    copy.Store(at, (copy.Load(at) & ~mask) | (src.Load(id.x * 4u) & mask));
+}
+"#;
+
+/// Whether the host made [`CARD_PATCH`]'s pipeline (`Host::make_card_work`,
+/// with `crate::shadow::dense_patch_asked`).
+static CARD_PATCH_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`CARD_PATCH_READY`].
+pub(crate) fn card_patch_ready() -> bool {
+    CARD_PATCH_READY.load(Ordering::Relaxed)
+}
+
+/// [`CARD_PATCH`]'s root signature and pipeline on `device`.
+fn make_card_patch(device: &ID3D12Device) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
+    let code = compile(CARD_PATCH, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
+    // SAFETY: the shader's own bytes; the root signature is inside it.
+    unsafe {
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;
+        let pso: ID3D12PipelineState = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: code.as_ptr().cast(),
+                BytecodeLength: code.len(),
+            },
+            ..Default::default()
+        })?;
+        Ok((root, pso))
+    }
+}
+
+/// One page's patch ([`CARD_PATCH`]) as recorded: the card's address of
+/// what it reads (the title words; the mask words follow them), its
+/// window (first byte in the copy, words) and, with the check
+/// ([`patch_check`]), the buffer in the PC's memory the window comes down
+/// to, as it was before the patch (first half) and after it.
+struct PatchPass {
+    src: u64,
+    first: u32,
+    words: u32,
+    check: Option<ID3D12Resource>,
+}
+
+/// Records `passes` on `buffer`, a copy's card side that nothing of `list`
+/// touched yet (in the common state, as at the start of every list: a
+/// buffer's state decays to it), and leaves it in the copy destination
+/// state, for the copies of changed ranges that follow. With checks, the
+/// windows come down before and after the patches.
+///
+/// # Safety
+/// An open list; live buffers; `src` addresses whose words outlive the
+/// list's run; windows inside `buffer`.
+unsafe fn record_card_patches(
+    list: &ID3D12GraphicsCommandList,
+    root: &ID3D12RootSignature,
+    pso: &ID3D12PipelineState,
+    buffer: &ID3D12Resource,
+    passes: &[PatchPass],
+) {
+    let uav_barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
+    };
+    let checked = passes.iter().any(|p| p.check.is_some());
+    let down = |half: u64| {
+        for p in passes {
+            if let Some(check) = &p.check {
+                let bytes = u64::from(p.words) * 4;
+                // SAFETY: as the function's.
+                unsafe { list.CopyBufferRegion(check, half * bytes, buffer, u64::from(p.first), bytes) };
+            }
+        }
+    };
+    // SAFETY: as the function's.
+    unsafe {
+        if checked {
+            list.ResourceBarrier(&[transition(buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            down(0);
+            list.ResourceBarrier(&[transition(buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+        } else {
+            list.ResourceBarrier(&[transition(buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+        }
+        list.SetComputeRootSignature(root);
+        list.SetPipelineState(pso);
+        list.SetComputeRootUnorderedAccessView(2, buffer.GetGPUVirtualAddress());
+        // Two windows may share a word (pages next to each other in a copy
+        // not on a 4-byte line, two parts of a page): the later pass reads
+        // it after the earlier one wrote it.
+        let mut open: Vec<(u32, u32)> = Vec::new();
+        for p in passes {
+            let window = (p.first, p.first + 4 * p.words);
+            if open.iter().any(|w| w.0 < window.1 && window.0 < w.1) {
+                list.ResourceBarrier(std::slice::from_ref(&uav_barrier));
+                open.clear();
+            }
+            open.push(window);
+            let constants = [p.first, p.words];
+            list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+            list.SetComputeRootShaderResourceView(1, p.src);
+            list.Dispatch(p.words.div_ceil(64), 1, 1);
+        }
+        list.ResourceBarrier(std::slice::from_ref(&uav_barrier));
+        if checked {
+            list.ResourceBarrier(&[transition(buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            down(1);
+            list.ResourceBarrier(&[transition(buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        } else {
+            list.ResourceBarrier(&[transition(buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        }
+    }
+}
+
+/// Diagnostics: whether one patched page in 16 ([`CARD_PATCH`]) comes down
+/// before and after its patch, to be compared when its submission has run
+/// (`VICTORY_DENSE_PAGE_PATCH_CHECK=1`): the masked bytes must be the
+/// title's as `merge_under_writes` read them, the others as they were.
+fn patch_check() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics") && std::env::var("VICTORY_DENSE_PAGE_PATCH_CHECK").is_ok_and(|v| v.trim() == "1")
+    })
+}
+
+/// A page [`patch_check`] looks at once its submission has run: the copy
+/// (for the line), the window's first byte, what went up (title words,
+/// then mask words) and where the window came down to ([`PatchPass`]).
+struct PatchCheck {
+    copy: (u64, u64),
+    first: usize,
+    up: Vec<u8>,
+    down: (ID3D12Resource, usize),
+}
+
+/// [`patch_check`], since the last frame-rate line: pages looked at, masked
+/// bytes that were not the title's, other bytes the patch changed.
+static PATCH_CHECKED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`patch_check`], since the start: wrong bytes, and pages with any.
+static PATCH_WRONG_ALL: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`CARD_PATCH`] in `Host::card_before`, since the last frame-rate line:
+/// passes recorded, and bytes of title words and masks put up for them.
+static PATCH_SENT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Compares `check`'s window as it came down before and after the patch
+/// with what went up: (masked bytes not the title's, other bytes changed).
+fn patch_compared(check: &PatchCheck) -> (u64, u64) {
+    let bytes = check.up.len() / 2;
+    // SAFETY: the mapping holds both halves; the list that wrote them has
+    // run (its submission was waited for or landed).
+    let down = unsafe { std::slice::from_raw_parts(check.down.1 as *const u8, 2 * bytes) };
+    let (before, after) = down.split_at(bytes);
+    let (title, mask) = check.up.split_at(bytes);
+    let mut wrong = (0, 0);
+    for i in 0..bytes {
+        if mask[i] != 0 {
+            wrong.0 += u64::from(after[i] != title[i]);
+        } else {
+            wrong.1 += u64::from(after[i] != before[i]);
+        }
+    }
+    wrong
+}
+
+/// [`patch_compared`] for the checks of a plan whose submission has run:
+/// counted, and said where a byte is wrong (the first 16 pages, then one in
+/// 256).
+fn patch_checks_done(checks: Vec<PatchCheck>) {
+    for check in checks {
+        let (masked, other) = patch_compared(&check);
+        PATCH_CHECKED[0].fetch_add(1, Ordering::Relaxed);
+        PATCH_CHECKED[1].fetch_add(masked, Ordering::Relaxed);
+        PATCH_CHECKED[2].fetch_add(other, Ordering::Relaxed);
+        if masked + other == 0 {
+            continue;
+        }
+        PATCH_WRONG_ALL[0].fetch_add(masked + other, Ordering::Relaxed);
+        let n = PATCH_WRONG_ALL[1].fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n.is_multiple_of(256) {
+            tracing::warn!(
+                "a page patched on the card (VICTORY_DENSE_PAGE_PATCH_CHECK) came down wrong: copy at {:#x}+{:#x}, window at offset \
+                 {:#x} ({} bytes), {masked} masked bytes not the title's, {other} other bytes changed; {n} such pages since the start",
+                check.copy.0,
+                check.copy.1,
+                check.first,
+                check.up.len() / 2,
+            );
+        }
+    }
+}
 
 /// Whether the pieces a flight's compare flags come down to the PC inside
 /// the flight itself (`VICTORY_CARD_FETCH_INFLIGHT=1`; off by default, and
@@ -1914,6 +2133,11 @@ struct CardPlan {
     /// The `CardInflight::landed` its [`CARD_FETCH`] was told: which of its
     /// tickets got a slot ([`inflight_gets_slot`]).
     inflight_landed: u32,
+    /// VIcky ([`CARD_PATCH`]): the upload chunks its patches read, given
+    /// back by `Host::card_done`, and the patches to look at then
+    /// ([`patch_check`]).
+    patch_chunks: Vec<(Chunk, u64)>,
+    patch_checks: Vec<PatchCheck>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -3135,6 +3359,8 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         // VIcky (`crate::shadow::dense_whole`): the pages left to go up
         // whole go up only if nothing settles the flights.
         let mut whole: Vec<(Arc<crate::shadow::Shadow>, Vec<crate::shadow::WholePage>)> = Vec::new();
+        // VIcky (`crate::shadow::dense_patch`): whether pages were patched.
+        let patched = crate::shadow::patch_noted();
         let settle = spans.iter().any(|(shadow, from, to)| {
             let mut pages = Vec::new();
             let settle = shadow.merge_under_writes(*from, *to - *from, &mut runs_left, &mut pages);
@@ -3144,6 +3370,7 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
             settle
         });
         crate::shadow::whole_pages_done(whole, settle);
+        crate::shadow::patch_round(patched, settle);
         return settle;
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
@@ -3666,11 +3893,40 @@ fn late_line(frames: f64) {
             }
             None => String::new(),
         };
+        // VIcky (`crate::shadow::dense_patch`): only with the switch.
+        let patch = if crate::shadow::dense_patch() {
+            let p = crate::shadow::patch_stats().map(|n| n as f64 / frames);
+            let sent = PATCH_SENT.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+            let check = if patch_check() {
+                let c = PATCH_CHECKED.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+                let all = PATCH_WRONG_ALL.each_ref().map(|n| n.load(Ordering::Relaxed));
+                format!(
+                    "; patch check (VICTORY_DENSE_PAGE_PATCH_CHECK, one page in 16 read back): {} pages, masked bytes not the title's {} \
+                     (must be 0), other bytes the patch changed {} (must be 0); {} wrong bytes in {} pages since the start",
+                    c[0], c[1], c[2], all[0], all[1],
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "; pages over the runs left patched on the card (VICTORY_DENSE_PAGE_PATCH): {:.1} pages ({:.0} runs, {:.1} KB masked), \
+                 settles avoided {:.2}, submissions that patched and settled all the same {:.2}; patch passes {:.1} ({:.2} MB up){check}",
+                p[0],
+                p[1],
+                p[2] / 1024.0,
+                p[3],
+                p[4],
+                sent[0],
+                sent[1] / (1 << 20) as f64,
+            )
+        } else {
+            String::new()
+        };
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB; settles it asked for (\"title memory changed under shader writes\"), by why: \
              memory not write-watched {unwatched:.2}, the journal could not say {journal:.2}, a PC copy without a snapshot {no_snapshot:.2}, \
-             a card copy's page over the runs left (VICTORY_MERGE_RUNS) {over:.2}, wanting {:.0} runs with {:.0} left each time{put_up}{dense}",
+             a card copy's page over the runs left (VICTORY_MERGE_RUNS) {over:.2}, wanting {:.0} runs with {:.0} left each time{put_up}{dense}{patch}",
             bytes / (1 << 20) as f64,
             per_trip(wanted),
             per_trip(left),
@@ -4170,7 +4426,27 @@ impl Host {
                 taken: 0,
                 out: 0,
                 inflight: if inflight_fetch() { self.make_card_inflight(RESULTS) } else { None },
+                patch: if crate::shadow::dense_patch_asked() { self.make_card_patch() } else { None },
             })
+        }
+    }
+
+    /// [`CARD_PATCH`]'s pipeline (`crate::shadow::dense_patch`); `None`, and
+    /// pages over the runs left settle as before, if it cannot be made.
+    fn make_card_patch(&self) -> Option<(ID3D12RootSignature, ID3D12PipelineState)> {
+        match make_card_patch(&self.device) {
+            Ok(made) => {
+                CARD_PATCH_READY.store(true, Ordering::Relaxed);
+                tracing::info!(
+                    check = patch_check(),
+                    "card copies' pages over the runs left are patched on the card, not settled (VICTORY_DENSE_PAGE_PATCH=1)"
+                );
+                Some(made)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no patches on the card (VICTORY_DENSE_PAGE_PATCH=1): pages over the runs left settle as before");
+                None
+            }
         }
     }
 
@@ -4303,7 +4579,9 @@ impl Host {
             }
             None => 0,
         };
-        let mut dirty = crate::shadow::card_dirty(sent_as);
+        // VIcky (`crate::shadow::dense_patch`): with the pages to patch.
+        let mut patches: Vec<(Arc<crate::shadow::Shadow>, Vec<crate::shadow::PatchPage>)> = Vec::new();
+        let mut dirty = crate::shadow::card_dirty(sent_as, &mut patches);
         // With fetches on a copy queue (`crate::queue2`, bit 1 of
         // `VICTORY_QUEUE2`): the send's number is signalled on the direct
         // queue behind the send, so that a fetch knows which sends the card
@@ -4333,6 +4611,77 @@ impl Host {
                 whole.push(shadow.clone());
                 if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
                     dirty.push((shadow.clone(), Vec::new()));
+                }
+            }
+        }
+        // VIcky (`crate::shadow::dense_patch`): each page's title words and
+        // mask go into upload chunks of the plan's own, read by its
+        // `CARD_PATCH` pass (per copy: the passes, and the pages' offsets
+        // in the copy for the hashes). Without the pipeline or the memory
+        // the page's runs go up one copy each, as under the cap (they were
+        // noted as sent all the same).
+        let mut patch_chunks: Vec<(Chunk, u64)> = Vec::new();
+        let mut patch_checks: Vec<PatchCheck> = Vec::new();
+        let mut passes: Vec<(Arc<crate::shadow::Shadow>, Vec<PatchPass>, Vec<(usize, usize)>)> = Vec::new();
+        if !patches.is_empty() {
+            static CHECK_EVERY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let mut used_bytes = 0u64;
+            for (shadow, pages) in patches {
+                let (mut own, mut spans, mut filled) = (Vec::new(), Vec::new(), Vec::new());
+                for page in &pages {
+                    let (first, words) = page.window();
+                    let bytes = 8 * words as u64;
+                    let room = if work.patch.is_some() { self.patch_room(&mut patch_chunks, &mut used_bytes, bytes) } else { None };
+                    let Some((data, src)) = room else {
+                        if let Some((_, ranges)) = dirty.iter_mut().find(|(s, _)| Arc::ptr_eq(s, &shadow)) {
+                            ranges.extend_from_slice(page.runs());
+                            ranges.sort_unstable();
+                        }
+                        continue;
+                    };
+                    // SAFETY: the room is `bytes` long, in a mapped upload
+                    // chunk only this plan uses.
+                    page.fill(unsafe { std::slice::from_raw_parts_mut(data, bytes as usize) });
+                    own.push(PatchPass {
+                        src,
+                        first: first as u32,
+                        words: words as u32,
+                        check: None,
+                    });
+                    spans.push(page.span());
+                    filled.push(data);
+                    PATCH_SENT[0].fetch_add(1, Ordering::Relaxed);
+                    PATCH_SENT[1].fetch_add(bytes, Ordering::Relaxed);
+                }
+                // The check (`patch_check`): one page in 16 whose window no
+                // other page of the copy shares (another pass may change
+                // the bytes it does not mask).
+                for i in 0..own.len() {
+                    if !patch_check() || !CHECK_EVERY.fetch_add(1, Ordering::Relaxed).is_multiple_of(16) {
+                        continue;
+                    }
+                    let window = |p: &PatchPass| (p.first, p.first + 4 * p.words);
+                    let (from, to) = window(&own[i]);
+                    if own.iter().enumerate().any(|(j, p)| j != i && window(p).0 < to && from < window(p).1) {
+                        continue;
+                    }
+                    let bytes = 8 * own[i].words as usize;
+                    let Some((down, at)) = self.shared_buffer(bytes as u64) else {
+                        continue;
+                    };
+                    name(&down, || "card patch check".into());
+                    // SAFETY: what `fill` wrote above, in the plan's chunk.
+                    let up = unsafe { std::slice::from_raw_parts(filled[i], bytes) }.to_vec();
+                    patch_checks.push(PatchCheck {
+                        copy: shadow.span(),
+                        first: from as usize,
+                        up,
+                        down: (down.clone(), at as usize),
+                    });
+                    own[i].check = Some(down);
+                }
+                if !own.is_empty() {
+                    passes.push((shadow, own, spans));
                 }
             }
         }
@@ -4403,6 +4752,16 @@ impl Host {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
                         };
+                        // VIcky (`crate::shadow::dense_patch`): the masked
+                        // patches first, so that a range noted after a page
+                        // (newer bytes of the CPU's side) goes over it.
+                        let patched = match (passes.iter().find(|p| Arc::ptr_eq(&p.0, shadow)), &work.patch) {
+                            (Some((_, own, spans)), Some((root, pso))) => {
+                                record_card_patches(list, root, pso, &shadow.buffer, own);
+                                Some(spans)
+                            }
+                            _ => None,
+                        };
                         for &(a, b) in ranges {
                             match &landed {
                                 Some(landing) => list.CopyBufferRegion(&shadow.buffer, a as u64, landing, at, (b - a) as u64),
@@ -4421,7 +4780,8 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
+                        // (A patched copy is in that state too.)
+                        if !ranges.is_empty() || patched.is_some() {
                             list.ResourceBarrier(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -4436,7 +4796,8 @@ impl Host {
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                            // The patched pages' pieces are hashed again too.
+                            ranges.iter().chain(patched.into_iter().flatten()).map(|&(a, b)| shadow.card_run(a, b)).collect()
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
                         let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
@@ -4469,6 +4830,8 @@ impl Host {
             sent_as,
             inflight: false,
             inflight_landed: 0,
+            patch_chunks,
+            patch_checks,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -4588,6 +4951,26 @@ impl Host {
         Some(plan)
     }
 
+    /// VIcky ([`CARD_PATCH`]): room for `bytes` in a plan's upload chunks
+    /// `chunks` (the last one used up to `used`), on 256 bytes: its mapping
+    /// and card address. A chunk is taken as lists take theirs
+    /// ([`take_chunk`]) when the last one is full.
+    fn patch_room(&self, chunks: &mut Vec<(Chunk, u64)>, used: &mut u64, bytes: u64) -> Option<(*mut u8, u64)> {
+        let at = used.next_multiple_of(256);
+        if let Some((chunk, size)) = chunks.last()
+            && at + bytes <= *size
+        {
+            *used = at + bytes;
+            return Some(((chunk.data + at as usize) as *mut u8, chunk.gpu + at));
+        }
+        let size = bytes.next_multiple_of(SCRATCH_CHUNK);
+        let chunk = take_chunk(self, size)?;
+        let room = (chunk.data as *mut u8, chunk.gpu);
+        chunks.push((chunk, size));
+        *used = bytes;
+        Some(room)
+    }
+
     /// With [`relay`]: whether the compare's result area is half taken by
     /// plans in the air. It starts from the beginning only when no plan is
     /// out, so the caller lets the flights land first.
@@ -4604,6 +4987,11 @@ impl Host {
     /// when nothing of ours is on the card, so the compare's results start
     /// from the beginning again.
     fn card_done(&self, plan: CardPlan) {
+        // VIcky ([`CARD_PATCH`]): its lists have run.
+        give_chunks(plan.patch_chunks);
+        if !plan.patch_checks.is_empty() {
+            patch_checks_done(plan.patch_checks);
+        }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(work) = work.as_mut() else {
             return;
@@ -9367,5 +9755,258 @@ void main() {
             }
         }
         drop((a, b, trial));
+    }
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::*;
+
+    /// A flight's shader: every fifth word of the first `words` of the
+    /// buffer gets a value of its own.
+    const SCATTER: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), UAV(u0)"
+cbuffer What : register(b0) { uint words; uint seed; };
+RWByteAddressBuffer memory : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= words || id.x % 5u != 0u) return;
+    memory.Store(id.x * 4u, (id.x * 2654435761u) ^ seed);
+}
+"#;
+
+    fn scattered(word: u32, seed: u32) -> u32 {
+        word.wrapping_mul(2_654_435_761) ^ seed
+    }
+
+    fn buffer(device: &ID3D12Device, kind: D3D12_HEAP_TYPE, size: u64, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES) -> ID3D12Resource {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: kind,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a buffer.
+        unsafe { device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut made) }.expect("a buffer");
+        made.expect("a buffer")
+    }
+
+    fn mapped(buffer: &ID3D12Resource) -> *mut u8 {
+        let mut data = std::ptr::null_mut();
+        // SAFETY: a CPU-visible buffer of ours.
+        unsafe { buffer.Map(0, None, Some(&mut data)) }.expect("a mapping");
+        data.cast()
+    }
+
+    /// VIcky (`crate::shadow::dense_patch`), on the software adapter: a copy
+    /// in the card's memory, a flight's shader writing it (sent, not waited
+    /// for), then the masked patches of two pages as `Host::card_before`
+    /// records them (`record_card_patches`, `CARD_PATCH`), one of them
+    /// read back for the check. The masked bytes are the title's, also in
+    /// words the flight wrote (queue order: the patch after the writer);
+    /// every other byte is the shader's or the copy's own, including the
+    /// title bytes put up outside the runs and the window's bytes outside
+    /// the page's part (a copy not on a 4-byte line). The check finds 0
+    /// wrong bytes, and finds a wrong one.
+    #[test]
+    fn warp_a_masked_patch_takes_the_title_bytes_and_leaves_the_shaders() {
+        let Ok(adapter) = warp_adapter() else {
+            eprintln!("patch_tests: skipped, no software adapter or device");
+            return;
+        };
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain creation on the software adapter.
+        if unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device) }.is_err() {
+            eprintln!("patch_tests: skipped, no software adapter or device");
+            return;
+        }
+        let device = device.expect("a device");
+        const LEN: usize = 2 << 16;
+        const SEED: u32 = 0x00c3_5a00;
+        // The flight writes over three quarters of the copy.
+        const WORDS: u32 = (LEN * 3 / 4 / 4) as u32;
+        // SAFETY: plain creation calls.
+        let (queue, allocator, list, fence): (ID3D12CommandQueue, ID3D12CommandAllocator, ID3D12GraphicsCommandList, ID3D12Fence) = unsafe {
+            let queue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .expect("a queue");
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("an allocator");
+            let list = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).expect("a list");
+            let fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("a fence");
+            (queue, allocator, list, fence)
+        };
+        // SAFETY: an open list of ours; closed before its first use.
+        unsafe { list.Close() }.expect("a closed list");
+        let (root, pso) = make_card_patch(&device).expect("the patch's pipeline");
+        let code = compile(SCATTER, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
+        // SAFETY: the shader's own bytes; its root signature is inside.
+        let (scatter_root, scatter): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &code).expect("a root signature");
+            let pso = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .expect("a pipeline");
+            (root, pso)
+        };
+        let card = buffer(&device, D3D12_HEAP_TYPE_DEFAULT, LEN as u64, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        const UP: usize = LEN + (1 << 20);
+        let up = buffer(&device, D3D12_HEAP_TYPE_UPLOAD, UP as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+        let back = buffer(&device, D3D12_HEAP_TYPE_READBACK, LEN as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        let content: Vec<u8> = (0..LEN).map(|i| (i * 13 + 7) as u8).collect();
+        // SAFETY: the mapping holds `UP` bytes.
+        let upload = unsafe { std::slice::from_raw_parts_mut(mapped(&up), UP) };
+        upload[..LEN].copy_from_slice(&content);
+        // Page A: from offset 2 to its end (the copy starts 2 bytes into a
+        // word); runs of 1 to 3 bytes 11 bytes apart. Page B: 1,000 bytes
+        // from offset 65,538, runs at both ends. C: the 2 bytes before B,
+        // in B's first word (two parts of a page in two declared ranges):
+        // the later pass reads what the earlier wrote. The title's bytes
+        // outside the runs are garbage: they must not go up.
+        let page = |at: usize, n: usize, runs: Vec<(usize, usize)>| {
+            let mut title = vec![0xeeu8; n];
+            for &(a, b) in &runs {
+                for i in a..b {
+                    title[i - at] = content[i] ^ 0x5a;
+                }
+            }
+            crate::shadow::PatchPage::new(at, title, runs)
+        };
+        let a_runs: Vec<(usize, usize)> = (0..).map(|k| (5 + 11 * k, 5 + 11 * k + 1 + k % 3)).take_while(|r| r.1 <= 1 << 16).collect();
+        let pages = [
+            page(2, (1 << 16) - 2, a_runs),
+            page(65_538, 1000, vec![(65_538, 65_540), (65_600, 65_603), (66_537, 66_538)]),
+            page(65_536, 2, vec![(65_536, 65_537)]),
+        ];
+        assert_eq!(pages[0].window(), (0, 1 << 14));
+        assert_eq!(pages[1].window(), (65_536, 251));
+        assert_eq!(pages[2].window(), (65_536, 1));
+        let mut passes = Vec::new();
+        let mut at = LEN;
+        let mut check = None;
+        for (i, p) in pages.iter().enumerate() {
+            let (first, words) = p.window();
+            let bytes = 8 * words;
+            p.fill(&mut upload[at..at + bytes]);
+            let down = (i == 0).then(|| {
+                let down = buffer(&device, D3D12_HEAP_TYPE_READBACK, bytes as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+                check = Some(PatchCheck {
+                    copy: (0, LEN as u64),
+                    first,
+                    up: upload[at..at + bytes].to_vec(),
+                    down: (down.clone(), mapped(&down) as usize),
+                });
+                down
+            });
+            // SAFETY: a live buffer.
+            let src = unsafe { up.GetGPUVirtualAddress() } + at as u64;
+            passes.push(PatchPass {
+                src,
+                first: first as u32,
+                words: words as u32,
+                check: down,
+            });
+            at = (at + bytes).next_multiple_of(256);
+        }
+        // SAFETY: lists of ours on live buffers; each list's run is over
+        // before its allocator is reset (the fence is waited for).
+        unsafe {
+            let run = |record: &dyn Fn(&ID3D12GraphicsCommandList)| {
+                allocator.Reset().expect("a reset");
+                list.Reset(&allocator, None).expect("a reset");
+                record(&list);
+                list.Close().expect("a closed list");
+                queue.ExecuteCommandLists(&[Some(list.cast().expect("a command list"))]);
+            };
+            // The copy's bytes; waited for (the allocator is reset next).
+            run(&|list| list.CopyBufferRegion(&card, 0, &up, 0, LEN as u64));
+            queue.Signal(&fence, 1).expect("a signal");
+            while fence.GetCompletedValue() < 1 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // The flight and, behind it on the queue, the patch: one list
+            // each, as on the host (the patch is the next send's list).
+            let flight_allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).expect("an allocator");
+            let flight: ID3D12GraphicsCommandList =
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &flight_allocator, None).expect("a list");
+            flight.SetComputeRootSignature(&scatter_root);
+            flight.SetPipelineState(&scatter);
+            flight.SetComputeRoot32BitConstants(0, 2, [WORDS, SEED].as_ptr().cast(), 0);
+            flight.SetComputeRootUnorderedAccessView(1, card.GetGPUVirtualAddress());
+            flight.Dispatch(WORDS.div_ceil(64), 1, 1);
+            flight.Close().expect("a closed list");
+            queue.ExecuteCommandLists(&[Some(flight.cast().expect("a command list"))]);
+            run(&|list| {
+                record_card_patches(list, &root, &pso, &card, &passes);
+                list.ResourceBarrier(&[transition(&card, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.CopyBufferRegion(&back, 0, &card, 0, LEN as u64);
+            });
+            queue.Signal(&fence, 2).expect("a signal");
+            while fence.GetCompletedValue() < 2 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        // What the copy must hold: its bytes, the flight's words, then the
+        // title's bytes in the runs.
+        let mut expected = content.clone();
+        for w in (0..WORDS).filter(|w| w % 5 == 0) {
+            expected[w as usize * 4..w as usize * 4 + 4].copy_from_slice(&scattered(w, SEED).to_le_bytes());
+        }
+        let after_flight = expected.clone();
+        let mut both = 0;
+        for p in &pages {
+            for &(a, b) in p.runs() {
+                for i in a..b {
+                    both += usize::from(i / 4 % 5 == 0 && i / 4 < WORDS as usize);
+                    expected[i] = content[i] ^ 0x5a;
+                }
+            }
+        }
+        assert!(both > 100, "runs in words the flight wrote: {both}");
+        // SAFETY: the readback's mapping holds `LEN` bytes; the list ran.
+        let got = unsafe { std::slice::from_raw_parts(mapped(&back), LEN) };
+        let wrong: Vec<usize> = (0..LEN).filter(|&i| got[i] != expected[i]).collect();
+        if let Some(&i) = wrong.first() {
+            panic!(
+                "{} bytes wrong, the first at {i}: got {:#x}, expected {:#x} (the copy's {:#x}, after the flight {:#x})",
+                wrong.len(),
+                got[i],
+                expected[i],
+                content[i],
+                after_flight[i],
+            );
+        }
+        // The check: the window came down after the flight and after the
+        // patch, and nothing is wrong.
+        let check = check.expect("a check");
+        assert_eq!(patch_compared(&check), (0, 0));
+        // SAFETY: the check's mapping holds both halves; the list ran.
+        let before = unsafe { std::slice::from_raw_parts(check.down.1 as *const u8, 1 << 16) };
+        assert_eq!(before, &after_flight[..1 << 16], "the window as the flight left it");
+        // A wrong byte is found: a masked byte the card did not take.
+        let mut bad = check.up.clone();
+        let (a, _) = pages[0].runs()[7];
+        bad[a] ^= 1;
+        let bad = PatchCheck { up: bad, ..check };
+        assert_eq!(patch_compared(&bad), (1, 0));
     }
 }

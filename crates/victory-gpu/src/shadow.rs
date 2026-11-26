@@ -148,6 +148,11 @@ struct DirtyNotes {
     /// `ranges` is out of order, or two of them overlap or touch: put in
     /// order (as [`joined`] leaves ranges) at the next look.
     unsorted: bool,
+    /// VIcky ([`dense_patch`]): pages whose changed runs go up as one
+    /// masked patch on the card ([`PatchPage`]), in the order noted. Their
+    /// runs are left out of merges as `ranges` are, until they are sent
+    /// ([`card_dirty`]: then noted in [`Card::sent`] with the send).
+    patches: Vec<PatchPage>,
 }
 
 impl DirtyNotes {
@@ -192,6 +197,103 @@ impl DirtyNotes {
             self.unsorted = false;
         }
         overlapping_in(&self.ranges, from, to, out);
+        // The masked patches' runs, byte for byte: what lies between them
+        // on their pages is not the title's and is merged.
+        for p in &self.patches {
+            let (a, b) = p.span();
+            if a < to && b > from {
+                overlapping_in(&p.runs, from, to, out);
+            }
+        }
+    }
+
+    /// The ranges ([`DirtyNotes::take`]) and the masked patches: they go
+    /// up now, with send `sent_as`. With [`relay`] all of them are noted in
+    /// `sent` with it, the patches' runs as runs (byte-exact), and the
+    /// notes of sends up to `fetched` are dropped.
+    fn take_with(&mut self, sent: Option<&mut SentNotes>, sent_as: u64, fetched: u64) -> (Vec<(usize, usize)>, Vec<PatchPage>) {
+        let ranges = self.take();
+        let patches = std::mem::take(&mut self.patches);
+        if let Some(sent) = sent {
+            sent.drop_up_to(fetched);
+            if patches.is_empty() {
+                sent.note(sent_as, ranges.clone());
+            } else {
+                let mut all = ranges.clone();
+                all.extend(patches.iter().flat_map(|p| p.runs.iter().copied()));
+                sent.note(sent_as, joined(all));
+            }
+        }
+        (ranges, patches)
+    }
+}
+
+/// VIcky ([`dense_patch`]): a page of a copy in the card's memory that
+/// [`Shadow::merge_under_writes`] found with more changed runs than are left
+/// (`VICTORY_MERGE_RUNS`) while flights that may write it were in the air.
+/// Instead of settling those flights, the runs' bytes go into the CPU's side
+/// (as under the cap) and up as one compute pass on the card
+/// (`crate::host`'s `CARD_PATCH`, in `Host::card_before`, behind the
+/// flights in the air and ahead of the next lists): per 4-byte word,
+/// `card = (card & !mask) | (title & mask)`, the mask 0xff on each byte of
+/// a run. What the flights' shaders write beside the runs stays, as with
+/// the runs' own copies.
+pub(crate) struct PatchPage {
+    /// Offset in the copy of the page's part (its title memory `lo`).
+    at: usize,
+    /// Title memory there, as `merge_under_writes` read it.
+    title: Vec<u8>,
+    /// The runs, as offsets of the copy `[from, to)`, in order, apart.
+    runs: Vec<(usize, usize)>,
+}
+
+impl PatchPage {
+    /// The page's part at offset `at` of the copy, title memory's bytes
+    /// `title` there, and the runs (offsets of the copy, in order, apart,
+    /// inside the part).
+    pub(crate) fn new(at: usize, title: Vec<u8>, runs: Vec<(usize, usize)>) -> PatchPage {
+        debug_assert!(runs.iter().all(|r| at <= r.0 && r.0 < r.1 && r.1 <= at + title.len()));
+        PatchPage { at, title, runs }
+    }
+
+    /// Offsets of the copy `[from, to)` the page's part covers.
+    pub(crate) fn span(&self) -> (usize, usize) {
+        (self.at, self.at + self.title.len())
+    }
+
+    /// The 4-byte words of the copy the patch covers (a shader stores
+    /// words; the copy need not start on one): the first's offset in the
+    /// copy, and how many. Bytes of them outside the page's part are not
+    /// masked.
+    pub(crate) fn window(&self) -> (usize, usize) {
+        let from = self.at & !3;
+        let to = (self.at + self.title.len() + 3) & !3;
+        (from, (to - from) / 4)
+    }
+
+    /// The runs, as offsets of the copy `[from, to)`.
+    pub(crate) fn runs(&self) -> &[(usize, usize)] {
+        &self.runs
+    }
+
+    /// The bytes of the runs.
+    pub(crate) fn masked(&self) -> usize {
+        self.runs.iter().map(|r| r.1 - r.0).sum()
+    }
+
+    /// What the patch reads ([`PatchPage::window`]'s words): the title's
+    /// bytes, then the mask, 0xff on each byte of a run and 0 elsewhere.
+    /// `out` holds 8 bytes a word.
+    pub(crate) fn fill(&self, out: &mut [u8]) {
+        let (from, words) = self.window();
+        let (title, mask) = out[..8 * words].split_at_mut(4 * words);
+        title.fill(0);
+        mask.fill(0);
+        let skew = self.at - from;
+        title[skew..skew + self.title.len()].copy_from_slice(&self.title);
+        for &(a, b) in &self.runs {
+            mask[a - from..b - from].fill(0xff);
+        }
     }
 }
 
@@ -423,6 +525,71 @@ pub(crate) fn whole_overwritten(flagged: &[(Arc<Shadow>, u32, u64)]) -> u64 {
         }
     }
     found
+}
+
+/// VIcky: whether `VICTORY_DENSE_PAGE_PATCH=1` was asked for (off by
+/// default), with the relay (the patches' runs are noted as sent by the
+/// relay's numbered sends). See [`dense_patch`].
+pub(crate) fn dense_patch_asked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DENSE_PAGE_PATCH").is_ok_and(|v| v.trim() == "1") && crate::host::relay())
+}
+
+/// VIcky: whether a page of a copy in the card's memory with more changed
+/// runs than are left (`VICTORY_MERGE_RUNS`), while flights that may write
+/// it are in the air, is patched on the card ([`PatchPage`]) instead of
+/// settling those flights, whatever the card's compare said of its piece
+/// (with [`dense_whole`] too, a page whose piece is quiet goes up whole and
+/// the others are patched). [`dense_patch_asked`], and the host made the
+/// patch's pipeline (`crate::host::card_patch_ready`).
+///
+/// RT74: with [`dense_whole`], 0.83 settles a frame (39 ms of the
+/// submitting thread waiting for the card) were left, all for pages of the
+/// title's 182 MB heap (shader writes declared by a buffer view) with 600
+/// to 4,500 scattered runs of 1-3 bytes, whose piece shaders wrote a few
+/// frames before. A patch keeps what the runs keep: the title's bytes in
+/// the runs, queued behind the flights in the air (a byte both changed ends
+/// the title's: the 51a3239 rule while a value is ahead, a race on the
+/// console otherwise, as under the cap), and the shaders' writes beside
+/// them. It costs one note, one dispatch and 128 KiB up (title bytes and
+/// mask) per page, not one copy per run.
+pub(crate) fn dense_patch() -> bool {
+    dense_patch_asked() && crate::host::card_patch_ready()
+}
+
+/// [`dense_patch`], since the last frame-rate line: pages noted to be
+/// patched, their runs and bytes masked; submissions that settled for none
+/// of their pages with some patched, and those that settled all the same
+/// (another page or cause; the patches still go up, as runs under the cap
+/// do).
+static PATCH: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+const PATCH_PAGES: usize = 0;
+const PATCH_RUNS: usize = 1;
+const PATCH_BYTES: usize = 2;
+const PATCH_AVOIDED: usize = 3;
+const PATCH_SETTLED: usize = 4;
+
+/// Pages noted to be patched since the start ([`patch_round`]).
+static PATCH_NOTED_ALL: AtomicU64 = AtomicU64::new(0);
+
+/// [`PATCH`], taken.
+pub(crate) fn patch_stats() -> [u64; 5] {
+    PATCH.each_ref().map(|n| n.swap(0, Ordering::Relaxed))
+}
+
+/// Pages noted to be patched since the start: asked by `crate::host`
+/// before its look for title bytes under flights' shader writes, and
+/// given back to [`patch_round`] after it.
+pub(crate) fn patch_noted() -> u64 {
+    PATCH_NOTED_ALL.load(Ordering::Relaxed)
+}
+
+/// After the look: whether it patched pages (more noted than `before`),
+/// and if so whether the flights were `settled` all the same.
+pub(crate) fn patch_round(before: u64, settled: bool) {
+    if PATCH_NOTED_ALL.load(Ordering::Relaxed) > before {
+        PATCH[if settled { PATCH_SETTLED } else { PATCH_AVOIDED }].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -689,7 +856,12 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// that send knows the card did not hold these bytes yet
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
-pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+///
+/// VIcky ([`dense_patch`]): the pages to patch on the card ([`PatchPage`])
+/// are taken too, onto `patches` per copy, and noted as sent with the same
+/// send (their runs); a copy with patches and no ranges is in the result
+/// with no ranges.
+pub(crate) fn card_dirty(sent_as: u64, patches: &mut Vec<(Arc<Shadow>, Vec<PatchPage>)>) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
@@ -697,26 +869,30 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         let Some(shadow) = weak.upgrade() else {
             return false;
         };
-        let ranges = shadow
-            .card
-            .as_ref()
-            .map(|c| {
-                let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = dirty.take();
-                if relay() {
-                    let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.drop_up_to(fetched);
-                    sent.note(sent_as, ranges.clone());
-                }
-                ranges
-            })
-            .unwrap_or_default();
-        if !ranges.is_empty() {
+        let (ranges, patched) = shadow.card.as_ref().map(|c| c.take_dirty(sent_as, fetched)).unwrap_or_default();
+        if !patched.is_empty() {
+            patches.push((shadow.clone(), patched));
+            out.push((shadow, ranges));
+        } else if !ranges.is_empty() {
             out.push((shadow, ranges));
         }
         true
     });
     out
+}
+
+impl Card {
+    /// [`card_dirty`] for one copy: its ranges and patches, noted as sent
+    /// with send `sent_as` with [`relay`], in the lock that took them.
+    fn take_dirty(&self, sent_as: u64, fetched: u64) -> (Vec<(usize, usize)>, Vec<PatchPage>) {
+        let mut dirty = self.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        if relay() {
+            let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
+            dirty.take_with(Some(&mut *sent), sent_as, fetched)
+        } else {
+            dirty.take_with(None, sent_as, fetched)
+        }
+    }
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -4312,7 +4488,18 @@ impl Shadow {
     /// flagged lately, goes onto `whole` instead (it takes one run of what
     /// is left), for the caller to put up whole if nothing settles the
     /// flights ([`whole_pages_done`]). Empty without the switch.
+    ///
+    /// VIcky ([`dense_patch`]): such a page that does not go up whole has
+    /// its runs put into the CPU's side as under the cap and is noted to be
+    /// patched on the card ([`PatchPage`]) instead of settling the flights
+    /// (it takes one run of what is left).
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize, whole: &mut Vec<WholePage>) -> bool {
+        self.merge_under_writes_as(address, len, runs_left, whole, dense_patch())
+    }
+
+    /// [`Shadow::merge_under_writes`], with pages over the runs left patched
+    /// on the card if `patch`.
+    fn merge_under_writes_as(&self, address: usize, len: usize, runs_left: &mut usize, whole: &mut Vec<WholePage>, patch: bool) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -4383,28 +4570,41 @@ impl Shadow {
                         // VIcky (`VICTORY_DENSE_PAGE_WHOLE`): whole, if no
                         // shader wrote the piece lately. Put in, and taken,
                         // by the caller once nothing settles the flights.
-                        if let Some(frames) = dense_whole() {
-                            if self.card_quiet(page, frames) {
-                                let all = (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e;
-                                whole.push(WholePage { lo, hi, page, now, all });
-                                *runs_left = runs_left.saturating_sub(1);
-                                continue;
-                            }
-                            DENSE[DENSE_LOUD].fetch_add(1, Ordering::Relaxed);
+                        if let Some(frames) = dense_whole()
+                            && self.card_quiet(page, frames)
+                        {
+                            let all = (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e;
+                            whole.push(WholePage { lo, hi, page, now, all });
+                            *runs_left = runs_left.saturating_sub(1);
+                            continue;
                         }
-                        MERGED[MERGED_OVER].fetch_add(1, Ordering::Relaxed);
-                        MERGED[MERGED_OVER + 1].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                        MERGED[MERGED_OVER + 2].fetch_add(*runs_left as u64, Ordering::Relaxed);
-                        #[cfg(feature = "diagnostics")]
-                        self.over_cap_said(lo, (a, e), title, held, &runs, *runs_left);
-                        return true;
-                    }
-                    *runs_left -= runs.len();
-                    for (r, m) in runs {
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        if !patch {
+                            if dense_whole().is_some() {
+                                DENSE[DENSE_LOUD].fetch_add(1, Ordering::Relaxed);
+                            }
+                            MERGED[MERGED_OVER].fetch_add(1, Ordering::Relaxed);
+                            MERGED[MERGED_OVER + 1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                            MERGED[MERGED_OVER + 2].fetch_add(*runs_left as u64, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            self.over_cap_said(lo, (a, e), title, held, &runs, *runs_left);
+                            return true;
+                        }
+                        // VIcky (`VICTORY_DENSE_PAGE_PATCH`): the runs into
+                        // the CPU's side as under the cap, and up as one
+                        // masked patch (`Host::card_before`).
+                        for &(r, m) in &runs {
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                        }
+                        self.card_patch_noted(at, title, &runs);
+                        *runs_left = runs_left.saturating_sub(1);
+                    } else {
+                        *runs_left -= runs.len();
+                        for (r, m) in runs {
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            self.card_changed(at + r, at + r + m);
+                            MERGED[1].fetch_add(1, Ordering::Relaxed);
+                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        }
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
@@ -4737,6 +4937,23 @@ impl Shadow {
             return;
         }
         card.dirty.lock().unwrap_or_else(|e| e.into_inner()).add(from, to);
+    }
+
+    /// VIcky ([`dense_patch`]): the page's part at offset `at` of the copy,
+    /// whose CPU side took title memory's bytes `title` (read at `at`) in
+    /// `runs` (offsets in the part, in order), is noted to be patched on
+    /// the card ([`PatchPage`]). Called under the CPU side's lock, as
+    /// [`Shadow::card_changed`] is by `merge_under_writes`.
+    fn card_patch_noted(&self, at: usize, title: &[u8], runs: &[(usize, usize)]) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        let page = PatchPage::new(at, title.to_vec(), runs.iter().map(|&(r, m)| (at + r, at + r + m)).collect());
+        PATCH[PATCH_PAGES].fetch_add(1, Ordering::Relaxed);
+        PATCH[PATCH_RUNS].fetch_add(runs.len() as u64, Ordering::Relaxed);
+        PATCH[PATCH_BYTES].fetch_add(page.masked() as u64, Ordering::Relaxed);
+        PATCH_NOTED_ALL.fetch_add(1, Ordering::Relaxed);
+        card.dirty.lock().unwrap_or_else(|e| e.into_inner()).patches.push(page);
     }
 
     /// A landing found piece `piece` of the copy (numbered as the compare
@@ -6057,6 +6274,148 @@ mod card_merge_tests {
         // were not.
         assert_eq!(whole_overwritten(&[(shadow.clone(), 0, 8)]), 1);
         assert_eq!(whole_overwritten(&[(shadow.clone(), 0, 9), (shadow.clone(), 0, 10), (shadow.clone(), 1, 3)]), 0);
+    }
+
+    /// VIcky (`VICTORY_DENSE_PAGE_PATCH`), on a real copy in the card's
+    /// memory and write-watched title memory: a page with more changed runs
+    /// than are left settles without the switch; with it,
+    /// `merge_under_writes` asks for no settle, the CPU's side takes the
+    /// title's bytes in the runs (and nothing else), the page is noted once
+    /// to be patched with its runs (not as ranges; a page under the cap
+    /// still is) and taken. Merges leave out exactly the runs: before the
+    /// send (still to go up), and once sent for a fetch before that send
+    /// (the sent note holds the runs); a byte between two runs the card
+    /// wrote is merged, and a fetch after the send merges the runs too.
+    #[test]
+    fn a_dense_page_over_the_runs_left_is_patched_not_settled() {
+        use super::{PatchPage, under_runs};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const LEN: usize = 2 * PAGE;
+        let content: Vec<u8> = (0..LEN).map(|i| (i * 7 + 3) as u8).collect();
+        let shadow_of = |title: *mut u8, side: &mut Vec<u8>| {
+            let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title as u64, LEN as u64);
+            shadow.card = Some(Card {
+                staging: staging.clone(),
+                before: Mutex::new(None),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                // 0: no card bytes counted (`Drop` takes them off again).
+                size: 0,
+                dense: Dense::default(),
+            });
+            *shadow.pending.lock().unwrap() = vec![(title as usize, title as usize + LEN)];
+            shadow
+        };
+        // Title memory, write-watched as the title's is.
+        // SAFETY: a plain allocation of our own.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!title.is_null());
+        // Page 0: a field of every 12-byte record (5,461 runs); page 1:
+        // three bytes.
+        let mut wanted = content.clone();
+        for i in (4..PAGE).step_by(12).chain([PAGE + 10, PAGE + 500, PAGE + 9000]) {
+            wanted[i] ^= 0x3c;
+        }
+        // SAFETY: inside the allocation, ours alone.
+        unsafe { std::ptr::copy_nonoverlapping(wanted.as_ptr(), title, LEN) };
+        // Title memory as the merges left it.
+        // SAFETY: inside the allocation.
+        let memory = |at: usize| unsafe { title.add(at).read_volatile() };
+        // Without the switch: settled, page 0 left as it was.
+        let mut side = content.clone();
+        let shadow = shadow_of(title, &mut side);
+        let mut left = 512;
+        assert!(shadow.merge_under_writes_as(title as usize, LEN, &mut left, &mut Vec::new(), false));
+        drop(shadow);
+        assert_eq!(side, content);
+        // With it: no settle.
+        let mut side = content.clone();
+        let shadow = shadow_of(title, &mut side);
+        let mut left = 512;
+        assert!(!shadow.merge_under_writes_as(title as usize, LEN, &mut left, &mut Vec::new(), true), "no settle");
+        assert_eq!(left, 512 - 1 - 3);
+        let card = shadow.card.as_ref().unwrap();
+        let (runs, span) = {
+            let dirty = card.dirty.lock().unwrap();
+            assert_eq!(dirty.ranges, [(PAGE + 10, PAGE + 11), (PAGE + 500, PAGE + 501), (PAGE + 9000, PAGE + 9001)], "page 1: runs");
+            assert_eq!(dirty.patches.len(), 1, "page 0: one note");
+            (dirty.patches[0].runs().to_vec(), dirty.patches[0].span())
+        };
+        assert_eq!(span, (0, PAGE));
+        assert_eq!(runs.len(), (PAGE - 4).div_ceil(12));
+        assert_eq!(runs, under_runs(&wanted[..PAGE], &content[..PAGE]).iter().map(|&(r, m)| (r, r + m)).collect::<Vec<_>>());
+        assert!(shadow.copied.lock().unwrap().iter().all(|&at| at > 0), "both pages taken");
+        // The card's side, as a flight in the air left it: its shaders wrote
+        // a byte of a run (both changed it), a byte between two runs, and a
+        // byte of a run they write again later.
+        let (both, beside, later) = (4 + 12 * 100, 4 + 12 * 200 + 5, 4 + 12 * 300);
+        let mut slot = content.clone();
+        for at in [both, beside, later] {
+            slot[at] ^= 0xc3;
+        }
+        // SAFETY: inside `side`, which the shadow maps; nothing else
+        // touches it meanwhile.
+        let side_now = |at: usize| unsafe { *shadow.data.add(at) };
+        // Before the send: the runs are left out, the byte between merged.
+        assert!(shadow.card_merge_relay(0, &slot[..PAGE], 3, &mut Vec::new()) > 0);
+        assert_eq!((memory(both), side_now(both)), (wanted[both], wanted[both]), "the title's byte stays");
+        assert_eq!((memory(beside), side_now(beside)), (slot[beside], slot[beside]), "the shader's byte lands");
+        // Sent with send 5: the sent note holds the runs and page 1's ranges.
+        let (ranges, patches): (Vec<(usize, usize)>, Vec<PatchPage>) = {
+            let mut dirty = card.dirty.lock().unwrap();
+            let mut sent = card.sent.lock().unwrap();
+            let taken = dirty.take_with(Some(&mut *sent), 5, 0);
+            assert_eq!(sent.0.len(), 1);
+            assert_eq!(sent.0[0].0, 5);
+            assert_eq!(sent.0[0].1.len(), runs.len() + 3);
+            assert_eq!(sent.0[0].1[..runs.len()], runs[..]);
+            taken
+        };
+        assert_eq!((ranges.len(), patches.len()), (3, 1));
+        assert!(card.dirty.lock().unwrap().patches.is_empty());
+        // A fetch before the send: the runs are still left out, byte for
+        // byte.
+        let mut slot = slot.clone();
+        slot[beside + 1] ^= 0xc3;
+        assert!(shadow.card_merge_relay(0, &slot[..PAGE], 4, &mut Vec::new()) > 0);
+        assert_eq!(memory(both), wanted[both]);
+        assert_eq!(memory(later), wanted[later]);
+        assert_eq!(memory(beside + 1), slot[beside + 1], "beside a run: merged");
+        // A fetch after it: the card holds the patch, and a shader's write
+        // over it lands.
+        let mut after = wanted[..PAGE].to_vec();
+        for at in [beside, beside + 1] {
+            after[at] = slot[at];
+        }
+        after[later] ^= 0x81;
+        assert!(shadow.card_merge_relay(0, &after, 5, &mut Vec::new()) > 0);
+        assert_eq!(memory(later), after[later], "written after the patch: merged");
+        assert_eq!(memory(both), wanted[both]);
+        drop(shadow);
+        // SAFETY: ours, no longer used.
+        unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// VIcky (`VICTORY_DENSE_PAGE_PATCH`): what a patch reads, for a part of
+    /// a page not on a 4-byte line: the window's words of title bytes (its
+    /// own bytes, 0 around them), then the mask, 0xff on the runs' bytes
+    /// only.
+    #[test]
+    fn a_patch_window_covers_its_part_in_words() {
+        use super::PatchPage;
+        let title: Vec<u8> = (0..10).map(|i| 0x10 + i as u8).collect();
+        let page = PatchPage::new(6, title, vec![(6, 7), (9, 12), (15, 16)]);
+        assert_eq!(page.window(), (4, 3));
+        assert_eq!(page.span(), (6, 16));
+        assert_eq!(page.masked(), 5);
+        let mut out = vec![0x77u8; 24];
+        page.fill(&mut out);
+        assert_eq!(out[..12], [0, 0, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19]);
+        assert_eq!(out[12..], [0, 0, 0xff, 0, 0, 0xff, 0xff, 0xff, 0, 0, 0, 0xff]);
     }
 
     /// VIcky (`VICTORY_DENSE_PAGE_WHOLE`): a piece counts as quiet once the
