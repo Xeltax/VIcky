@@ -102,14 +102,54 @@ pub(crate) fn current() -> Option<String> {
 /// decision into its own key) and so left out of the translator's
 /// fingerprint ([`super::translation_fingerprint`]): a new list translates
 /// again only the programs whose decision it changes.
-pub(super) const PER_PROGRAM_SWITCHES: [&str; 6] = [
+pub(super) const PER_PROGRAM_SWITCHES: [&str; 7] = [
     "VICTORY_WAVE_DEEP_SKIPS_NOT",
     "VICTORY_WAVE_DEEP_SKIPS_ONLY",
     "VICTORY_SHADER_OPT_NOT",
     "VICTORY_SHADER_OPT_ONLY",
     "VICTORY_WAVE_MASK_COPIES",
     "VICTORY_STORE_DROP",
+    "VICTORY_WAVE_SITE_PAIRS",
 ];
+
+/// Whether the program whose hash is `hash` (`None`: not known) is built with fork #1002's
+/// forms (brunofgmag, `eaeb8f17`; `crate::ir`): a pair of scalars parked in two lanes that
+/// hold other scalars elsewhere moves as a pair where it can (`site_pairs`), an
+/// `s_cbranch_execnz` over a far jump to the end is an early-out, and a scalar join that
+/// passes one value through is a copy of it (`without_skips` with `deep`). With them the
+/// tiled cascade shadow programs (#f133e35e and three siblings) translate exactly on a host
+/// of 32-lane waves, without the mask copies. `VICTORY_WAVE_SITE_PAIRS` (opt-in): unset or
+/// `0` for no program, `all` for every one, `<hash>,...` for the listed ones.
+pub fn site_pairs_allowed(hash: Option<&str>) -> bool {
+    #[cfg(test)]
+    if let Some(value) = TEST_SITE_PAIRS.get() {
+        return site_pairs_decide(value, hash);
+    }
+    static VALUE: OnceLock<Option<String>> = OnceLock::new();
+    let value = VALUE.get_or_init(|| std::env::var(PER_PROGRAM_SWITCHES[6]).ok());
+    site_pairs_decide(value.as_deref(), hash)
+}
+
+/// [`site_pairs_allowed`] for the program being translated on this thread ([`for_program`]).
+pub(crate) fn site_pairs_here() -> bool {
+    site_pairs_allowed(current().as_deref())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's value of `VICTORY_WAVE_SITE_PAIRS` (`Some(None)`: unset), for its thread only.
+    pub(crate) static TEST_SITE_PAIRS: std::cell::Cell<Option<Option<&'static str>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`site_pairs_allowed`] on the switch's value (`None`: unset). Pure, for testing.
+fn site_pairs_decide(value: Option<&str>, hash: Option<&str>) -> bool {
+    match value.map(str::trim) {
+        None | Some("0") => false,
+        Some(v) if v.eq_ignore_ascii_case("all") => true,
+        Some(v) => listed(&parse_hash_list(v), hash),
+    }
+}
 
 /// The console offsets of the stores `VICTORY_STORE_DROP` (module notes)
 /// leaves out of the translation of the program whose hash is `hash`
@@ -501,6 +541,23 @@ mod tests {
         TEST_MASK_COPIES.set(Some(Some("0")));
         assert!(!for_program(SHADOW, || mask_copies_retry_here(MASK_COPIES_RETRY_ON)));
         TEST_MASK_COPIES.set(was);
+    }
+
+    #[test]
+    fn site_pairs_are_opt_in_per_program() {
+        const SHADOW: &str = "f133e35efed2a48a";
+        for hash in [Some(A), Some(SHADOW), None] {
+            assert!(!site_pairs_decide(None, hash), "unset: {hash:?}");
+            assert!(!site_pairs_decide(Some("0"), hash), "0: {hash:?}");
+            assert!(site_pairs_decide(Some("all"), hash), "all: {hash:?}");
+        }
+        assert!(site_pairs_decide(Some("f133e35e"), Some(SHADOW)));
+        assert!(!site_pairs_decide(Some("f133e35e"), Some(A)));
+        let was = TEST_SITE_PAIRS.replace(Some(Some("f133e35e")));
+        assert!(for_program(SHADOW, site_pairs_here));
+        assert!(!for_program(A, site_pairs_here));
+        assert!(!site_pairs_here(), "outside a program's translation");
+        TEST_SITE_PAIRS.set(was);
     }
 
     #[test]

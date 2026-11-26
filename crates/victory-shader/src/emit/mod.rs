@@ -122,11 +122,11 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use per_program::{
     MASK_COPIES_RETRY_ON, MaskCopies, deep_skips_allowed, for_program, mask_copies, mask_copies_retried, shader_opt_allowed,
-    dropped_stores, wave64_program, wave64_retried, with_mask_copies,
+    dropped_stores, site_pairs_allowed, wave64_program, wave64_retried, with_mask_copies,
 };
-pub(crate) use per_program::{current as program_hash, mask_copies_here, store_dropped_here};
+pub(crate) use per_program::{current as program_hash, mask_copies_here, site_pairs_here, store_dropped_here};
 #[cfg(test)]
-pub(crate) use per_program::TEST_MASK_COPIES;
+pub(crate) use per_program::{TEST_MASK_COPIES, TEST_SITE_PAIRS};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_MARKS, MEMORY_NOTES, MEMORY_PAGE_MARKS, MEMORY_PAGES, MEMORY_TOUCHED, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY,

@@ -3836,10 +3836,12 @@ fn describe(view: Option<&View>) -> String {
         None => "no view".into(),
         Some(v @ View::Shader(r, _)) => texture(*r as This)
             .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
-        Some(v @ View::Unordered(r, ..)) => match texture(*r as This) {
-            Some(t) => format!("uav texture {t}"),
+        // (with the title's view description: a typed view's DXGI format first, then
+        // dimension, first element, element count, stride, counter offset, flags)
+        Some(v @ View::Unordered(r, _, desc)) => match texture(*r as This) {
+            Some(t) => format!("uav texture {t} view {desc:?}"),
             None => format!(
-                "uav resource {r:#x} buffer {:?}",
+                "uav resource {r:#x} buffer {:?} view {desc:?}",
                 crate::descriptor::host::buffer_range(v)
             ),
         },

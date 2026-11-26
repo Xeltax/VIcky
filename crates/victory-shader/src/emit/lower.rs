@@ -348,6 +348,19 @@ pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read
 /// A lane mask read as a number in a block not every lane of a console wave run as two host
 /// waves runs, so the halves cannot exchange their ballots there.
 pub(super) const MASK_EXCHANGED: Why = "a lane mask exchanged where not every lane runs";
+/// A typed buffer access whose byte offset (an soffset, a built descriptor's base) is not
+/// known to be 0, with `VICTORY_TYPED_OFFSET=refuse` ([`typed_offset_refused`]).
+pub(super) const TYPED_OFFSET: Why = "a typed buffer access at an offset (VICTORY_TYPED_OFFSET=refuse)";
+
+/// `VICTORY_TYPED_OFFSET=refuse` (opt-in): a typed buffer load or store whose soffset or
+/// built descriptor base is not known to be 0 is refused instead of going to element `index`
+/// from the view's start (the offset left out). The offset cannot be folded into the index
+/// here: the element's size is the view's format's, which the host chooses from the title's
+/// view and a translated program does not see. Part of the build key (a global switch).
+fn typed_offset_refused() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TYPED_OFFSET").is_some_and(|v| v == "refuse"))
+}
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
@@ -10813,6 +10826,13 @@ impl<'a> Lower<'a> {
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
+                // shortcut: an SGPR or constant soffset, or a built descriptor's base, is
+                // left out: the store goes to element `index` from the view's start.
+                // `VICTORY_TYPED_OFFSET=refuse` refuses it (RVZO6, VIctory #3009).
+                let zero = self.s.m.i32(0);
+                if typed_offset_refused() && off != zero {
+                    return Err(TYPED_OFFSET);
+                }
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
@@ -10870,6 +10890,11 @@ impl<'a> Lower<'a> {
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
+            }
+            // (a constant soffset or base is left out likewise; refused with the switch)
+            let zero = self.s.m.i32(0);
+            if typed_offset_refused() && off != zero {
+                return Err(TYPED_OFFSET);
             }
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
