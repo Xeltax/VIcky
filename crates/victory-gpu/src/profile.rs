@@ -10,7 +10,9 @@
 //!   themselves by what they call ([`seen`]: [`crate::host::Host`]'s
 //!   submissions, the list calls);
 //! * our workers, by the names we start them with (`victory-pipelines-N`,
-//!   `victory-wide-N`, `victory-late-wait`) and the title's main thread;
+//!   `victory-wide-N`, `victory-late-wait`; VIcky's `victory-relay`,
+//!   `victory-heap-pass` and `victory-heap-pass-N`, `victory-heap-sync`,
+//!   `victory-heap`) and the title's main thread;
 //! * the busiest of the other threads (the title's own).
 //!
 //! A look ([`Sampler::capture`]) suspends the thread, reads its registers
@@ -224,17 +226,28 @@ pub(crate) enum Role {
     Submit,
     Record,
     Late,
+    Relay,
+    HeapPass,
+    HeapSync,
+    HeapWorker,
     Wide,
     Pipelines,
     TitleMain,
     Busy,
 }
 
+/// How many [`Role`]s there are.
+const ROLES: usize = 11;
+
 impl Role {
-    const ALL: [Role; 7] = [
+    const ALL: [Role; ROLES] = [
         Role::Submit,
         Role::Record,
         Role::Late,
+        Role::Relay,
+        Role::HeapPass,
+        Role::HeapSync,
+        Role::HeapWorker,
         Role::Wide,
         Role::Pipelines,
         Role::TitleMain,
@@ -247,6 +260,10 @@ impl Role {
             Role::Submit => "submit",
             Role::Record => "record",
             Role::Late => "late-wait",
+            Role::Relay => "relay",
+            Role::HeapPass => "heap-pass",
+            Role::HeapSync => "heap-sync",
+            Role::HeapWorker => "heap-worker",
             Role::Wide => "wide",
             Role::Pipelines => "pipelines",
             Role::TitleMain => "title-main",
@@ -259,6 +276,10 @@ impl Role {
             Role::Submit => "SUBMITTING (threads that send lists to the card: Host::submit)",
             Role::Record => "RECORDING (threads that make list calls and do not submit)",
             Role::Late => "LATE WAIT (victory-late-wait: settles submissions sent ahead)",
+            Role::Relay => "RELAY (victory-relay: lands flights, copies back what shaders wrote)",
+            Role::HeapPass => "HEAP PASS (victory-heap-pass, victory-heap-pass-N: the pass over buffer views beside)",
+            Role::HeapSync => "HEAP SYNC (victory-heap-sync: the heap sync beside the refreshes)",
+            Role::HeapWorker => "HEAP WORKER (victory-heap: textures picked by index, uploaded ahead)",
             Role::Wide => "WIDE WORKERS (victory-wide-N: copies and compares of title memory)",
             Role::Pipelines => "PIPELINE WORKERS (victory-pipelines-N)",
             Role::TitleMain => "TITLE MAIN (title-main)",
@@ -274,6 +295,14 @@ impl Role {
             Some(Role::Wide)
         } else if name == "victory-late-wait" {
             Some(Role::Late)
+        } else if name == "victory-relay" {
+            Some(Role::Relay)
+        } else if name == "victory-heap-pass" || name.starts_with("victory-heap-pass-") {
+            Some(Role::HeapPass)
+        } else if name == "victory-heap-sync" {
+            Some(Role::HeapSync)
+        } else if name == "victory-heap" {
+            Some(Role::HeapWorker)
         } else if name == "title-main" {
             Some(Role::TitleMain)
         } else {
@@ -301,10 +330,14 @@ struct Config {
     /// Bytes copied of a stack at most.
     stack: usize,
     /// Threads followed at most, and of those the busy ones with no role.
+    /// VIcky: 32 (was 24): with 28 logical processors the roles named
+    /// before took 23 (6 wide, 8 pipeline workers), and the helper threads
+    /// named since (relay, heap pass and sync, heap worker) would find no
+    /// place.
     most: usize,
     busy: usize,
     /// The roles followed, by `Role as usize`.
-    roles: [bool; 7],
+    roles: [bool; ROLES],
     /// Whether calls the compiler inlined are shown as frames of their own.
     inline: bool,
     /// Whether a thread that used no cycles since the last look is taken
@@ -333,9 +366,9 @@ impl Config {
             length: None,
             depth: 48,
             stack: 128 << 10,
-            most: 24,
+            most: 32,
             busy: 6,
-            roles: [true; 7],
+            roles: [true; ROLES],
             inline: true,
             reuse: true,
             budget: 0.03,

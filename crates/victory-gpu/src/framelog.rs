@@ -16,9 +16,20 @@
 //! On by default in diagnostics builds, off in others;
 //! `VICTORY_FRAME_LOG=1` or `0` says otherwise. The counters themselves
 //! are plain atomic adds in every build.
+//!
+//! VIcky: the title's turn. The frame is a loop through our submitting
+//! thread and the title's own work between two presents, and only the
+//! first was measured. Each frame also gives, from the return of the
+//! present before to this one's call: the time to the title's first
+//! submit call (`queue::execute`, the first hand-over of the frame's
+//! lists), from that call to the return of the last one (the burst), and
+//! from there to the present call; and the list-call time of the one
+//! recording thread that made the most of them (the frame line has only
+//! their sum). A line after the usual frame's gives their mean
+//! ([`turn_text`]); a long frame's line ends with its own.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 /// Totals since the start (microseconds unless said otherwise).
 #[derive(Clone, Copy)]
@@ -144,6 +155,118 @@ pub fn here(h: H, n: u64) {
         v[h as usize] += n;
         c.set(v);
     });
+}
+
+/// VIcky: microseconds since the first look, plus one (0 is "none").
+fn turn_us(at: std::time::Instant) -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    at.saturating_duration_since(*EPOCH.get_or_init(std::time::Instant::now)).as_micros() as u64 + 1
+}
+
+/// The frame's hand-overs so far ([`turn_us`]): the earliest call, the
+/// latest return (`u64::MAX` and 0 while there is none), how many; when the
+/// present was called, and whether the title is inside it now.
+static FIRST_HANDOVER: AtomicU64 = AtomicU64::new(u64::MAX);
+static LAST_HANDOVER: AtomicU64 = AtomicU64::new(0);
+static HANDOVERS: AtomicU64 = AtomicU64::new(0);
+static PRESENT_CALLED: AtomicU64 = AtomicU64::new(0);
+static PRESENTING: AtomicBool = AtomicBool::new(false);
+
+/// The title's submit call that began at `started` returns. One made while
+/// the title is inside its present (by another of its threads) is not the
+/// next frame's hand-over and is left out.
+pub fn handed_over(started: std::time::Instant) {
+    if !on() || PRESENTING.load(Relaxed) {
+        return;
+    }
+    FIRST_HANDOVER.fetch_min(turn_us(started), Relaxed);
+    LAST_HANDOVER.fetch_max(turn_us(std::time::Instant::now()), Relaxed);
+    HANDOVERS.fetch_add(1, Relaxed);
+}
+
+/// The title calls its present (`frame` is called when it returns).
+pub fn present_called() {
+    if !on() {
+        return;
+    }
+    PRESENT_CALLED.store(turn_us(std::time::Instant::now()), Relaxed);
+    PRESENTING.store(true, Relaxed);
+}
+
+/// Frames ended so far ([`frame`]), for the list-call time of each thread
+/// by frame: the low 16 bits tag [`LONGEST`].
+static FRAME_NUMBER: AtomicU64 = AtomicU64::new(0);
+/// The most list-call time of one thread in the frame: the frame's tag in
+/// the top 16 bits, nanoseconds below.
+static LONGEST: AtomicU64 = AtomicU64::new(0);
+const LONGEST_NS: u64 = (1 << 48) - 1;
+
+thread_local! {
+    /// This thread's list calls in a frame: the frame's tag, nanoseconds.
+    static MINE: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// A list call of `ns` nanoseconds returned on this thread (diagnostics
+/// builds, `crate::copystat::recorded`).
+pub fn recorded_here(ns: u64) {
+    if !on() {
+        return;
+    }
+    let frame = FRAME_NUMBER.load(Relaxed) & 0xFFFF;
+    let mine = MINE.with(|m| {
+        let (tag, so_far) = m.get();
+        let mine = if tag == frame { so_far + ns } else { ns };
+        m.set((frame, mine));
+        mine.min(LONGEST_NS)
+    });
+    let _ = LONGEST.fetch_update(Relaxed, Relaxed, |old| {
+        let (tag, most) = (old >> 48, old & LONGEST_NS);
+        // A thread still counting a frame that has ended changes nothing.
+        let newer = frame.wrapping_sub(tag) & 0xFFFF;
+        ((newer != 0 && newer < 0x8000) || (newer == 0 && mine > most)).then_some(frame << 48 | mine)
+    });
+}
+
+/// The title's turn in a frame (microseconds; list calls in nanoseconds).
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum W {
+    /// From the present before's return to this present's call, and of it:
+    /// to the first hand-over's call, from there to the last one's return,
+    /// from there to the present call. A frame with no hand-over has all
+    /// of it in the first.
+    TurnUs,
+    ToFirstUs,
+    BurstUs,
+    ToPresentUs,
+    /// Submit calls in the burst.
+    Handovers,
+    /// The one thread with the most list-call time, its nanoseconds.
+    LongestRecordNs,
+    Count,
+}
+
+const WN: usize = W::Count as usize;
+
+/// The frame's turn, the present before having returned at `returned`;
+/// the hand-overs are taken.
+fn turn(returned: std::time::Instant, longest_ns: u64) -> [f64; WN] {
+    let first = FIRST_HANDOVER.swap(u64::MAX, Relaxed);
+    let last = LAST_HANDOVER.swap(0, Relaxed);
+    let n = HANDOVERS.swap(0, Relaxed);
+    let (from, to) = (turn_us(returned), PRESENT_CALLED.load(Relaxed));
+    let mut w = [0.0; WN];
+    w[W::TurnUs as usize] = to.saturating_sub(from) as f64;
+    w[W::Handovers as usize] = n as f64;
+    w[W::LongestRecordNs as usize] = longest_ns as f64;
+    if n == 0 || first == u64::MAX {
+        w[W::ToFirstUs as usize] = w[W::TurnUs as usize];
+        return w;
+    }
+    w[W::ToFirstUs as usize] = first.saturating_sub(from) as f64;
+    w[W::BurstUs as usize] = last.saturating_sub(first) as f64;
+    w[W::ToPresentUs as usize] = to.saturating_sub(last) as f64;
+    w
 }
 
 /// Whether the processor this thread runs on right now is a slow one: on a
@@ -364,7 +487,8 @@ fn sample() -> [u64; S] {
 
 /// One frame: its number, when it ended (seconds since the first), its
 /// length in microseconds, and the differences of the totals, the sampled
-/// values and the presenting thread's own counts over it.
+/// values and the presenting thread's own counts over it; and the title's
+/// turn in it.
 #[derive(Clone)]
 struct Frame {
     number: u64,
@@ -373,6 +497,7 @@ struct Frame {
     t: [f64; N],
     s: [f64; S],
     h: [f64; HN],
+    w: [f64; WN],
 }
 
 struct State {
@@ -476,10 +601,26 @@ fn text(f: &Frame) -> String {
     )
 }
 
+/// A frame's turn as text (`f` may be a mean of frames).
+fn turn_text(f: &Frame) -> String {
+    let ms = |x: W| f.w[x as usize] / 1e3;
+    format!(
+        "{:.1} ms (present return -> first hand-over {:.1}, burst {:.1} in {:.1} submit calls, last hand-over -> present \
+         {:.1}); longest recording thread {:.1} ms (all threads {:.1})",
+        ms(W::TurnUs),
+        ms(W::ToFirstUs),
+        ms(W::BurstUs),
+        f.w[W::Handovers as usize],
+        ms(W::ToPresentUs),
+        f.w[W::LongestRecordNs as usize] / 1e6,
+        f.t[T::RecordNs as usize] / 1e6,
+    )
+}
+
 /// The mean of `frames` (not empty).
 fn mean(frames: &[&Frame]) -> Frame {
     let n = frames.len() as f64;
-    let mut out = Frame { number: 0, at: 0.0, us: 0.0, t: [0.0; N], s: [0.0; S], h: [0.0; HN] };
+    let mut out = Frame { number: 0, at: 0.0, us: 0.0, t: [0.0; N], s: [0.0; S], h: [0.0; HN], w: [0.0; WN] };
     for f in frames {
         out.us += f.us / n;
         for i in 0..N {
@@ -490,6 +631,9 @@ fn mean(frames: &[&Frame]) -> Frame {
         }
         for i in 0..HN {
             out.h[i] += f.h[i] / n;
+        }
+        for i in 0..WN {
+            out.w[i] += f.w[i] / n;
         }
     }
     out
@@ -521,10 +665,12 @@ fn lines(frames: &[Frame], usual: f64, seconds: f64) -> Vec<String> {
         each.join(" ")
     )];
     if !plain.is_empty() {
-        out.push(format!("usual frame (the mean of {} not long): {}", plain.len(), text(&mean(&plain))));
+        let usual = mean(&plain);
+        out.push(format!("usual frame (the mean of {} not long): {}", plain.len(), text(&usual)));
+        out.push(format!("title's turn (the mean of {} not long): {}", plain.len(), turn_text(&usual)));
     }
     for f in long.iter().take(LONG_MOST) {
-        out.push(format!("long frame {} at {:.1} s: {}", f.number, f.at, text(f)));
+        out.push(format!("long frame {} at {:.1} s: {} | title's turn: {}", f.number, f.at, text(f), turn_text(f)));
     }
     if long.len() > LONG_MOST {
         out.push(format!("long frames: {} more in this reading are not listed", long.len() - LONG_MOST));
@@ -552,6 +698,11 @@ pub fn frame() {
     let totals: [u64; N] = std::array::from_fn(|i| TOTAL[i].load(Relaxed));
     let sampled = sample();
     let here = HERE.with(|c| c.replace([0; HN]));
+    // The frame's longest recording thread; list calls from here on count
+    // for the next one.
+    let ended = FRAME_NUMBER.fetch_add(1, Relaxed) & 0xFFFF;
+    let longest = LONGEST.load(Relaxed);
+    let longest_ns = if longest >> 48 == ended { longest & LONGEST_NS } else { 0 };
     // SAFETY: a plain query.
     let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -564,7 +715,11 @@ pub fn frame() {
         recent: std::collections::VecDeque::new(),
     });
     state.number += 1;
-    if let Some((then, t0, s0, thread0)) = state.last.replace((now, totals, sampled, thread)) {
+    let last = state.last.replace((now, totals, sampled, thread));
+    // The hand-overs are taken at every frame, the first one's too.
+    let w = turn(last.as_ref().map_or(now, |l| l.0), longest_ns);
+    PRESENTING.store(false, Relaxed);
+    if let Some((then, t0, s0, thread0)) = last {
         let mut f = Frame {
             number: state.number,
             at: (now - state.first).as_secs_f64(),
@@ -572,6 +727,7 @@ pub fn frame() {
             t: std::array::from_fn(|i| totals[i].wrapping_sub(t0[i]) as i64 as f64),
             s: std::array::from_fn(|i| sampled[i].wrapping_sub(s0[i]) as i64 as f64),
             h: here.map(|v| v as f64),
+            w,
         };
         f.s[S_FREE_MB] = sampled[S_FREE_MB] as f64;
         if thread != thread0 {
@@ -605,9 +761,11 @@ mod tests {
     use super::*;
 
     fn frame(number: u64, ms: f64) -> Frame {
-        let mut f = Frame { number, at: number as f64, us: ms * 1e3, t: [0.0; N], s: [0.0; S], h: [0.0; HN] };
+        let mut f = Frame { number, at: number as f64, us: ms * 1e3, t: [0.0; N], s: [0.0; S], h: [0.0; HN], w: [0.0; WN] };
         f.t[T::PresentUs as usize] = ms * 100.0;
         f.t[T::Uploads as usize] = ms;
+        f.w[W::TurnUs as usize] = ms * 100.0;
+        f.w[W::BurstUs as usize] = ms * 10.0;
         f
     }
 
@@ -615,16 +773,42 @@ mod tests {
     fn a_long_frame_is_listed_beside_the_usual_one() {
         let frames: Vec<Frame> = [150.0, 160.0, 140.0, 400.0, 150.0].iter().enumerate().map(|(i, &ms)| frame(i as u64, ms)).collect();
         let out = lines(&frames, 150_000.0, 1.0);
-        assert_eq!(out.len(), 3, "{out:#?}");
+        assert_eq!(out.len(), 4, "{out:#?}");
         assert!(out[0].starts_with("frame times: 5 frames in 1.0 s: shortest 140 ms, median 150, longest 400; 1 long (over 225 ms"), "{}", out[0]);
         assert!(out[0].ends_with("each: 150 160 140 400 150"), "{}", out[0]);
         // The usual frame is the mean of the four that are not long.
         assert!(out[1].starts_with("usual frame (the mean of 4 not long): 150 ms |"), "{}", out[1]);
         assert!(out[1].contains("in the present call 15.0 "), "{}", out[1]);
         assert!(out[1].contains(" 150 uploads"), "{}", out[1]);
-        assert!(out[2].starts_with("long frame 3 at 3.0 s: 400 ms |"), "{}", out[2]);
-        assert!(out[2].contains("in the present call 40.0 "), "{}", out[2]);
-        assert!(out[2].contains(" 400 uploads"), "{}", out[2]);
+        // The title's turn of the same frames.
+        assert!(out[2].starts_with("title's turn (the mean of 4 not long): 15.0 ms (present return -> first hand-over 0.0, burst 1.5 in"), "{}", out[2]);
+        assert!(out[3].starts_with("long frame 3 at 3.0 s: 400 ms |"), "{}", out[3]);
+        assert!(out[3].contains("in the present call 40.0 "), "{}", out[3]);
+        assert!(out[3].contains(" 400 uploads"), "{}", out[3]);
+        assert!(out[3].contains("| title's turn: 40.0 ms (present return -> first hand-over 0.0, burst 4.0 in"), "{}", out[3]);
+    }
+
+    /// The turn's parts: to the first hand-over, the burst, to the present.
+    #[test]
+    fn a_turn_is_cut_at_the_first_and_last_hand_overs() {
+        // (The clock's start, before the times the test gives.)
+        let _ = turn_us(std::time::Instant::now());
+        let returned = std::time::Instant::now();
+        let at = |ms: u64| returned + std::time::Duration::from_millis(ms);
+        // (Taken as `turn` takes them; the test sets them as the hooks do.)
+        FIRST_HANDOVER.store(turn_us(at(30)), Relaxed);
+        LAST_HANDOVER.store(turn_us(at(45)), Relaxed);
+        HANDOVERS.store(9, Relaxed);
+        PRESENT_CALLED.store(turn_us(at(50)), Relaxed);
+        let near = |w: &[f64; WN], x: W, ms: f64| (w[x as usize] / 1e3 - ms).abs() < 0.01;
+        let w = turn(returned, 7_000_000);
+        assert!(near(&w, W::TurnUs, 50.0) && near(&w, W::ToFirstUs, 30.0) && near(&w, W::BurstUs, 15.0) && near(&w, W::ToPresentUs, 5.0), "{w:?}");
+        assert_eq!(w[W::Handovers as usize], 9.0);
+        assert_eq!(w[W::LongestRecordNs as usize], 7e6);
+        // Taken: a frame without hand-overs has its whole turn before the first.
+        PRESENT_CALLED.store(turn_us(at(20)), Relaxed);
+        let w = turn(returned, 0);
+        assert!(near(&w, W::TurnUs, 20.0) && near(&w, W::ToFirstUs, 20.0) && near(&w, W::BurstUs, 0.0), "{w:?}");
     }
 
     #[test]

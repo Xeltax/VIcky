@@ -1104,6 +1104,7 @@ pub(crate) fn recorded(started: std::time::Instant) {
     crate::framelog::add(crate::framelog::T::RecordCalls, 1);
     crate::framelog::add(crate::framelog::T::RecordNs, ns);
     crate::framelog::here(crate::framelog::H::RecordNs, ns);
+    crate::framelog::recorded_here(ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
