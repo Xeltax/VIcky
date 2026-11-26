@@ -2184,6 +2184,13 @@ static LINE_LANDED: std::sync::Condvar = std::sync::Condvar::new();
 /// later one.
 static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 
+/// [`QUEUE_ORDER`] now: the number of the last send of changed ranges to
+/// copies in the card's memory; the next `Host::card_before` takes the
+/// number after it.
+pub(crate) fn queue_order() -> u64 {
+    *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Since the last frame-rate line, of the thread that lands flights
 /// ([`relay`]): landings, flights landed, microseconds it waited for the
 /// card with nothing to land, microseconds it waited for fetches of card
@@ -2297,11 +2304,17 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(us
 /// did not compare) are noted on their copies as written by shaders in
 /// this frame (`Shadow::card_flagged`, kept with
 /// `crate::shadow::dense_tracked`).
-fn card_flags_noted(plans: &[(u64, &CardPlan)]) {
-    let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(work) = work.as_ref() else {
-        return;
+///
+/// With `crate::shadow::dense_whole`: those the card did compare and
+/// found changed, each once, with its plan's send, for the look whether a
+/// page sent up whole went over them (`crate::shadow::whole_overwritten`).
+fn card_flags_noted(plans: &[(u64, &CardPlan)]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, u32, u64)> {
+    let mut compared = Vec::new();
+    let guard = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(work) = guard.as_ref() else {
+        return compared;
     };
+    let whole = crate::shadow::dense_whole().is_some();
     // SAFETY: the mapping of the results. The compares of these plans have
     // run, and their dwords are given to no other plan before these are
     // done with (`card_done`).
@@ -2309,12 +2322,21 @@ fn card_flags_noted(plans: &[(u64, &CardPlan)]) {
     for (_, plan) in plans {
         for r in &plan.ranges {
             for p in 0..r.span.pieces {
-                if !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| d != 0) {
+                let flag = differs.get((r.at + p) as usize).is_none_or(|&d| d != 0);
+                if !r.compared || flag {
                     r.shadow.card_flagged(r.span.first + p);
+                }
+                if whole && r.compared && flag {
+                    compared.push((r.shadow.clone(), r.span.first + p, plan.sent_as));
                 }
             }
         }
     }
+    drop(guard);
+    // A piece under two ranges of a plan, once.
+    compared.sort_unstable_by_key(|c| (std::sync::Arc::as_ptr(&c.0) as usize, c.1, c.2));
+    compared.dedup_by_key(|c| (std::sync::Arc::as_ptr(&c.0) as usize, c.1, c.2));
+    compared
 }
 
 /// Whether pieces fetched on a copy queue beside later flights are fetched
@@ -3110,7 +3132,19 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         let mut runs_left = *RUNS.get_or_init(|| {
             std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(512, |n| n.clamp(1, 1 << 16))
         });
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        // VIcky (`crate::shadow::dense_whole`): the pages left to go up
+        // whole go up only if nothing settles the flights.
+        let mut whole: Vec<(Arc<crate::shadow::Shadow>, Vec<crate::shadow::WholePage>)> = Vec::new();
+        let settle = spans.iter().any(|(shadow, from, to)| {
+            let mut pages = Vec::new();
+            let settle = shadow.merge_under_writes(*from, *to - *from, &mut runs_left, &mut pages);
+            if !pages.is_empty() {
+                whole.push((shadow.clone(), pages));
+            }
+            settle
+        });
+        crate::shadow::whole_pages_done(whole, settle);
+        return settle;
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
 }
@@ -3611,11 +3645,32 @@ fn late_line(frames: f64) {
         } else {
             String::new()
         };
+        // VIcky (`crate::shadow::dense_whole`): only with the switch.
+        let dense = match crate::shadow::dense_whole() {
+            Some(quiet) => {
+                let d = crate::shadow::dense_stats();
+                let f = |i: usize| d[i] as f64 / frames;
+                format!(
+                    "; pages over the runs left sent up whole (VICTORY_DENSE_PAGE_WHOLE, their piece not flagged by the compare for {quiet} \
+                     frames): {:.1} pages ({:.2} MB), settles avoided {:.2}, pages found but settled all the same {:.2}, pages left to \
+                     settle as their piece was flagged lately {:.2}; whole pages a flight in the air then wrote (must be about 0) {:.2}, \
+                     {} since the start",
+                    f(0),
+                    f(1) / (1 << 20) as f64,
+                    f(2),
+                    f(3),
+                    f(4),
+                    f(5),
+                    d[6],
+                )
+            }
+            None => String::new(),
+        };
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB; settles it asked for (\"title memory changed under shader writes\"), by why: \
              memory not write-watched {unwatched:.2}, the journal could not say {journal:.2}, a PC copy without a snapshot {no_snapshot:.2}, \
-             a card copy's page over the runs left (VICTORY_MERGE_RUNS) {over:.2}, wanting {:.0} runs with {:.0} left each time{put_up}",
+             a card copy's page over the runs left (VICTORY_MERGE_RUNS) {over:.2}, wanting {:.0} runs with {:.0} left each time{put_up}{dense}",
             bytes / (1 << 20) as f64,
             per_trip(wanted),
             per_trip(left),
@@ -4998,10 +5053,12 @@ impl Host {
                 let plans: Vec<(u64, &CardPlan)> = flights.iter().filter_map(|f| f.card.as_ref().map(|card| (f.number, card))).collect();
                 let behind = flights.iter().map(|f| f.fence).max().unwrap_or(0);
                 let landed = flights.iter().map(|f| f.number).max().unwrap_or(0);
-                if crate::shadow::dense_tracked() {
-                    card_flags_noted(&plans);
-                }
+                let flagged = if crate::shadow::dense_tracked() { card_flags_noted(&plans) } else { Vec::new() };
                 self.relay_card_back(&plans, fetch, behind, landed);
+                // VIcky (`crate::shadow::dense_whole`): after the merges.
+                if !flagged.is_empty() {
+                    crate::shadow::whole_overwritten(&flagged);
+                }
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {

@@ -236,8 +236,9 @@ fn overlapping_in(ranges: &[(usize, usize)], from: usize, to: usize, out: &mut V
 
 /// Per 64 KiB piece of a copy in the card's memory (cut as the compare
 /// cuts it, [`pieces_of`]): the last frame a landing found the piece
-/// flagged by its flight's compare, i.e. written by shaders. Empty unless
-/// kept ([`dense_tracked`]).
+/// flagged by its flight's compare, i.e. written by shaders, and the last
+/// send that took it up whole ([`dense_whole`]). Empty unless kept
+/// ([`dense_tracked`]).
 #[derive(Default)]
 struct Dense {
     /// The frame the copy was made in.
@@ -245,6 +246,10 @@ struct Dense {
     /// Per piece: 1 + the frame of the last landing whose compare flagged
     /// it (a range without a compare counts as flagged whole); 0: never.
     flagged: Box<[AtomicU64]>,
+    /// With [`dense_whole`], per piece: the number of the last send
+    /// (`crate::host`'s order of the queue) that took a page of it up
+    /// whole ([`whole_pages_done`]); 0: none.
+    whole: Box<[AtomicU64]>,
 }
 
 impl Dense {
@@ -255,16 +260,17 @@ impl Dense {
             return Dense::default();
         }
         let pieces = (size / PIECE as u64 + 2) as usize;
+        let zeros = |n: usize| (0..n).map(|_| AtomicU64::new(0)).collect();
         Dense {
             made: crate::frame::current(),
-            flagged: (0..pieces).map(|_| AtomicU64::new(0)).collect(),
+            flagged: zeros(pieces),
+            whole: zeros(if dense_whole().is_some() { pieces } else { 0 }),
         }
     }
 
     /// How many frames before `frame` the piece was last flagged, and
     /// whether it ever was (if not: the frames since the copy was made).
     /// `None` if not kept.
-    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     fn flagged_ago(&self, piece: usize, frame: u64) -> Option<(u64, bool)> {
         let at = self.flagged.get(piece)?.load(Ordering::Relaxed);
         Some(match at {
@@ -276,9 +282,147 @@ impl Dense {
 
 /// Whether the copies in the card's memory keep what their compares said
 /// of each piece ([`Dense`]): in the diagnostics build, for the line that
-/// names a page over the runs left.
+/// names a page over the runs left, and with [`dense_whole`].
 pub(crate) fn dense_tracked() -> bool {
-    cfg!(feature = "diagnostics")
+    cfg!(feature = "diagnostics") || dense_whole().is_some()
+}
+
+/// VIcky: whether a page of a copy in the card's memory with more changed
+/// runs than are left (`VICTORY_MERGE_RUNS`), while flights that may write
+/// it are in the air, goes up whole instead of settling those flights, if
+/// the card's compare has not found its piece written by shaders for this
+/// many frames (`VICTORY_DENSE_PAGE_WHOLE=1`, off by default;
+/// `VICTORY_DENSE_PAGE_WHOLE_FRAMES`, 64). With the relay only: the flags
+/// come from its landings ([`Dense`]), and the sends are numbered there.
+///
+/// RT66d and RT68: a frame bound by the submitting thread settled the
+/// flights 1.4 to 2.0 times a frame (50-67 ms of waiting) for pages of a
+/// big card copy that the title rewrites as a dense table of small records,
+/// a run every 7 to 11 bytes (6,000 to 10,800 runs on one 64 KiB page),
+/// whatever the cap. Under the cap each run is a copy of its own; whole,
+/// such a page is one copy of up to 64 KiB and one note
+/// ([`Shadow::card_put_whole`]), with the semantics the runs have: queued
+/// behind the flights in the air and ahead of the next lists, the title's
+/// bytes winning over what those flights write there.
+///
+/// What it gives up: a whole page takes the title's bytes everywhere in it,
+/// also where a flight still in the air has its shaders write a byte the
+/// title did not change (the runs leave such bytes alone). The page's piece
+/// was not flagged for that many frames, so no shader wrote it in that
+/// time; a flight that does all the same loses those writes, once, and its
+/// landing counts it ([`whole_overwritten`]: must stay about 0), after
+/// which the piece is flagged and takes the runs (or the settle) again.
+/// A shader write the lists do not declare is not compared, and a whole
+/// page goes over it unseen.
+pub(crate) fn dense_whole() -> Option<u64> {
+    static ON: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_DENSE_PAGE_WHOLE").is_ok_and(|v| v.trim() == "1");
+        let frames = std::env::var("VICTORY_DENSE_PAGE_WHOLE_FRAMES").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64);
+        (on && crate::host::relay()).then_some(frames)
+    })
+}
+
+/// A page [`Shadow::merge_under_writes`] found over the runs left whose
+/// piece the card's compare has not flagged lately ([`dense_whole`]): it
+/// goes up whole if nothing else settles the flights
+/// ([`whole_pages_done`]).
+pub(crate) struct WholePage {
+    /// Title memory `[lo, hi)`: the page's part in the declared range.
+    lo: usize,
+    hi: usize,
+    /// The page's number (title address / `PAGE`).
+    page: usize,
+    /// The write-watch asking that found it written.
+    now: u64,
+    /// The range holds all of the page that is in the copy: once up, the
+    /// page is noted as taken at `now`.
+    all: bool,
+}
+
+/// [`dense_whole`], since the last frame-rate line: pages sent up whole and
+/// their bytes; submissions that settled for none of their pages thanks to
+/// them; pages found but not sent because the flights were settled all the
+/// same (another page, another cause); pages over the runs left that
+/// settled because their piece was flagged lately; and whole pages a flight
+/// in the air then turned out to write ([`whole_overwritten`]).
+static DENSE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+const DENSE_PAGES: usize = 0;
+const DENSE_BYTES: usize = 1;
+const DENSE_AVOIDED: usize = 2;
+const DENSE_DROPPED: usize = 3;
+const DENSE_LOUD: usize = 4;
+const DENSE_OVERWRITTEN: usize = 5;
+
+/// [`DENSE`]'s last count, since the start.
+static DENSE_OVERWRITTEN_ALL: AtomicU64 = AtomicU64::new(0);
+
+/// [`DENSE`], taken; then whole pages a flight then wrote, since the start.
+pub(crate) fn dense_stats() -> [u64; 7] {
+    let mut out = [0u64; 7];
+    for (i, n) in DENSE.iter().enumerate() {
+        out[i] = n.swap(0, Ordering::Relaxed);
+    }
+    out[6] = DENSE_OVERWRITTEN_ALL.load(Ordering::Relaxed);
+    out
+}
+
+/// After `crate::host`'s look for title bytes under flights' shader writes
+/// (`stale_under_flights`): the pages [`Shadow::merge_under_writes`] left
+/// to go up whole (per copy) go up now, unless the flights are `settled`
+/// all the same (then the refresh takes them as any page, nothing being in
+/// the air).
+pub(crate) fn whole_pages_done(pages: Vec<(Arc<Shadow>, Vec<WholePage>)>, settled: bool) {
+    if pages.is_empty() {
+        return;
+    }
+    if settled {
+        DENSE[DENSE_DROPPED].fetch_add(pages.iter().map(|p| p.1.len() as u64).sum(), Ordering::Relaxed);
+        return;
+    }
+    // The send that takes them: the next one (`Host::card_before`, later
+    // in this submission, under the same submission lock).
+    let order = crate::host::queue_order() + 1;
+    let sent: u64 = pages.into_iter().map(|(shadow, pages)| shadow.card_put_whole(pages, order)).sum();
+    if sent > 0 {
+        DENSE[DENSE_AVOIDED].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// As flights land (`crate::host`, after their merges): `flagged` are the
+/// pieces their compares flagged, each with its flight's send. A piece a
+/// later send took up whole ([`whole_pages_done`]) was written by shaders
+/// of a flight in the air then, and the whole page went over those writes:
+/// counted and said (the first 16, then one in 256). An upper bound: the
+/// flag may be for bytes of the piece outside the part sent whole, or the
+/// flight's merge may have run before the page went up (it then read the
+/// merged bytes). Returns how many.
+pub(crate) fn whole_overwritten(flagged: &[(Arc<Shadow>, u32, u64)]) -> u64 {
+    let mut found = 0;
+    for (shadow, piece, flight) in flagged {
+        let Some(at) = shadow.card.as_ref().and_then(|c| c.dense.whole.get(*piece as usize)) else {
+            continue;
+        };
+        let whole = at.load(Ordering::Relaxed);
+        if whole <= *flight {
+            continue;
+        }
+        found += 1;
+        DENSE[DENSE_OVERWRITTEN].fetch_add(1, Ordering::Relaxed);
+        let n = DENSE_OVERWRITTEN_ALL.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n.is_multiple_of(256) {
+            tracing::warn!(
+                "a page sent up whole (VICTORY_DENSE_PAGE_WHOLE) was written by shaders of a flight in the air: copy {} at {:#x}+{:#x}, \
+                 piece {piece} (title {:#x}), the flight's send {flight}, the page went up with send {whole}; {n} since the start (the \
+                 first 16, then one in 256)",
+                shadow.id,
+                shadow.start,
+                shadow.len,
+                (shadow.start as usize / PIECE + *piece as usize) * PIECE,
+            );
+        }
+    }
+    found
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -4162,7 +4306,13 @@ impl Shadow {
     /// Whether the caller must still settle the flights: the journal
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
-    pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+    ///
+    /// VIcky ([`dense_whole`]): a page of a copy in the card's memory with
+    /// more runs than are left, whose piece the card's compare has not
+    /// flagged lately, goes onto `whole` instead (it takes one run of what
+    /// is left), for the caller to put up whole if nothing settles the
+    /// flights ([`whole_pages_done`]). Empty without the switch.
+    pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize, whole: &mut Vec<WholePage>) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -4230,6 +4380,18 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = under_runs(title, held);
                     if runs.len() > *runs_left {
+                        // VIcky (`VICTORY_DENSE_PAGE_WHOLE`): whole, if no
+                        // shader wrote the piece lately. Put in, and taken,
+                        // by the caller once nothing settles the flights.
+                        if let Some(frames) = dense_whole() {
+                            if self.card_quiet(page, frames) {
+                                let all = (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e;
+                                whole.push(WholePage { lo, hi, page, now, all });
+                                *runs_left = runs_left.saturating_sub(1);
+                                continue;
+                            }
+                            DENSE[DENSE_LOUD].fetch_add(1, Ordering::Relaxed);
+                        }
                         MERGED[MERGED_OVER].fetch_add(1, Ordering::Relaxed);
                         MERGED[MERGED_OVER + 1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         MERGED[MERGED_OVER + 2].fetch_add(*runs_left as u64, Ordering::Relaxed);
@@ -4584,6 +4746,67 @@ impl Shadow {
         if let Some(at) = self.card.as_ref().and_then(|c| c.dense.flagged.get(piece as usize)) {
             at.store(crate::frame::current() + 1, Ordering::Relaxed);
         }
+    }
+
+    /// VIcky ([`dense_whole`]): whether no landing found the piece of title
+    /// page `page` flagged by its compare for `frames` frames or more
+    /// (never flagged: that long since the copy was made).
+    fn card_quiet(&self, page: usize, frames: u64) -> bool {
+        let piece = page - self.start as usize / PIECE;
+        self.card
+            .as_ref()
+            .and_then(|c| c.dense.flagged_ago(piece, crate::frame::current()))
+            .is_some_and(|(ago, _)| ago >= frames)
+    }
+
+    /// VIcky ([`whole_pages_done`]): each page goes into the CPU's side
+    /// whole, as title memory has it now, and is noted to go up as one
+    /// range, as [`Shadow::merge_under_writes`] notes its runs; with send
+    /// `order` it is noted as sent whole ([`Dense::whole`]), and taken at
+    /// its asking if its range held all of it. A page that is not there is
+    /// left as it is (stale, looked at again next time). Returns the pages
+    /// put in.
+    fn card_put_whole(&self, mut pages: Vec<WholePage>, order: u64) -> u64 {
+        let Some(card) = &self.card else {
+            return 0;
+        };
+        let start = self.start as usize;
+        // A page in two declared ranges was found twice.
+        pages.sort_unstable_by_key(|p| (p.lo, p.hi));
+        pages.dedup_by_key(|p| (p.lo, p.hi));
+        let mut title = vec![0u8; PAGE];
+        let mut put = 0;
+        for p in pages {
+            let (n, at) = (p.hi - p.lo, p.lo - start);
+            let title = &mut title[..n];
+            // As `merge_under_writes`: the reference's lock from before
+            // title memory is read until its bytes are in, so that a merge
+            // of the relay's comes wholly before or wholly after.
+            let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            if !crate::host::read_into(p.lo as *const u8, title) {
+                continue;
+            }
+            // SAFETY: inside the mapping of the copy's CPU side (`lo` and
+            // `hi` lie in the copy), which only the submitting thread
+            // writes, and the relay's merges under the lock held here.
+            let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+            held.copy_from_slice(title);
+            self.card_changed(at, at + n);
+            if let Some(whole) = card.dense.whole.get(p.page - start / PIECE) {
+                whole.store(order, Ordering::Relaxed);
+            }
+            drop(before);
+            if p.all {
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(at) = copied.get_mut(p.page - start / PAGE) {
+                    *at = p.now;
+                }
+            }
+            DENSE[DENSE_PAGES].fetch_add(1, Ordering::Relaxed);
+            DENSE[DENSE_BYTES].fetch_add(n as u64, Ordering::Relaxed);
+            put += 1;
+        }
+        put
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -5476,7 +5699,7 @@ mod window_tests {
 
 #[cfg(test)]
 mod card_merge_tests {
-    use super::{Both, Card, Dense, SentNotes, Shadow};
+    use super::{Both, Card, Dense, PAGE, SentNotes, Shadow, WholePage, whole_overwritten};
     use std::sync::Mutex;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     use windows::Win32::Graphics::Direct3D12::*;
@@ -5771,6 +5994,89 @@ mod card_merge_tests {
         assert_eq!((title[both_byte], side[both_byte]), (content[both_byte] ^ 0x5a, content[both_byte]));
         assert_eq!(side[both_too], title[both_too]);
         assert_eq!(dirty, vec![(both_too, both_too + 1)]);
+    }
+
+    /// VIcky (`VICTORY_DENSE_PAGE_WHOLE`), on a real copy in the card's
+    /// memory: a dense page the title rewrote goes into the CPU's side
+    /// whole, as title memory has it, and up as one range; it is noted as
+    /// taken and as sent whole with its send; a landing of a flight sent
+    /// before that send whose compare flagged the piece is counted as a
+    /// whole page written by shaders, one sent with it or after is not.
+    #[test]
+    fn a_dense_page_goes_up_whole_and_a_flight_before_it_is_counted() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const LEN: usize = 2 * PAGE;
+        let content: Vec<u8> = (0..LEN).map(|i| (i * 11 + 5) as u8).collect();
+        let mut title = content.clone();
+        // A field of every 12-byte record rewritten, as the title's table.
+        for i in (4..LEN).step_by(12) {
+            title[i] ^= 0x3c;
+        }
+        let mut side = content.clone();
+        let start = title.as_ptr() as usize;
+        let mut shadow = Shadow::new(buffer, side.as_mut_ptr(), 0, start as u64, LEN as u64);
+        let pieces = || (0..4).map(|_| AtomicU64::new(0)).collect();
+        shadow.card = Some(Card {
+            staging,
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            // 0: no card bytes counted (`Drop` takes them off again).
+            size: 0,
+            dense: Dense {
+                made: 0,
+                flagged: pieces(),
+                whole: pieces(),
+            },
+        });
+        let shadow = Arc::new(shadow);
+        // The page that holds the copy's first byte, from that byte on.
+        let page = start / PAGE;
+        let hi = ((page + 1) * PAGE).min(start + LEN);
+        let n = hi - start;
+        let whole = WholePage {
+            lo: start,
+            hi,
+            page,
+            now: 77,
+            all: true,
+        };
+        let order = 9;
+        assert_eq!(shadow.card_put_whole(vec![whole], order), 1);
+        assert_eq!(side[..n], title[..n], "the CPU's side takes the page whole");
+        assert_eq!(side[n..], content[n..], "nothing past the page");
+        let card = shadow.card.as_ref().unwrap();
+        assert_eq!(card.dirty.lock().unwrap().ranges, [(0, n)], "one range goes up");
+        assert_eq!(card.dense.whole[0].load(Ordering::Relaxed), order);
+        assert_eq!(shadow.copied.lock().unwrap()[0], 77, "taken");
+        // Flight 8 was in the air (sent before send 9); flights 9 and 10
+        // were not.
+        assert_eq!(whole_overwritten(&[(shadow.clone(), 0, 8)]), 1);
+        assert_eq!(whole_overwritten(&[(shadow.clone(), 0, 9), (shadow.clone(), 0, 10), (shadow.clone(), 1, 3)]), 0);
+    }
+
+    /// VIcky (`VICTORY_DENSE_PAGE_WHOLE`): a piece counts as quiet once the
+    /// compare has not flagged it for the frames asked, counted from the
+    /// copy's making if it never did.
+    #[test]
+    fn a_piece_is_quiet_frames_after_its_last_flag() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dense = Dense {
+            made: 100,
+            flagged: (0..2).map(|_| AtomicU64::new(0)).collect(),
+            whole: Box::default(),
+        };
+        assert_eq!(dense.flagged_ago(0, 163), Some((63, false)));
+        assert_eq!(dense.flagged_ago(0, 164), Some((64, false)));
+        dense.flagged[1].store(150 + 1, Ordering::Relaxed);
+        assert_eq!(dense.flagged_ago(1, 213), Some((63, true)));
+        assert_eq!(dense.flagged_ago(1, 214), Some((64, true)));
+        assert_eq!(dense.flagged_ago(2, 214), None, "past the copy");
+        assert_eq!(Dense::default().flagged_ago(0, 214), None, "not kept");
     }
 }
 
