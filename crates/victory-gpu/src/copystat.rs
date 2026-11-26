@@ -133,8 +133,26 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// The guards' answers for view memory (`watch::guard`, part of
+    /// `GuardUs`): askings that came to look at the range's blocks; of
+    /// them, the ones found all clean at once (with
+    /// `VICTORY_GUARD_SUMMARY=1`, by the summary alone); and the blocks the
+    /// others walked one by one.
+    GuardAsked,
+    GuardAllClean,
+    GuardWalked,
+    /// Takings of the guards' lock by those askings that had to wait (a
+    /// title thread's write fault, or another asking, held it), and the
+    /// nanoseconds waited.
+    GuardWaits,
+    GuardWaitNs,
+    /// Nanoseconds the askings held the lock: finding whether the range is
+    /// all clean, and walking the ranges that were not (guarding their
+    /// written blocks again).
+    GuardCheckNs,
+    GuardWalkNs,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1130,7 +1148,10 @@ pub(crate) fn log(frames: f64) {
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
          refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
-         guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
+         guards {:.1} ms ({:.0} askings, {:.0} found all clean at once{}, {:.0} blocks walked; \
+         {:.0} waits for their lock {:.2} ms, held {:.2} ms finding all clean and {:.2} ms \
+         walking; summary checks since the start: {} of {} differed); \
+         {:.1} MB copied whole (memory not watched); {:.1} frame waits \
          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
          {:.0} steps {:.1} MB left out",
         c[C::RecordCalls as usize],
@@ -1146,6 +1167,16 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::BackCompared as usize]),
         ms(c[C::SparseUs as usize]),
         ms(c[C::GuardUs as usize]),
+        c[C::GuardAsked as usize],
+        c[C::GuardAllClean as usize],
+        if crate::watch::guard_summary() { " by the summary" } else { "" },
+        c[C::GuardWalked as usize],
+        c[C::GuardWaits as usize],
+        c[C::GuardWaitNs as usize] / 1e6,
+        c[C::GuardCheckNs as usize] / 1e6,
+        c[C::GuardWalkNs as usize] / 1e6,
+        crate::watch::SUMMARY_CHECKS[1].load(Relaxed),
+        crate::watch::SUMMARY_CHECKS[0].load(Relaxed),
         mb(c[C::WholeBytes as usize]),
         c[C::PaceWaits as usize],
         ms(c[C::PaceUs as usize]),

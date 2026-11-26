@@ -23,7 +23,8 @@
 //! [`MANY_VIEWS`] views). A
 //! system call writing into a guarded block fails (none is known to).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::BuildHasherDefault;
 use std::sync::Mutex;
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
@@ -501,7 +502,7 @@ fn failed_asking(start: usize, end: usize) {
     let (protected, clean, absent, viewed, aliased) = {
         let g = guards();
         let b = start / BLOCK;
-        (g.protected.contains(&b), g.clean.contains(&b), g.absent.contains(&b), g.viewed.contains(&b), g.aliased.contains(&b))
+        (g.protected.contains(&b), g.clean.contains(b), g.absent.contains(&b), g.viewed.contains(&b), g.aliased.contains(&b))
     };
     tracing::info!(
         "a failed write-watch asking (one in 2048): {start:#x}+{:#x}; Windows says (answered {n}): base {:#x} region {:#x} state {:#x} type {:#x} protect {:#x} allocation protect {:#x}; \
@@ -570,16 +571,14 @@ fn known_view(start: usize) -> bool {
     if ask {
         return false;
     }
-    let g = guards();
-    let first = start / BLOCK;
-    g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
+    guards().known(start / BLOCK, summary())
 }
 
 struct Guards {
     /// Blocks we made read-only.
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
-    clean: BTreeSet<usize>,
+    clean: Clean,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
@@ -634,9 +633,256 @@ fn view_known() -> bool {
     }
 }
 
+impl Guards {
+    /// Whether `block` is view memory the guards hold: read-only by our
+    /// hand, or noted absent (or, with [`view_known`], once guarded). With
+    /// `summed` ([`summary`]) a clean block, nearly every one asked about,
+    /// is found by its bit first (every clean block is read-only by our
+    /// hand), not looked up in the sets.
+    fn known(&self, block: usize, summed: bool) -> bool {
+        (summed && self.clean.has(block))
+            || self.protected.contains(&block)
+            || self.absent.contains(&block)
+            || (view_known() && self.viewed.contains(&block))
+    }
+}
+
+/// Blocks a word of [`Clean`]'s bits stands for: 4 MiB of view memory.
+const WORD: usize = 64;
+
+/// [`Guards::clean`]: the blocks read-only by our hand and not written
+/// since a copy took them, in a set; and with [`summary`] the same blocks
+/// as bits, one per block, 64 to a word.
+///
+/// In a steady scene the submitting thread asks [`guard`] some 3,600 times
+/// a frame which blocks of a range were written, about 13 GB of view
+/// memory (200,000 blocks), nearly all of it clean. Each asking read the
+/// range's clean blocks off the set to count them, under the lock a title
+/// thread's write fault also takes ("guards" 31.7 ms a frame of the
+/// submitting thread's ~143). With the bits a range is found all clean
+/// with one lookup per 4 MiB, and a range that is not is walked block by
+/// block only in the words that are not all clean.
+struct Clean {
+    /// The blocks, in order.
+    set: BTreeSet<usize>,
+    /// With [`summary`] (always in tests): word number (block / [`WORD`])
+    /// to its bits, bit `n` set if block `word * WORD + n` is clean. A word
+    /// with no clean block is left out.
+    bits: HashMap<usize, u64, BuildHasherDefault<WordHash>>,
+}
+
+impl Clean {
+    const fn new() -> Self {
+        Self {
+            set: BTreeSet::new(),
+            bits: HashMap::with_hasher(BuildHasherDefault::new()),
+        }
+    }
+
+    fn contains(&self, block: usize) -> bool {
+        self.set.contains(&block)
+    }
+
+    fn insert(&mut self, block: usize) {
+        self.set.insert(block);
+        if keep_bits() {
+            *self.bits.entry(block / WORD).or_insert(0) |= 1 << (block % WORD);
+        }
+    }
+
+    fn remove(&mut self, block: usize) {
+        self.set.remove(&block);
+        if keep_bits()
+            && let Some(bits) = self.bits.get_mut(&(block / WORD))
+        {
+            *bits &= !(1 << (block % WORD));
+            if *bits == 0 {
+                self.bits.remove(&(block / WORD));
+            }
+        }
+    }
+
+    /// Notes blocks `[from, to)` clean.
+    fn extend(&mut self, from: usize, to: usize) {
+        self.set.extend(from..to);
+        if keep_bits() {
+            let mut at = from;
+            while at < to {
+                let end = word_end(at).min(to);
+                *self.bits.entry(at / WORD).or_insert(0) |= span(at, end);
+                at = end;
+            }
+        }
+    }
+
+    /// The bits of word `word` (bit `n`: block `word * WORD + n` is clean).
+    fn word(&self, word: usize) -> u64 {
+        self.bits.get(&word).copied().unwrap_or(0)
+    }
+
+    /// Whether the bits say `block` is clean.
+    fn has(&self, block: usize) -> bool {
+        self.word(block / WORD) & (1 << (block % WORD)) != 0
+    }
+
+    /// Whether the bits say every block of `[first, last)` is clean.
+    fn all(&self, first: usize, last: usize) -> bool {
+        let mut at = first;
+        while at < last {
+            let end = word_end(at).min(last);
+            let want = span(at, end);
+            if self.word(at / WORD) & want != want {
+                return false;
+            }
+            at = end;
+        }
+        true
+    }
+
+    /// Whether the bits say of every block of `[first, last)` what the set
+    /// says: the check of `VICTORY_GUARD_SUMMARY_CHECK`, with the walk of
+    /// the set the askings made before the bits.
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn agrees(&self, first: usize, last: usize) -> bool {
+        let mut set = self.set.range(first..last).peekable();
+        let mut at = first;
+        while at < last {
+            let end = word_end(at).min(last);
+            let mut from_set = 0u64;
+            while let Some(block) = set.next_if(|&&b| b < end) {
+                from_set |= 1 << (block % WORD);
+            }
+            if self.word(at / WORD) & span(at, end) != from_set {
+                return false;
+            }
+            at = end;
+        }
+        true
+    }
+}
+
+/// The first block of the word after the one holding `block`.
+fn word_end(block: usize) -> usize {
+    (block / WORD + 1) * WORD
+}
+
+/// The bits of blocks `[from, to)`, which lie in one word.
+fn span(from: usize, to: usize) -> u64 {
+    let n = to - from;
+    let low = if n >= WORD { u64::MAX } else { (1 << n) - 1 };
+    low << (from % WORD)
+}
+
+/// Hashes a word number with one multiplication: the default hasher costs
+/// more than the rest of a lookup of [`Clean`]'s bits.
+#[derive(Default)]
+struct WordHash(u64);
+
+impl std::hash::Hasher for WordHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.0 = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+/// Whether [`guard`] answers from [`Clean`]'s bits
+/// (`VICTORY_GUARD_SUMMARY=1`; off by default). Off, the bits are not kept
+/// and every asking reads its range's clean blocks off the set, as before.
+///
+/// The answers are the same. A range the bits find all clean is one the
+/// set holds every block of. One that is not is walked as before, by the
+/// same steps ([`step`]), each block's being clean read off its word's
+/// bits instead of the set, and the words found all clean passed over
+/// whole: at a clean block the walk does nothing but end a run of written
+/// blocks before it. Also, a range whose first block is clean is known as
+/// view memory by its bit, and an asking takes the lock once instead of
+/// twice (whether the range is a view, and its answer, under one holding).
+///
+/// `VICTORY_GUARD_SUMMARY_CHECK=1` (diagnostics) also reads the set one
+/// asking in [`CHECK_EVERY`] and counts the askings where the bits said
+/// otherwise of a block (the "recording per frame" line, since the start:
+/// it must stay 0).
+fn summary() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_SUMMARY.get() {
+        return on;
+    }
+    summary_switch()
+}
+
+/// `VICTORY_GUARD_SUMMARY`, as set.
+fn summary_switch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_SUMMARY").is_some_and(|v| v == "1"))
+}
+
+/// Whether [`Clean`] keeps its bits: with the switch, and in tests always,
+/// so that each test thread can ask either way (`TEST_SUMMARY`).
+fn keep_bits() -> bool {
+    cfg!(test) || summary_switch()
+}
+
+/// [`summary`], for the frame line.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn guard_summary() -> bool {
+    summary()
+}
+
+/// One check of `VICTORY_GUARD_SUMMARY_CHECK` in this many askings.
+#[cfg(feature = "diagnostics")]
+const CHECK_EVERY: u64 = 64;
+
+/// `VICTORY_GUARD_SUMMARY_CHECK`, since the start: askings checked, and
+/// of them the ones where the bits differed from the set.
+#[cfg(feature = "diagnostics")]
+pub(crate) static SUMMARY_CHECKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// With `VICTORY_GUARD_SUMMARY_CHECK=1`, one asking in [`CHECK_EVERY`]:
+/// reads the clean blocks of `[first, last)` off the set, as the askings
+/// did before the bits, and counts the asking if the bits differ (the
+/// first few said in the log).
+#[cfg(feature = "diagnostics")]
+fn check_summary(g: &Guards, first: usize, last: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static TURN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_SUMMARY_CHECK").is_some_and(|v| v == "1"))
+        || !TURN.fetch_add(1, Relaxed).is_multiple_of(CHECK_EVERY)
+    {
+        return;
+    }
+    SUMMARY_CHECKS[0].fetch_add(1, Relaxed);
+    if !g.clean.agrees(first, last) && SUMMARY_CHECKS[1].fetch_add(1, Relaxed) < 32 {
+        tracing::warn!(
+            "VICTORY_GUARD_SUMMARY_CHECK: the summary of clean blocks differs from the set over {:#x}..{:#x}: \
+             {} of {} blocks clean in the set, all clean by the summary: {}",
+            first * BLOCK,
+            last * BLOCK,
+            g.clean.set.range(first..last).count(),
+            last - first,
+            g.clean.all(first, last)
+        );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`summary`] for this thread, whatever the environment says.
+    static TEST_SUMMARY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
-    clean: BTreeSet::new(),
+    clean: Clean::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     viewed: BTreeSet::new(),
@@ -646,15 +892,37 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// [`guards`] for an asking of [`guard`]. With diagnostics a wait for the
+/// lock (a title thread's write fault holds it while it opens a block, or
+/// another asking while it walks) is counted and timed.
+fn guards_waited() -> std::sync::MutexGuard<'static, Guards> {
+    #[cfg(feature = "diagnostics")]
+    {
+        match GUARDS.try_lock() {
+            Ok(g) => return g,
+            Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        let waiting = std::time::Instant::now();
+        let g = guards();
+        crate::copystat::add(crate::copystat::C::GuardWaits, 1);
+        crate::copystat::add(crate::copystat::C::GuardWaitNs, waiting.elapsed().as_nanos() as u64);
+        g
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    guards()
+}
+
 /// Whether the block `page` is read-only by our hand and unwritten since a
 /// copy took it (diagnostics of `VICTORY_BACK_OWN_CHECK`).
 pub(crate) fn clean(page: usize) -> bool {
-    guards().clean.contains(&page)
+    guards().clean.contains(page)
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
+/// With [`summary`] the clean blocks are read off [`Clean`]'s bits.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
@@ -664,29 +932,83 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = guards();
-        let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
-    };
-    if !known && !is_view(start, end) {
-        return None;
-    }
-    install();
-    let mut g = guards();
-    let mut written = Vec::new();
-    let mut run: Option<usize> = None;
+    let ask = *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"));
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let summed = summary();
+    let mut g = if summed {
+        // The question and the answer under one holding of the lock, when
+        // the first block says the range is a view (and the handler is in).
+        let g = guards_waited();
+        let known = !ask && g.known(first, true);
+        if known && INSTALLED.is_completed() {
+            g
+        } else {
+            drop(g);
+            if !known && !is_view(start, end) {
+                return None;
+            }
+            install();
+            guards_waited()
+        }
+    } else {
+        let known = !ask && guards_waited().known(first, false);
+        if !known && !is_view(start, end) {
+            return None;
+        }
+        install();
+        guards_waited()
+    };
+    let mut written = Vec::new();
+    #[cfg(feature = "diagnostics")]
+    let checking = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::GuardAsked, 1);
+    // Counts an asking found all clean, and the time finding it took.
+    #[cfg(feature = "diagnostics")]
+    let all_clean = |checking: std::time::Instant| {
+        use crate::copystat::{C, add};
+        add(C::GuardAllClean, 1);
+        add(C::GuardCheckNs, checking.elapsed().as_nanos() as u64);
+    };
+    if summed {
+        #[cfg(feature = "diagnostics")]
+        check_summary(&g, first, last);
+        // Nothing written, mapped or new since the range was last taken.
+        if g.clean.all(first, last) {
+            #[cfg(feature = "diagnostics")]
+            all_clean(checking);
+            return Some(written);
+        }
+        #[cfg(feature = "diagnostics")]
+        let walking = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardCheckNs, (walking - checking).as_nanos() as u64);
+        let _walked = walk_summed(&mut g, first, last, &mut written);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::GuardWalked, _walked);
+            add(C::GuardWalkNs, walking.elapsed().as_nanos() as u64);
+        }
+        return Some(written);
+    }
     // The range's clean blocks, in order: read off the set in one pass,
     // not looked up one block at a time. A frame asks about some 10 GB of
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
     // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
     // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
+    let clean: Vec<usize> = g.clean.set.range(first..last).copied().collect();
     if clean.len() == last - first {
         // Nothing written, mapped or new since the range was last taken.
+        #[cfg(feature = "diagnostics")]
+        all_clean(checking);
         return Some(written);
     }
+    #[cfg(feature = "diagnostics")]
+    let walking = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::GuardCheckNs, (walking - checking).as_nanos() as u64);
+    let mut run: Option<usize> = None;
     let mut next_clean = 0;
     let mut uncommitted_until = first;
     for block in first..=last {
@@ -694,33 +1016,92 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             next_clean += 1;
         }
         let is_clean = next_clean < clean.len() && clean[next_clean] == block;
-        let mut open = block < last && !is_clean;
-        if open && g.absent.contains(&block) {
-            // Ordinary commits need no runtime mapping notification. Reuse
-            // this asking's query for the following blocks in the same region.
-            if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
-            }
-            open = block >= uncommitted_until;
-            if open {
-                g.absent.remove(&block);
-            }
-        }
-        if open {
-            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.protected.contains(&block) {
-                // Written through the runtime, still read-only.
-                g.clean.insert(block);
-            } else {
-                run.get_or_insert(block);
-                continue;
-            }
-        }
-        if let Some(from) = run.take() {
-            protect(&mut g, from, block);
-        }
+        step(&mut g, block, block >= last || is_clean, &mut run, &mut uncommitted_until, &mut written);
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::GuardWalked, (last - first) as u64);
+        add(C::GuardWalkNs, walking.elapsed().as_nanos() as u64);
     }
     Some(written)
+}
+
+/// One block of [`guard`]'s walk. `clean`: the block was clean when the
+/// asking began, or lies past the range (nothing to open there). A block
+/// not clean is reported written, unless it is noted absent and still
+/// wholly uncommitted. One still read-only by our hand (written through the
+/// runtime) is noted clean again; the others are guarded again in runs,
+/// each run ending at the next block that needs no guarding.
+fn step(
+    g: &mut Guards,
+    block: usize,
+    clean: bool,
+    run: &mut Option<usize>,
+    uncommitted_until: &mut usize,
+    written: &mut Vec<usize>,
+) {
+    let mut open = !clean;
+    if open && g.absent.contains(&block) {
+        // Ordinary commits need no runtime mapping notification. Reuse
+        // this asking's query for the following blocks in the same region.
+        if block >= *uncommitted_until {
+            *uncommitted_until = uncommitted_end(block);
+        }
+        open = block >= *uncommitted_until;
+        if open {
+            g.absent.remove(&block);
+        }
+    }
+    if open {
+        written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+        if g.protected.contains(&block) {
+            // Written through the runtime, still read-only.
+            g.clean.insert(block);
+        } else {
+            run.get_or_insert(block);
+            return;
+        }
+    }
+    if let Some(from) = run.take() {
+        protect(g, from, block);
+    }
+}
+
+/// [`guard`]'s walk of `[first, last)` with [`summary`]: the words of
+/// [`Clean`]'s bits all clean over the range are passed over whole (the
+/// walk would only end a run of written blocks at their first block), the
+/// others are walked block by block. Returns the blocks walked one by one.
+///
+/// A word's bits are read when the walk comes to it: what the walk notes
+/// clean meanwhile is the block it stands at or ones before it (the runs it
+/// guards again end there), so the later blocks read as they were when the
+/// asking began, as the set read once at the start gave them.
+fn walk_summed(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usize>) -> u64 {
+    let mut run: Option<usize> = None;
+    let mut uncommitted_until = first;
+    let mut walked = 0;
+    let mut block = first;
+    while block < last {
+        let end = word_end(block).min(last);
+        let bits = g.clean.word(block / WORD);
+        let want = span(block, end);
+        if bits & want == want {
+            if let Some(from) = run.take() {
+                protect(g, from, block);
+            }
+            block = end;
+            continue;
+        }
+        walked += (end - block) as u64;
+        while block < end {
+            let clean = bits & (1 << (block % WORD)) != 0;
+            step(g, block, clean, &mut run, &mut uncommitted_until, written);
+            block += 1;
+        }
+    }
+    step(g, last, true, &mut run, &mut uncommitted_until, written);
+    walked
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in
@@ -858,7 +1239,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
-        g.clean.extend(from..to);
+        g.clean.extend(from, to);
         if view_known() {
             g.viewed.extend(from..to);
         }
@@ -941,7 +1322,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .collect();
     for &block in &blocks {
         g.protected.remove(&block);
-        g.clean.remove(&block);
+        g.clean.remove(block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
@@ -1138,7 +1519,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
-        g.clean.remove(&block);
+        g.clean.remove(block);
     }
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
@@ -1200,12 +1581,14 @@ fn install() {
             EXCEPTION_CONTINUE_SEARCH
         }
     }
-    static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: the handler only touches our guard state and protections.
-    ONCE.call_once(|| unsafe {
+    INSTALLED.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
 }
+
+/// Done once the handler of [`install`] is registered.
+static INSTALLED: std::sync::Once = std::sync::Once::new();
 
 /// Whether `at` is committed read-write memory now.
 fn writable(at: usize) -> bool {
@@ -1709,6 +2092,391 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// A small random number source for the tests below (xorshift).
+    struct Dice(u64);
+
+    impl Dice {
+        /// A number below `n`.
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    /// The summary of clean blocks says of every block what the set says,
+    /// through blocks noted clean one at a time and in runs and let go of,
+    /// across words and at their edges: whether a range is all clean, each
+    /// block, and each word.
+    #[test]
+    fn the_summary_says_what_the_set_says() {
+        let mut dice = Dice(0x2545_F491_4F6C_DD1D);
+        let mut clean = Clean::new();
+        // Five words and a bit, not starting at a word's edge.
+        let base = 0x7_0000 / BLOCK * WORD + 37;
+        let size = 5 * WORD + 11;
+        for round in 0..20_000 {
+            let at = base + dice.below(size);
+            match dice.below(8) {
+                0..=2 => clean.insert(at),
+                3 | 4 => clean.remove(at),
+                5 => clean.extend(at, (at + 1 + dice.below(3 * WORD)).min(base + size)),
+                6 => {
+                    // A range let go of, as a remapping does.
+                    for block in at..(at + dice.below(2 * WORD)).min(base + size) {
+                        clean.remove(block);
+                    }
+                }
+                _ => {
+                    // Everything noted clean, as a first guarding does.
+                    if round % 64 == 0 {
+                        clean.extend(base, base + size);
+                    }
+                }
+            }
+            for _ in 0..4 {
+                let first = base - 2 + dice.below(size + 4);
+                let last = first + dice.below(base + size + 2 - first.min(base + size));
+                let in_set = clean.set.range(first..last).count();
+                assert_eq!(clean.all(first, last), in_set == last - first, "{first}..{last} after {round} steps");
+                assert!(clean.agrees(first, last), "{first}..{last} after {round} steps");
+            }
+            if round % 997 == 0 {
+                for block in base - WORD..base + size + WORD {
+                    assert_eq!(clean.has(block), clean.contains(block), "block {block}");
+                }
+                assert!(clean.bits.values().all(|&bits| bits != 0), "a word with no clean block is left out");
+                assert!(clean.agrees(base - WORD, base + size + WORD));
+            }
+        }
+        // A word whose bits say otherwise is found.
+        clean.extend(base, base + size);
+        assert!(clean.all(base, base + size));
+        clean.set.remove(&(base + WORD));
+        assert!(!clean.agrees(base, base + size));
+        assert!(clean.agrees(base, base + WORD));
+    }
+
+    /// The same steps at two views of their own, one asked about as before
+    /// and one with the summary: the same answers each time, and the same
+    /// blocks guarded, clean and absent at the end. Pages are committed
+    /// (some blocks are never committed whole, some not at all), written
+    /// through the handler and by the runtime, and remapped, at random over
+    /// ranges that cross the summary's words.
+    #[test]
+    fn the_summary_answers_as_the_set_does() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            MapViewOfFileEx, SEC_RESERVE, UnmapViewOfFile, VirtualProtect,
+        };
+        const BLOCKS: usize = 150;
+        const SIZE: usize = BLOCKS * BLOCK;
+        const PAGES: usize = BLOCK / KERNEL_PAGE;
+        let view = |n: usize| {
+            // SAFETY: a new reserved pagefile section, mapped; the view
+            // holds its own reference once the handle is closed. High up
+            // if it can be, away from the other tests' views: one of them
+            // unmapped before its guards are told would leave ours read-only
+            // and forgotten.
+            unsafe {
+                let section = CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    PAGE_READWRITE | SEC_RESERVE,
+                    0,
+                    SIZE as u32,
+                    std::ptr::null(),
+                );
+                assert!(!section.is_null());
+                let high = (0x2B00_0000_0000 + n * 0x1000_0000) as *const _;
+                let mut view = MapViewOfFileEx(section, FILE_MAP_WRITE, 0, 0, SIZE, high);
+                if view.Value.is_null() {
+                    view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE);
+                }
+                CloseHandle(section);
+                assert!(!view.Value.is_null());
+                view.Value as usize
+            }
+        };
+        // As before, and with the summary.
+        let views = [view(0), view(1)];
+        let mut dice = Dice(0x9E37_79B9_7F4A_7C15);
+        // The kernel pages committed, numbered from the view's start.
+        let mut committed = BTreeSet::new();
+        let commit = |committed: &mut BTreeSet<usize>, page: usize| {
+            if committed.insert(page) {
+                for view in views {
+                    let at = view + page * KERNEL_PAGE;
+                    // SAFETY: a page of our reserved view.
+                    let done = unsafe { VirtualAlloc(at as _, KERNEL_PAGE, MEM_COMMIT, PAGE_READWRITE) };
+                    assert_eq!(done as usize, at);
+                }
+            }
+        };
+        for block in 0..BLOCKS {
+            match dice.below(10) {
+                0 => {}
+                1 => commit(&mut committed, block * PAGES + dice.below(PAGES)),
+                _ => (0..PAGES).for_each(|page| commit(&mut committed, block * PAGES + page)),
+            }
+        }
+        let asked = |views: [usize; 2], from: usize, to: usize| {
+            views.map(|view| {
+                TEST_SUMMARY.set(Some(view == views[1]));
+                let pages = guard(view + from, view + to);
+                pages.map(|pages| pages.into_iter().map(|page| page - view / PAGE).collect::<Vec<_>>())
+            })
+        };
+        for round in 0..4000 {
+            match dice.below(10) {
+                0..=4 => {
+                    let (from, to) = if dice.below(8) == 0 {
+                        (0, SIZE)
+                    } else {
+                        let from = dice.below(SIZE);
+                        (from, from + 1 + dice.below(SIZE - from))
+                    };
+                    let [before, summed] = asked(views, from, to);
+                    assert!(before.is_some());
+                    assert_eq!(before, summed, "{from:#x}..{to:#x} after {round} steps");
+                }
+                5 | 6 => {
+                    // The title writes a committed page: through the
+                    // handler where its block is guarded.
+                    if let Some(&page) = committed.iter().nth(dice.below(committed.len().max(1))) {
+                        for view in views {
+                            // SAFETY: a committed page of our view.
+                            unsafe { ((view + page * KERNEL_PAGE + 8) as *mut u8).write_volatile(round as u8) };
+                        }
+                    }
+                }
+                7 => commit(&mut committed, dice.below(BLOCKS * PAGES)),
+                8 => {
+                    // Inside the views: no other test's block is opened.
+                    let at = dice.below(SIZE);
+                    let len = (1 + dice.below(4 * BLOCK)).min(SIZE - at);
+                    for view in views {
+                        writing(view + at, len);
+                    }
+                }
+                _ => {
+                    // The runtime maps something new there: read-write.
+                    let (first, n) = (dice.below(BLOCKS), 1 + dice.below(3 * WORD));
+                    let last = (first + n).min(BLOCKS);
+                    for view in views {
+                        title_memory_remapped(view + first * BLOCK, (last - first) * BLOCK);
+                        for &page in committed.range(first * PAGES..last * PAGES) {
+                            let mut old = 0;
+                            // SAFETY: a committed page of our view.
+                            let done = unsafe {
+                                VirtualProtect((view + page * KERNEL_PAGE) as _, KERNEL_PAGE, PAGE_READWRITE, &mut old)
+                            };
+                            assert_ne!(done, 0);
+                        }
+                    }
+                }
+            }
+        }
+        let [before, summed] = asked(views, 0, SIZE);
+        assert_eq!(before, summed);
+        {
+            let g = guards();
+            let held = |view: usize, block: usize| {
+                let block = view / BLOCK + block;
+                assert_eq!(g.clean.has(block), g.clean.contains(block));
+                (g.protected.contains(&block), g.clean.contains(block), g.absent.contains(&block))
+            };
+            for block in 0..BLOCKS {
+                assert_eq!(held(views[0], block), held(views[1], block), "block {block}");
+            }
+            for view in views {
+                assert!(g.clean.agrees(view / BLOCK, view / BLOCK + BLOCKS));
+            }
+        }
+        TEST_SUMMARY.set(None);
+        for view in views {
+            title_memory_remapped(view, SIZE);
+            // SAFETY: our view.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        }
+    }
+
+    /// The tests of view memory above, asked with the summary.
+    #[test]
+    fn the_view_tests_with_the_summary() {
+        TEST_SUMMARY.set(Some(true));
+        kernel_reads_into_guarded_blocks_after_opening();
+        writes_in_partly_committed_view_blocks_are_reported();
+        a_range_that_begins_in_an_unmapped_block_is_guarded();
+        unmapped_blocks_are_reported_once_until_mapped();
+        a_write_through_another_view_is_reported_at_the_guarded_one();
+        a_view_mapped_beside_a_guarded_one_makes_it_check_again();
+        a_write_told_at_one_view_is_reported_at_the_others();
+        a_write_is_reported_at_every_checked_view();
+        a_page_of_many_views_is_guarded_one_view_at_a_time();
+        TEST_SUMMARY.set(None);
+    }
+
+    /// For timing, about what a steady scene's frame asks: 3,600 ranges
+    /// over some 200,000 blocks, 16 of them the size of the title's heap,
+    /// in turn in `views` (first blocks) of `blocks` blocks each.
+    fn a_frame(dice: &mut Dice, views: &[usize], blocks: usize) -> Vec<(usize, usize)> {
+        (0..3600)
+            .map(|n| {
+                let len = if n < 16 { 2784.min(blocks) } else { 1 + dice.below(86) };
+                let at = views[n % views.len()] + dice.below(blocks - len + 1);
+                (at, at + len)
+            })
+            .collect()
+    }
+
+    /// Not a test: what finding a frame's ranges all clean costs, the set's
+    /// way (before the summary) and the summary's, among 200,000 clean
+    /// blocks. `cargo test --profile diag -p victory-gpu --lib -- --ignored
+    /// --nocapture costs`.
+    #[test]
+    #[ignore]
+    fn finding_ranges_all_clean_costs() {
+        let mut dice = Dice(0x1234_5678_9ABC_DEF1);
+        let mut clean = Clean::new();
+        // 64 views of 200 MB, 1 GiB apart and not at the words' edges.
+        let views: Vec<usize> = (0..64).map(|n| (0x10_0000_0000 / BLOCK) + n * (1 << 14) + n * 37).collect();
+        for &view in &views {
+            clean.extend(view, view + 3125);
+        }
+        let ranges = a_frame(&mut dice, &views, 3125);
+        for &(first, last) in ranges.iter().step_by(100) {
+            clean.remove(first + (last - first) / 2);
+        }
+        let blocks: usize = ranges.iter().map(|r| r.1 - r.0).sum();
+        let set_way = |clean: &Clean| {
+            ranges
+                .iter()
+                .filter(|&&(first, last)| {
+                    let found: Vec<usize> = clean.set.range(first..last).copied().collect();
+                    std::hint::black_box(found).len() == last - first
+                })
+                .count()
+        };
+        let summary_way =
+            |clean: &Clean| ranges.iter().filter(|&&(first, last)| std::hint::black_box(clean).all(first, last)).count();
+        assert_eq!(set_way(&clean), summary_way(&clean));
+        // Warm, and with the caches emptied before each frame (the title
+        // runs between the askings): the best of 20 frames each.
+        let mut other = vec![0u8; 64 << 20];
+        let mut best = [std::time::Duration::MAX; 4];
+        for n in 0..40 {
+            let cold = usize::from(n % 2 == 1);
+            let mut empty = || {
+                if cold == 1 {
+                    other.iter_mut().for_each(|b| *b = b.wrapping_add(1));
+                    std::hint::black_box(&other);
+                }
+            };
+            empty();
+            let started = std::time::Instant::now();
+            std::hint::black_box(set_way(&clean));
+            best[cold * 2] = best[cold * 2].min(started.elapsed());
+            empty();
+            let started = std::time::Instant::now();
+            std::hint::black_box(summary_way(&clean));
+            best[cold * 2 + 1] = best[cold * 2 + 1].min(started.elapsed());
+        }
+        let ms = best.map(|d| d.as_secs_f64() * 1e3);
+        println!(
+            "finding {} ranges ({blocks} blocks, {} all clean) all clean among {} clean blocks, the best of 20 frames: \
+             warm, the set's way {:.3} ms, the summary's {:.3} ms; caches emptied first, the set's way {:.3} ms, \
+             the summary's {:.3} ms",
+            ranges.len(),
+            summary_way(&clean),
+            clean.set.len(),
+            ms[0],
+            ms[1],
+            ms[2],
+            ms[3]
+        );
+    }
+
+    /// Not a test: what a frame's askings of [`guard`] cost, as before and
+    /// with the summary, at a 256 MB view of our own guarded whole (the
+    /// lock taken without waiting; a frame of the title holds some 200,000
+    /// clean blocks, this one 4,096). `cargo test --profile diag -p
+    /// victory-gpu --lib -- --ignored --nocapture costs`.
+    #[test]
+    #[ignore]
+    fn guarding_a_frame_costs() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        const BLOCKS: usize = 4096;
+        const SIZE: usize = BLOCKS * BLOCK;
+        // SAFETY: a new pagefile section, mapped; never touched, so no
+        // page of it is made.
+        let view = unsafe {
+            let section =
+                CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, SIZE as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE);
+            CloseHandle(section);
+            assert!(!view.Value.is_null());
+            view.Value as usize
+        };
+        assert_eq!(guard(view, view + SIZE).map(|pages| pages.len()), Some(BLOCKS));
+        let mut dice = Dice(0x0BAD_5EED_F00D_CAFE);
+        let ranges = a_frame(&mut dice, &[view / BLOCK], BLOCKS);
+        let blocks: usize = ranges.iter().map(|r| r.1 - r.0).sum();
+        // A frame's askings; before them, `written` blocks written by the
+        // title (one in a hundred: their faults are not timed, guarding
+        // them again is). The pages reported.
+        let frame = |summed: bool, written: usize, dice: &mut Dice| {
+            for _ in 0..written {
+                // SAFETY: a byte of our view, opened by the handler.
+                unsafe { ((view + dice.below(BLOCKS) * BLOCK + 8) as *mut u8).write_volatile(1) };
+            }
+            TEST_SUMMARY.set(Some(summed));
+            let started = std::time::Instant::now();
+            let pages: usize = ranges
+                .iter()
+                .map(|&(first, last)| guard(first * BLOCK, last * BLOCK).map_or(0, |pages| pages.len()))
+                .sum();
+            (started.elapsed(), pages)
+        };
+        let mut best = [std::time::Duration::MAX; 4];
+        let mut reported = [0; 2];
+        for _ in 0..20 {
+            for (n, summed) in [false, true].into_iter().enumerate() {
+                let (took, pages) = frame(summed, 0, &mut dice);
+                assert_eq!(pages, 0, "nothing written");
+                best[n] = best[n].min(took);
+                let (took, pages) = frame(summed, BLOCKS / 100, &mut dice);
+                best[2 + n] = best[2 + n].min(took);
+                reported[n] += pages;
+            }
+        }
+        TEST_SUMMARY.set(None);
+        let ms = best.map(|d| d.as_secs_f64() * 1e3);
+        println!(
+            "{} askings of guard ({blocks} blocks) at a view of {BLOCKS} blocks, the best of 20 frames: all clean, \
+             as before {:.3} ms, with the summary {:.3} ms; with {} blocks written before each frame, as before \
+             {:.3} ms, with the summary {:.3} ms ({} and {} pages reported in all, of blocks picked at random)",
+            ranges.len(),
+            ms[0],
+            ms[1],
+            BLOCKS / 100,
+            ms[2],
+            ms[3],
+            reported[0],
+            reported[1]
+        );
+        title_memory_remapped(view, SIZE);
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
     }
 }
 
