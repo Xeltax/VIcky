@@ -27,9 +27,46 @@
 //! - `VICTORY_SHADER_OPT_ONLY=<hash>,...`: no clean-up for every program not
 //!   listed.
 //!
+//! The third is for a wave64 lane mask the compiler parked as two scalar
+//! copies and restored dword by dword (`s_mov_b32` chains): structurisation
+//! can take the restored pair as the mask it was copied from
+//! (`structure`'s `Lanes::mask`, DexNom's 76749ce). On an RTX 4080
+//! (2026-11-26, RT88a) that let `CS_ShadowRenderTiledCascadesAlphaCBPPPC`
+//! (#f133e35e) translate and took the 8x8 stair-steps off shadow edges, and
+//! the characters' skin was no longer drawn. Offline, over every program of
+//! the title, it takes effect in five wave64 programs: two that were
+//! refused translate (#f133e35e, and `PS_VoxelizeVisiblity` #405bfb31,
+//! refused as "an opaque lane mask"), one that translated comes out
+//! different (`water_shading:CS_TransmissionVolumetrics_VolumePortalsOnly`
+//! #a10179ab), and two stay refused as before. Of these RT88a's scene bound
+//! #f133e35e alone: the lost heads go with running it (runs that drop it
+//! draw them; a tree whose own translator runs it loses them too), which
+//! the default keeps and `0` undoes. So it is chosen per program:
+//! - `VICTORY_WAVE_MASK_COPIES` unset or `retry`: only as a second attempt,
+//!   for a program whose translation without it is refused where a mask is
+//!   exchanged ([`MASK_COPIES_RETRY_ON`]): no program that translated
+//!   before changes;
+//! - `VICTORY_WAVE_MASK_COPIES=0`: for no program, as before;
+//! - `VICTORY_WAVE_MASK_COPIES=all`: for every program, from the start;
+//! - `VICTORY_WAVE_MASK_COPIES=<hash>,...`: for the listed programs, from
+//!   the start; for no other.
+//!
 //! A program's decision is part of its shader cache key (`victory-gpu`'s
 //! `shader_cache`), not the lists: changing a list translates again only
-//! the programs whose decision it changes.
+//! the programs whose decision it changes. For the mask copies the key says
+//! whether the translation ran with them, so a second attempt is filed
+//! where `all` files that program, never where its first attempt would be.
+//!
+//! And one to bisect what a program's writes do (diagnostics): its store
+//! instructions at the listed console offsets are left out of its
+//! translation, as if what they write went nowhere (a store to a null
+//! view):
+//! - `VICTORY_STORE_DROP=<hash>:<offset>+<offset>...,<hash>:...` (offsets
+//!   in hex, with or without `0x`, as `victory shader-info --disasm` lists
+//!   them; `buffer_`, `image_`, `global_` and `scratch_` stores, not
+//!   atomics or exports). Run 2026-11-26: the stores of
+//!   `CS_ShadowRenderTiledCascadesAlphaCBPPPC` (#f133e35e), to find which of
+//!   its outputs costs the characters their skin.
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -57,7 +94,7 @@ pub fn for_program<T>(hash: &str, f: impl FnOnce() -> T) -> T {
 }
 
 /// The hash [`for_program`] set on this thread, if any.
-pub(super) fn current() -> Option<String> {
+pub(crate) fn current() -> Option<String> {
     PROGRAM.with_borrow(Clone::clone)
 }
 
@@ -65,12 +102,156 @@ pub(super) fn current() -> Option<String> {
 /// decision into its own key) and so left out of the translator's
 /// fingerprint ([`super::translation_fingerprint`]): a new list translates
 /// again only the programs whose decision it changes.
-pub(super) const PER_PROGRAM_SWITCHES: [&str; 4] = [
+pub(super) const PER_PROGRAM_SWITCHES: [&str; 7] = [
     "VICTORY_WAVE_DEEP_SKIPS_NOT",
     "VICTORY_WAVE_DEEP_SKIPS_ONLY",
     "VICTORY_SHADER_OPT_NOT",
     "VICTORY_SHADER_OPT_ONLY",
+    "VICTORY_WAVE_MASK_COPIES",
+    "VICTORY_STORE_DROP",
+    "VICTORY_WAVE_SITE_PAIRS",
 ];
+
+/// Whether the program whose hash is `hash` (`None`: not known) is built with fork #1002's
+/// forms (brunofgmag, `eaeb8f17`; `crate::ir`): a pair of scalars parked in two lanes that
+/// hold other scalars elsewhere moves as a pair where it can (`site_pairs`), an
+/// `s_cbranch_execnz` over a far jump to the end is an early-out, and a scalar join that
+/// passes one value through is a copy of it (`without_skips` with `deep`). With them the
+/// tiled cascade shadow programs (#f133e35e and three siblings) translate exactly on a host
+/// of 32-lane waves, without the mask copies. `VICTORY_WAVE_SITE_PAIRS` (opt-in): unset or
+/// `0` for no program, `all` for every one, `<hash>,...` for the listed ones.
+pub fn site_pairs_allowed(hash: Option<&str>) -> bool {
+    #[cfg(test)]
+    if let Some(value) = TEST_SITE_PAIRS.get() {
+        return site_pairs_decide(value, hash);
+    }
+    static VALUE: OnceLock<Option<String>> = OnceLock::new();
+    let value = VALUE.get_or_init(|| std::env::var(PER_PROGRAM_SWITCHES[6]).ok());
+    site_pairs_decide(value.as_deref(), hash)
+}
+
+/// [`site_pairs_allowed`] for the program being translated on this thread ([`for_program`]).
+pub(crate) fn site_pairs_here() -> bool {
+    site_pairs_allowed(current().as_deref())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's value of `VICTORY_WAVE_SITE_PAIRS` (`Some(None)`: unset), for its thread only.
+    pub(crate) static TEST_SITE_PAIRS: std::cell::Cell<Option<Option<&'static str>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`site_pairs_allowed`] on the switch's value (`None`: unset). Pure, for testing.
+fn site_pairs_decide(value: Option<&str>, hash: Option<&str>) -> bool {
+    match value.map(str::trim) {
+        None | Some("0") => false,
+        Some(v) if v.eq_ignore_ascii_case("all") => true,
+        Some(v) => listed(&parse_hash_list(v), hash),
+    }
+}
+
+/// The console offsets of the stores `VICTORY_STORE_DROP` (module notes)
+/// leaves out of the translation of the program whose hash is `hash`
+/// (`None`: not known), in increasing order; empty for most.
+pub fn dropped_stores(hash: Option<&str>) -> Vec<usize> {
+    #[cfg(test)]
+    if let Some(value) = TEST_STORE_DROP.get() {
+        return stores_for(&parse_store_drop(value), hash);
+    }
+    static LIST: OnceLock<Vec<(String, Vec<usize>)>> = OnceLock::new();
+    let list = LIST.get_or_init(|| parse_store_drop(&std::env::var(PER_PROGRAM_SWITCHES[5]).unwrap_or_default()));
+    stores_for(list, hash)
+}
+
+/// Whether the store at console offset `offset` of the program being
+/// translated on this thread ([`for_program`]) is left out
+/// (`VICTORY_STORE_DROP`).
+pub(crate) fn store_dropped_here(offset: usize) -> bool {
+    dropped_stores(current().as_deref()).contains(&offset)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's value of `VICTORY_STORE_DROP`, for its thread only.
+    pub(crate) static TEST_STORE_DROP: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_STORE_DROP`'s entries: (hash or its first digits, offsets).
+/// An entry it cannot read is left out with a warning. Pure, for testing.
+fn parse_store_drop(value: &str) -> Vec<(String, Vec<usize>)> {
+    value
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let read = || -> Option<(String, Vec<usize>)> {
+                let (hash, offsets) = entry.split_once(':')?;
+                let hash = hash.trim_start_matches('#').to_ascii_lowercase();
+                if hash.is_empty() || hash.len() > 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return None;
+                }
+                let offsets = offsets
+                    .split('+')
+                    .map(|o| {
+                        let o = o.trim();
+                        let o = o.strip_prefix("0x").or_else(|| o.strip_prefix("0X")).unwrap_or(o);
+                        usize::from_str_radix(o, 16).ok()
+                    })
+                    .collect::<Option<Vec<usize>>>()?;
+                (!offsets.is_empty()).then_some((hash, offsets))
+            };
+            let parsed = read();
+            if parsed.is_none() {
+                eprintln!("VICTORY_STORE_DROP: an entry it cannot read, left out: {entry} (<hash>:<offset>+<offset>, in hex)");
+            }
+            parsed
+        })
+        .collect()
+}
+
+/// The offsets `list` names for the program `hash`, sorted and each once.
+fn stores_for(list: &[(String, Vec<usize>)], hash: Option<&str>) -> Vec<usize> {
+    let mut out: Vec<usize> = list
+        .iter()
+        .filter(|(entry, _)| listed(std::slice::from_ref(entry), hash))
+        .flat_map(|(_, offsets)| offsets.iter().copied())
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// What `VICTORY_WAVE_MASK_COPIES` asks of a program's translation (module
+/// notes): whether a wave64 lane mask restored from scalar copies is taken
+/// as the mask it was copied from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskCopies {
+    /// Never (`0`; a list that does not name the program).
+    Off,
+    /// From the start (`all`; a list that names the program).
+    On,
+    /// Only as a second attempt after a first without them was refused with
+    /// [`MASK_COPIES_RETRY_ON`] (unset, `retry`).
+    Retry,
+}
+
+/// The refusal that gives a program a second attempt with the mask copies
+/// ([`MaskCopies::Retry`]): the one #f133e35e has without them.
+pub const MASK_COPIES_RETRY_ON: &str = super::lower::MASK_EXCHANGED;
+
+thread_local! {
+    /// Whether the translation on this thread takes the mask copies whatever the switch says
+    /// ([`with_mask_copies`]).
+    static COPIES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's value of `VICTORY_WAVE_MASK_COPIES` (`Some(None)`: unset), for its thread
+    /// only.
+    pub(crate) static TEST_MASK_COPIES: std::cell::Cell<Option<Option<&'static str>>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// Whether the deep-skips form may be tried for the program whose hash is
 /// `hash` (`None`: not known, as for a translation outside
@@ -112,6 +293,80 @@ pub fn shader_opt_allowed(hash: Option<&str>) -> bool {
         }
     });
     decide(true, l.not.as_deref(), l.only.as_deref(), hash)
+}
+
+/// What `VICTORY_WAVE_MASK_COPIES` (module notes) asks of the translation of
+/// the program whose hash is `hash` (`None`: not known, as for a translation
+/// outside [`for_program`]).
+pub fn mask_copies(hash: Option<&str>) -> MaskCopies {
+    #[cfg(test)]
+    if let Some(value) = TEST_MASK_COPIES.get() {
+        return mask_copies_decide(value, hash);
+    }
+    static VALUE: OnceLock<Option<String>> = OnceLock::new();
+    let value = VALUE.get_or_init(|| std::env::var(PER_PROGRAM_SWITCHES[4]).ok());
+    mask_copies_decide(value.as_deref(), hash)
+}
+
+/// Runs `f` with the mask copies taken (`on`) or not, whatever
+/// `VICTORY_WAVE_MASK_COPIES` says: for a caller that makes each attempt
+/// itself and files it under its own key (`victory-gpu`'s `shader_cache`).
+/// [`super::emit`] then makes no second attempt of its own.
+pub fn with_mask_copies<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COPIES.set(self.0);
+        }
+    }
+    let _restore = Restore(COPIES.replace(Some(on)));
+    f()
+}
+
+/// Whether the translation on this thread takes the mask copies: as
+/// [`with_mask_copies`] says, else as the switch says for the program
+/// ([`for_program`]; a second attempt runs inside [`with_mask_copies`]).
+pub(crate) fn mask_copies_here() -> bool {
+    COPIES.get().unwrap_or_else(|| mask_copies(current().as_deref()) == MaskCopies::On)
+}
+
+/// Whether a translation on this thread that was refused with `what` is
+/// attempted once more with the mask copies: the switch says
+/// [`MaskCopies::Retry`] for the program and no caller chose
+/// ([`with_mask_copies`]).
+pub(crate) fn mask_copies_retry_here(what: &str) -> bool {
+    COPIES.get().is_none()
+        && mask_copies_retried(what)
+        && mask_copies(current().as_deref()) == MaskCopies::Retry
+}
+
+/// Whether a translation refused with `error` (its text, or the `what` of a
+/// [`crate::ShaderError::Unsupported`]) gets a second attempt with the mask
+/// copies under [`MaskCopies::Retry`].
+pub fn mask_copies_retried(error: &str) -> bool {
+    error.contains(MASK_COPIES_RETRY_ON)
+}
+
+/// [`mask_copies`] on the switch's value (`None`: unset). Pure, for testing.
+fn mask_copies_decide(value: Option<&str>, hash: Option<&str>) -> MaskCopies {
+    let on = |yes: bool| if yes { MaskCopies::On } else { MaskCopies::Off };
+    match value.map(str::trim) {
+        None => MaskCopies::Retry,
+        Some(v) if v.eq_ignore_ascii_case("retry") => MaskCopies::Retry,
+        // (not the list of the programs whose hash begins with a 0)
+        Some("0") => MaskCopies::Off,
+        Some(v) if v.eq_ignore_ascii_case("all") => MaskCopies::On,
+        Some(v) => on(listed(&parse_hash_list(v), hash)),
+    }
+}
+
+/// Whether the program of `container` is a console wave64 program, the only
+/// kind `VICTORY_WAVE_MASK_COPIES` can change. Cheap (no translation).
+pub fn wave64_program(container: &[u8]) -> bool {
+    Container::parse(container)
+        .ok()
+        .and_then(|c| super::main_program(&c).ok())
+        .is_some_and(|p| p.wave64)
 }
 
 /// Whether the wave64 forms, and so the deep-skips switches, can matter for
@@ -234,5 +489,97 @@ mod tests {
             assert!(!wave64_retried(b"DXBC"), "{lanes}");
             super::super::lower::TEST_HOST_WAVE.set(was);
         }
+        assert!(!wave64_program(b"not a container"));
+        assert!(!wave64_program(b"DXBC"));
+    }
+
+    #[test]
+    fn mask_copies_go_by_the_switch_and_default_to_a_second_attempt() {
+        use MaskCopies::{Off, On, Retry};
+        const SHADOW: &str = "f133e35efed2a48a";
+        for hash in [Some(A), Some(B), Some(SHADOW), None] {
+            assert_eq!(mask_copies_decide(None, hash), Retry, "unset: {hash:?}");
+            assert_eq!(mask_copies_decide(Some("retry"), hash), Retry, "retry: {hash:?}");
+            assert_eq!(mask_copies_decide(Some(" RETRY "), hash), Retry, "retry: {hash:?}");
+            assert_eq!(mask_copies_decide(Some("0"), hash), Off, "0: {hash:?}");
+            assert_eq!(mask_copies_decide(Some(" 0 "), hash), Off, "0: {hash:?}");
+            assert_eq!(mask_copies_decide(Some(""), hash), Off, "an empty list: {hash:?}");
+            assert_eq!(mask_copies_decide(Some("all"), hash), On, "all: {hash:?}");
+            assert_eq!(mask_copies_decide(Some("ALL"), hash), On, "all: {hash:?}");
+        }
+        let list = Some("#0123456789abcdef, fedcba98");
+        assert_eq!(mask_copies_decide(list, Some(A)), On);
+        assert_eq!(mask_copies_decide(list, Some(B)), On, "by its first digits");
+        assert_eq!(mask_copies_decide(list, Some(SHADOW)), Off, "a list: no retry for the others");
+        assert_eq!(mask_copies_decide(list, None), Off);
+        // The refusal the retry is for, as `what` and as a whole error's text.
+        assert!(mask_copies_retried(MASK_COPIES_RETRY_ON));
+        let text = crate::ShaderError::Unsupported { offset: 0x1eb4, what: MASK_COPIES_RETRY_ON }.to_string();
+        assert!(mask_copies_retried(&text), "{text}");
+        assert!(!mask_copies_retried("a lane mask holding lanes elsewhere read as data"));
+        assert!(!mask_copies_retried("an opaque lane mask"));
+        // The test override is this thread's alone and takes the switch's place.
+        let was = TEST_MASK_COPIES.replace(Some(Some("all")));
+        assert_eq!(mask_copies(Some(A)), On);
+        assert!(for_program(A, mask_copies_here));
+        assert!(!for_program(A, || mask_copies_retry_here(MASK_COPIES_RETRY_ON)), "all: no second attempt");
+        TEST_MASK_COPIES.set(Some(None));
+        assert_eq!(mask_copies(Some(SHADOW)), Retry);
+        // retry: the first attempt without; a second one after the refusal, unless the caller
+        // chose ([`with_mask_copies`]).
+        assert!(!for_program(SHADOW, mask_copies_here));
+        assert!(for_program(SHADOW, || mask_copies_retry_here(MASK_COPIES_RETRY_ON)));
+        assert!(!for_program(SHADOW, || mask_copies_retry_here("an opaque lane mask")));
+        assert!(with_mask_copies(true, mask_copies_here));
+        assert!(!with_mask_copies(false, || mask_copies_retry_here(MASK_COPIES_RETRY_ON)));
+        assert!(!with_mask_copies(true, || with_mask_copies(false, mask_copies_here)));
+        assert!(with_mask_copies(true, || {
+            let _ = with_mask_copies(false, mask_copies_here);
+            mask_copies_here()
+        }), "restored after the inner one");
+        assert!(!mask_copies_here(), "and after the outer one");
+        TEST_MASK_COPIES.set(Some(Some("0")));
+        assert!(!for_program(SHADOW, || mask_copies_retry_here(MASK_COPIES_RETRY_ON)));
+        TEST_MASK_COPIES.set(was);
+    }
+
+    #[test]
+    fn site_pairs_are_opt_in_per_program() {
+        const SHADOW: &str = "f133e35efed2a48a";
+        for hash in [Some(A), Some(SHADOW), None] {
+            assert!(!site_pairs_decide(None, hash), "unset: {hash:?}");
+            assert!(!site_pairs_decide(Some("0"), hash), "0: {hash:?}");
+            assert!(site_pairs_decide(Some("all"), hash), "all: {hash:?}");
+        }
+        assert!(site_pairs_decide(Some("f133e35e"), Some(SHADOW)));
+        assert!(!site_pairs_decide(Some("f133e35e"), Some(A)));
+        let was = TEST_SITE_PAIRS.replace(Some(Some("f133e35e")));
+        assert!(for_program(SHADOW, site_pairs_here));
+        assert!(!for_program(A, site_pairs_here));
+        assert!(!site_pairs_here(), "outside a program's translation");
+        TEST_SITE_PAIRS.set(was);
+    }
+
+    #[test]
+    fn dropped_stores_go_by_hash_and_offset() {
+        const SHADOW: &str = "f133e35efed2a48a";
+        let list = parse_store_drop("f133e35e:2957c+0x294b8, #0123456789abcdef:10 f133e35efed2a48a:2957C");
+        assert_eq!(list.len(), 3);
+        assert_eq!(stores_for(&list, Some(SHADOW)), vec![0x294b8, 0x2957c], "sorted, once each, by prefix");
+        assert_eq!(stores_for(&list, Some(A)), vec![0x10]);
+        assert_eq!(stores_for(&list, Some(B)), Vec::<usize>::new());
+        assert_eq!(stores_for(&list, None), Vec::<usize>::new(), "an unknown program is not listed");
+        // Entries it cannot read are left out, the others kept.
+        let bad = parse_store_drop("f133e35e,f133e35e:,zz:10,f133e35e:12+xy,0123:20");
+        assert_eq!(bad, vec![("0123".to_owned(), vec![0x20])]);
+        assert!(parse_store_drop("").is_empty());
+        // The test override, and the program on this thread.
+        let was = TEST_STORE_DROP.replace(Some("f133e35e:2957c"));
+        assert_eq!(dropped_stores(Some(SHADOW)), vec![0x2957c]);
+        assert!(for_program(SHADOW, || store_dropped_here(0x2957c)));
+        assert!(!for_program(SHADOW, || store_dropped_here(0x294b8)));
+        assert!(!for_program(A, || store_dropped_here(0x2957c)));
+        assert!(!store_dropped_here(0x2957c), "outside a program's translation");
+        TEST_STORE_DROP.set(was);
     }
 }

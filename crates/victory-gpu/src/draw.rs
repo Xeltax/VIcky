@@ -2311,6 +2311,8 @@ impl State {
             return;
         }
         #[cfg(feature = "diagnostics")]
+        crate::pipeline::note_ran(self.pipeline as This);
+        #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             let parts = if gx > crate::indirect::PART && crate::indirect::parts_on() {
                 format!(" in {} parts", crate::indirect::parts_of(gx))
@@ -3484,6 +3486,10 @@ impl State {
             return false;
         }
         #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH {
+            crate::pipeline::note_ran(self.pipeline as This);
+        }
+        #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             let parts = match (&split, parted) {
                 (Some(_), true) => " in parts",
@@ -3830,10 +3836,12 @@ fn describe(view: Option<&View>) -> String {
         None => "no view".into(),
         Some(v @ View::Shader(r, _)) => texture(*r as This)
             .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
-        Some(v @ View::Unordered(r, ..)) => match texture(*r as This) {
-            Some(t) => format!("uav texture {t}"),
+        // (with the title's view description: a typed view's DXGI format first, then
+        // dimension, first element, element count, stride, counter offset, flags)
+        Some(v @ View::Unordered(r, _, desc)) => match texture(*r as This) {
+            Some(t) => format!("uav texture {t} view {desc:?}"),
             None => format!(
-                "uav resource {r:#x} buffer {:?}",
+                "uav resource {r:#x} buffer {:?} view {desc:?}",
                 crate::descriptor::host::buffer_range(v)
             ),
         },

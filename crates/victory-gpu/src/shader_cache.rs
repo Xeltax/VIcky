@@ -82,41 +82,83 @@ fn build() -> [u8; 32] {
 /// was translated now. Needs [`use_shader_cache`] and the same host facts
 /// the run will have (`victory_shader::emit::translation_fingerprint`).
 pub fn warm(container: &[u8]) -> Result<bool, String> {
-    use victory_shader::emit;
     let cache = CACHE.get().ok_or("no shader cache")?;
     // The heap map of a capped host, as its run translates with it.
     crate::descriptor::host::offline_heap_map();
     let ran = AtomicBool::new(false);
-    // By its hash and under its own key, as at run time ([`host_shader`]):
-    // the per-program switches.
-    let hash = blake3::hash(container).to_hex()[..16].to_owned();
-    let translate = |c: &[u8]| {
-        ran.store(true, Ordering::Relaxed);
-        emit::for_program(&hash, || emit::translate(c)).map_err(|e| e.to_string())
-    };
-    let off = !emit::deep_skips_allowed(Some(&hash)) && emit::wave64_retried(container);
-    let key = program_key(&build(), off, opt_off(&hash));
-    cached(cache, &key, container, translate).map(|_| ran.load(Ordering::Relaxed))
+    // As at run time ([`host_shader`]): by its hash and under its own keys.
+    translation(Some(cache), container, &ran).map(|_| ran.load(Ordering::Relaxed))
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    translation(CACHE.get(), container, &AtomicBool::new(false))
+}
+
+/// The translation of `container` through `cache` if any, by the hash the
+/// log names the shader by (`pipeline.rs`), which the per-program switches
+/// take; `ran` is set when some attempt translated (was not in the cache).
+///
+/// With `VICTORY_WAVE_MASK_COPIES` at `retry` (the default) a console
+/// wave64 program refused without the mask copies is translated again with
+/// them (`victory_shader::emit::MaskCopies`). Each attempt runs with the
+/// copies chosen here (`emit::with_mask_copies`, so the translator makes no
+/// second attempt of its own) under the key of that choice
+/// ([`program_key`]): the second attempt is filed where `all` files that
+/// program, never where the first attempt would be. A refusal is not
+/// cached, so such a program's first attempt runs once a run.
+fn translation(cache: Option<&Cache>, container: &[u8], ran: &AtomicBool) -> Result<HostShader, String> {
     use victory_shader::emit;
-    // The hash the log names the shader by (`pipeline.rs`), which the
-    // per-program switches take.
     let hash = blake3::hash(container).to_hex()[..16].to_owned();
-    let translate = |c: &[u8]| emit::for_program(&hash, || emit::translate(c)).map_err(|e| e.to_string());
-    match CACHE.get() {
-        Some(cache) => {
-            // (`wave64_retried` second: it parses the container, and only a
-            // program a list names, or with `VICTORY_WAVE_DEEP_SKIPS=0`
-            // any, gets there)
-            let off = !emit::deep_skips_allowed(Some(&hash)) && emit::wave64_retried(container);
-            let key = program_key(&build(), off, opt_off(&hash));
-            cached(cache, &key, container, translate)
+    let attempt = |copies: bool| {
+        let translate = |c: &[u8]| {
+            ran.store(true, Ordering::Relaxed);
+            emit::for_program(&hash, || emit::with_mask_copies(copies, || emit::translate(c))).map_err(|e| e.to_string())
+        };
+        match cache {
+            Some(cache) => {
+                // (`wave64_retried` second: it parses the container, and only a
+                // program a list names, or with `VICTORY_WAVE_DEEP_SKIPS=0`
+                // any, gets there)
+                let off = !emit::deep_skips_allowed(Some(&hash)) && emit::wave64_retried(container);
+                let dropped = emit::dropped_stores(Some(&hash));
+                // (`wave64_program` second, as above)
+                let pairs = emit::site_pairs_allowed(Some(&hash)) && emit::wave64_program(container);
+                let key = program_key(&build(), off, opt_off(&hash), copies, pairs, &dropped);
+                cached(cache, &key, container, translate)
+            }
+            None => translate(container),
         }
-        None => translate(container),
+    };
+    let copied = attempts(emit::mask_copies(Some(&hash)), || emit::wave64_program(container), attempt);
+    if copied.1 {
+        tracing::info!(hash = %hash, ok = copied.0.is_ok(), "shader refused without the mask copies, translated again with them");
+    }
+    copied.0
+}
+
+/// The attempts [`translation`] makes under `mode`: `attempt(copies)` once,
+/// or for `MaskCopies::Retry` once more with the copies after a refusal
+/// that asks for it (`wave64`: whether the program is a console wave64 one,
+/// asked only then). The result, and whether there was a second attempt.
+fn attempts<T>(
+    mode: victory_shader::emit::MaskCopies,
+    wave64: impl Fn() -> bool,
+    attempt: impl Fn(bool) -> Result<T, String>,
+) -> (Result<T, String>, bool) {
+    use victory_shader::emit::{self, MaskCopies};
+    match mode {
+        MaskCopies::Off => (attempt(false), false),
+        MaskCopies::On => (attempt(wave64()), false),
+        MaskCopies::Retry => match attempt(false) {
+            Err(e) if emit::mask_copies_retried(&e) && wave64() => match attempt(true) {
+                Ok(again) => (Ok(again), true),
+                // (refused again: the first refusal, as without the switch)
+                Err(_) => (Err(e), true),
+            },
+            first => (first, false),
+        },
     }
 }
 
@@ -129,12 +171,30 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 /// - The program is kept out of the clean-up passes while the build runs
 ///   some (`VICTORY_SHADER_OPT_NOT`, `_ONLY`:
 ///   `victory_shader::emit::shader_opt_allowed`).
+/// - The translation takes a wave64 mask restored from scalar copies as the
+///   mask it was copied from (`VICTORY_WAVE_MASK_COPIES`:
+///   `victory_shader::emit::mask_copies`; by default only a second attempt
+///   after a refusal, [`translation`]). Only for a console wave64 program,
+///   the only ones it can change.
+/// - The program is built with fork #1002's forms (`VICTORY_WAVE_SITE_PAIRS`:
+///   `victory_shader::emit::site_pairs_allowed`). Only for a console wave64
+///   program, the only ones they can change.
+/// - Stores left out of the program (`VICTORY_STORE_DROP`, diagnostics:
+///   `victory_shader::emit::dropped_stores`): their console offsets.
 ///
 /// So the lists are in no key: changing one translates again only the
 /// programs whose decision it changes, and a program the lists leave alone
 /// keeps the key it had without any list.
-fn program_key(build: &[u8; 32], deep_skips_off: bool, opt_off: bool) -> [u8; 32] {
-    if !deep_skips_off && !opt_off {
+#[allow(clippy::fn_params_excessive_bools)] // one per switch, each mixed in on its own
+fn program_key(
+    build: &[u8; 32],
+    deep_skips_off: bool,
+    opt_off: bool,
+    mask_copies: bool,
+    site_pairs: bool,
+    dropped: &[usize],
+) -> [u8; 32] {
+    if !deep_skips_off && !opt_off && !mask_copies && !site_pairs && dropped.is_empty() {
         return *build;
     }
     let mut h = blake3::Hasher::new();
@@ -144,6 +204,18 @@ fn program_key(build: &[u8; 32], deep_skips_off: bool, opt_off: bool) -> [u8; 32
     }
     if opt_off {
         h.update(b"VICTORY_SHADER_OPT off for this program");
+    }
+    if mask_copies {
+        h.update(b"VICTORY_WAVE_MASK_COPIES on for this program");
+    }
+    if site_pairs {
+        h.update(b"VICTORY_WAVE_SITE_PAIRS on for this program");
+    }
+    if !dropped.is_empty() {
+        h.update(b"VICTORY_STORE_DROP for this program:");
+        for offset in dropped {
+            h.update(&(*offset as u64).to_le_bytes());
+        }
     }
     *h.finalize().as_bytes()
 }
@@ -463,11 +535,11 @@ mod tests {
     #[test]
     fn a_program_kept_out_of_the_deep_skips_form_has_a_key_of_its_own() {
         let build = [7u8; 32];
-        assert_eq!(program_key(&build, false, false), build, "allowed: the build's key, as without lists");
-        let off = program_key(&build, true, false);
+        assert_eq!(program_key(&build, false, false, false, false, &[]), build, "allowed: the build's key, as without lists");
+        let off = program_key(&build, true, false, false, false, &[]);
         assert_ne!(off, build);
-        assert_eq!(program_key(&build, true, false), off, "the same decision, the same key");
-        assert_ne!(program_key(&[8; 32], true, false), off, "and still the build's");
+        assert_eq!(program_key(&build, true, false, false, false, &[]), off, "the same decision, the same key");
+        assert_ne!(program_key(&[8; 32], true, false, false, false, &[]), off, "and still the build's");
 
         // So only the program whose decision changed is translated again.
         let dir = tempfile::tempdir().unwrap();
@@ -479,16 +551,16 @@ mod tests {
         };
         let [a, b] = [b"program a".as_slice(), b"program b"];
         for c in [a, b] {
-            cached(&cache, &program_key(&build, false, false), c, translate).unwrap();
+            cached(&cache, &program_key(&build, false, false, false, false, &[]), c, translate).unwrap();
         }
         assert_eq!(runs.load(Ordering::Relaxed), 2);
         // a listed: a translated again, b from the cache
-        cached(&cache, &program_key(&build, true, false), a, translate).unwrap();
-        cached(&cache, &program_key(&build, false, false), b, translate).unwrap();
+        cached(&cache, &program_key(&build, true, false, false, false, &[]), a, translate).unwrap();
+        cached(&cache, &program_key(&build, false, false, false, false, &[]), b, translate).unwrap();
         assert_eq!(runs.load(Ordering::Relaxed), 3);
         // the list emptied again: both from the cache
         for c in [a, b] {
-            cached(&cache, &program_key(&build, false, false), c, translate).unwrap();
+            cached(&cache, &program_key(&build, false, false, false, false, &[]), c, translate).unwrap();
         }
         assert_eq!(runs.load(Ordering::Relaxed), 3);
     }
@@ -496,10 +568,10 @@ mod tests {
     #[test]
     fn a_program_kept_out_of_the_clean_up_has_a_key_of_its_own() {
         let build = [7u8; 32];
-        assert_eq!(program_key(&build, false, false), build);
-        let opt = program_key(&build, false, true);
-        let deep = program_key(&build, true, false);
-        let both = program_key(&build, true, true);
+        assert_eq!(program_key(&build, false, false, false, false, &[]), build);
+        let opt = program_key(&build, false, true, false, false, &[]);
+        let deep = program_key(&build, true, false, false, false, &[]);
+        let both = program_key(&build, true, true, false, false, &[]);
         assert_ne!(opt, build);
         // Each decision a key of its own, the deep-skips one as before.
         assert!(opt != deep && opt != both && deep != both);
@@ -508,10 +580,100 @@ mod tests {
         h.update(b"VICTORY_WAVE_DEEP_SKIPS off for this program");
         let unchanged = *h.finalize().as_bytes();
         assert_eq!(deep, unchanged, "the deep-skips key is unchanged");
-        let again = program_key(&build, false, true);
+        let again = program_key(&build, false, true, false, false, &[]);
         assert_eq!(again, opt, "the same decision, the same key");
-        let other = program_key(&[8; 32], false, true);
+        let other = program_key(&[8; 32], false, true, false, false, &[]);
         assert_ne!(other, opt, "and still the build's");
+    }
+
+    #[test]
+    fn a_program_that_takes_mask_copies_has_a_key_of_its_own() {
+        let build = [7u8; 32];
+        let copies = program_key(&build, false, false, true, false, &[]);
+        assert_ne!(copies, build, "the build's key is for the programs that do not");
+        assert_eq!(program_key(&build, false, false, true, false, &[]), copies, "the same decision, the same key");
+        assert_ne!(program_key(&[8; 32], false, false, true, false, &[]), copies, "and still the build's");
+        // Each combination a key of its own; the earlier ones unchanged.
+        let all: Vec<[u8; 32]> = (0..8u8)
+            .map(|n| program_key(&build, n & 1 != 0, n & 2 != 0, n & 4 != 0, false, &[]))
+            .collect();
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        let mut h = blake3::Hasher::new();
+        h.update(&build);
+        h.update(b"VICTORY_WAVE_DEEP_SKIPS off for this program");
+        assert_eq!(program_key(&build, true, false, false, false, &[]), *h.finalize().as_bytes());
+    }
+
+    #[test]
+    fn a_program_with_dropped_stores_has_a_key_per_list_of_stores() {
+        let build = [7u8; 32];
+        let one = program_key(&build, false, false, false, false, &[0x2957c]);
+        let two = program_key(&build, false, false, false, false, &[0x294b8, 0x29598]);
+        assert_ne!(one, build);
+        assert_ne!(one, two);
+        assert_eq!(program_key(&build, false, false, false, false, &[0x2957c]), one, "the same stores, the same key");
+        assert_ne!(program_key(&build, false, false, true, false, &[0x2957c]), one, "with the other decisions too");
+        assert_eq!(program_key(&build, false, false, false, false, &[]), build, "none: the build's key");
+    }
+
+    #[test]
+    fn a_program_built_with_site_pairs_has_a_key_of_its_own() {
+        let build = [7u8; 32];
+        let pairs = program_key(&build, false, false, false, true, &[]);
+        let copies = program_key(&build, false, false, true, false, &[]);
+        assert_ne!(pairs, build);
+        assert_ne!(pairs, copies, "not the mask copies' key");
+        assert_ne!(program_key(&build, false, false, true, true, &[]), pairs);
+        assert_eq!(program_key(&build, false, false, false, true, &[]), pairs, "the same decision, the same key");
+    }
+
+    #[test]
+    fn a_second_attempt_with_mask_copies_is_filed_apart_from_the_first() {
+        use victory_shader::emit::{MASK_COPIES_RETRY_ON, MaskCopies};
+        let build = [7u8; 32];
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        // A program refused without the copies and translated with them, as #f133e35e.
+        let runs = AtomicU64::new(0);
+        let wave64 = || true;
+        let attempt = |copies: bool| {
+            let translate = |_: &[u8]| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                if copies {
+                    Ok(shader())
+                } else {
+                    Err(format!("GFX10 code at 0x1eb4: {MASK_COPIES_RETRY_ON} is not supported"))
+                }
+            };
+            cached(&cache, &program_key(&build, false, false, copies, false, &[]), b"program", translate)
+        };
+        let (r, again) = attempts(MaskCopies::Retry, wave64, attempt);
+        assert_eq!((r, again), (Ok(shader()), true));
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        // The refusal is not cached; the second attempt is, under the copies' key, where
+        // `all` finds it, and not under the first attempt's, where `0` looks.
+        let (r, again) = attempts(MaskCopies::Retry, wave64, attempt);
+        assert_eq!((r, again), (Ok(shader()), true));
+        assert_eq!(runs.load(Ordering::Relaxed), 3, "the first attempt again, the second from the cache");
+        assert_eq!(attempts(MaskCopies::On, wave64, attempt).0, Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 3, "all: from the cache");
+        assert!(attempts(MaskCopies::Off, wave64, attempt).0.is_err(), "0: refused, as before");
+        // Not for a program that is no console wave64 one, nor after another refusal.
+        assert!(attempts(MaskCopies::Retry, || false, attempt).0.is_err());
+        let other = |copies: bool| if copies { Ok(1) } else { Err("an opaque lane mask".to_owned()) };
+        assert_eq!(attempts(MaskCopies::Retry, wave64, other), (Err("an opaque lane mask".to_owned()), false));
+        // A program that translates without the copies never takes them under `retry`.
+        let fine = |copies: bool| Ok::<_, String>(copies);
+        assert_eq!(attempts(MaskCopies::Retry, wave64, fine), (Ok(false), false));
+        assert_eq!(attempts(MaskCopies::On, wave64, fine), (Ok(true), false));
+        assert_eq!(attempts(MaskCopies::On, || false, fine), (Ok(false), false));
+        // Refused again with the copies: the first refusal.
+        let both = |copies: bool| Err::<u8, _>(format!("{MASK_COPIES_RETRY_ON} ({copies})"));
+        assert_eq!(attempts(MaskCopies::Retry, wave64, both), (Err(format!("{MASK_COPIES_RETRY_ON} (false)")), true));
     }
 
     #[test]

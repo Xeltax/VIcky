@@ -2844,6 +2844,38 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     }
 }
 
+/// The float format of the same width as a 32-bit integer one (other
+/// formats as they are). Translated shaders declare every typed buffer load
+/// and store as 32-bit float (`victory_shader` `emit/lower.rs`); through a
+/// view in a 32-bit integer format a store converts the float to the
+/// integer it rounds to, so an integer's bits stored as a float come out as
+/// 0 for most of them, where the console moves the bits. The float format
+/// moves them unchanged. From GamingRipperDoc's fix in the fork (#684,
+/// `bit_exact_format`).
+fn bit_exact_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    match format {
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT => DXGI_FORMAT_R32G32B32A32_FLOAT,
+        DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT => DXGI_FORMAT_R32G32B32_FLOAT,
+        DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT => DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT => DXGI_FORMAT_R32_FLOAT,
+        other => other,
+    }
+}
+
+/// The format the host makes a typed buffer view of `format` in:
+/// [`bit_exact_format`] with `VICTORY_TYPED_BIT_EXACT=1` (opt-in), else the
+/// title's. A store of `CS_ShadowRenderTiledCascadesAlphaCBPPPC` (#f133e35e)
+/// sets bit 14 of a per-tile word this way (0x2957c); RT88a lost the
+/// characters' heads once that program ran.
+fn typed_view_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_TYPED_BIT_EXACT").is_some_and(|v| v == "1")) {
+        bit_exact_format(format)
+    } else {
+        format
+    }
+}
+
 /// A buffer view of title memory at `address` on its host copy: the first
 /// element moves by the copy's offset.
 /// Bytes per element of a buffer view.
@@ -3733,6 +3765,8 @@ fn buffer_srv_plan(
             Flags: D3D12_BUFFER_SRV_FLAG_RAW,
         };
     }
+    // (the same element size: the offsets below hold)
+    desc.Format = typed_view_format(desc.Format);
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -3853,6 +3887,8 @@ fn buffer_uav_plan(
     buffer.CounterOffsetInBytes = 0;
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    // (the same element size: the first element above holds)
+    desc.Format = typed_view_format(desc.Format);
     if window.is_some() {
         // (Left out at first: every structured unordered access view was then
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
@@ -4425,6 +4461,32 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `VICTORY_TYPED_BIT_EXACT`: typed buffer views of 32-bit integer
+    /// formats in the float format of the same width (the same element
+    /// size); every other format is the title's.
+    #[test]
+    fn typed_buffer_views_of_32_bit_integers_move_bits() {
+        for (title, host) in [
+            (DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32_FLOAT),
+            (DXGI_FORMAT_R32G32B32_SINT, DXGI_FORMAT_R32G32B32_FLOAT),
+            (DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT),
+        ] {
+            assert_eq!(bit_exact_format(title), host);
+            assert_eq!(crate::resource::element(title.0 as u32), crate::resource::element(host.0 as u32));
+        }
+        for kept in [
+            DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_R32_TYPELESS,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_R16G16_UINT,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+        ] {
+            assert_eq!(bit_exact_format(kept), kept);
+        }
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

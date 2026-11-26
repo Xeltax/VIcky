@@ -535,6 +535,9 @@ struct Lanes<'a> {
     /// SCC values of [`Self::scc_lane`] that are set when EVERY lane's bit is (`s_cmp_eq` of
     /// two masks: "no lane differs"); the others are set when some lane's is.
     scc_every: HashSet<Value>,
+    /// A wave64 mask restored from scalar copies is the mask it was copied from
+    /// (`VICTORY_WAVE_MASK_COPIES`: [`crate::emit::MaskCopies`]).
+    copies: bool,
     /// See [`Structured::wave_any`].
     wave_any: Vec<Option<bool>>,
 }
@@ -617,6 +620,7 @@ impl<'a> Lanes<'a> {
             wide: HashSet::new(),
             scc_every: HashSet::new(),
             wave_any: vec![None; blocks.len()],
+            copies: p.wave64 && crate::emit::mask_copies_here(),
         })
     }
 
@@ -897,6 +901,19 @@ impl<'a> Lanes<'a> {
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
         }
+        // A scalar pair can be parked in two VGPR lanes and restored one
+        // dword at a time. The spill pass turns these into scalar moves.
+        // Recover the original lane predicate only when the two words
+        // still come from the same known mask, in their original order.
+        // Per program: `VICTORY_WAVE_MASK_COPIES` (`copies`).
+        if self.copies {
+            let source = (self.move_source(k.0), self.move_source(k.1));
+            if source != k && let Some(&m) = self.masks.get(&source) {
+                self.why_copies(k, source);
+                self.masks.insert(k, m);
+                return (m, true);
+            }
+        }
         let p = self.p;
         let (m, derived) = match self.join(k) {
             Some(join) => join,
@@ -937,6 +954,46 @@ impl<'a> Lanes<'a> {
         };
         cache.insert(k, m);
         (m, derived)
+    }
+
+    /// `VICTORY_WAVE_WHY`: a `MASK-COPIES` line naming where each dword of
+    /// the pair `k` and of the mask `source` it is taken as is written
+    /// (instruction offsets; `-` for a phi or an entry value).
+    fn why_copies(&self, k: Key, source: Key) {
+        static WHY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*WHY.get_or_init(|| std::env::var_os("VICTORY_WAVE_WHY").is_some()) {
+            return;
+        }
+        let at = |v: Value| match self.defs.get(&v) {
+            Some(&(b, i)) => {
+                let inst = &self.p.blocks[b].insts[i];
+                format!("{:#x} {}", inst.machine.offset, inst.name())
+            }
+            None => "-".to_owned(),
+        };
+        let hash = crate::emit::program_hash();
+        eprintln!(
+            "MASK-COPIES #{} pair ({} / {}) taken as ({} / {})",
+            hash.as_deref().unwrap_or("?"),
+            at(k.0),
+            at(k.1),
+            at(source.0),
+            at(source.1)
+        );
+    }
+
+    fn move_source(&self, mut value: Value) -> Value {
+        while let Some(&(b, i)) = self.defs.get(&value) {
+            let inst = &self.p.blocks[b].insts[i];
+            let [(Reg::S(_), source)] = inst.reads.as_slice() else {
+                break;
+            };
+            if inst.name() != "s_mov_b32" {
+                break;
+            }
+            value = *source;
+        }
+        value
     }
 
     /// A mask joined by phis at a block entry, and whether a mask coming in
@@ -1688,6 +1745,100 @@ mod tests {
                 "{reader:#x}: vcc_hi was zeroed after the compare"
             );
         }
+    }
+
+    #[test]
+    fn split_scalar_copies_across_a_branch_preserve_both_words_of_a_wave64_mask() {
+        for (high, intact) in [(0xBE83_036B, true), (0xBE83_036A, false)] {
+            let p = build(
+                &[
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBE84_046A, // s_mov_b64 s[4:5], vcc
+                    0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                    0xBF85_0004, // s_cbranch_scc1 -> join at 32
+                    0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                    high,        // s_mov_b32 s3, vcc_hi (or vcc_lo)
+                    0xBE84_0302, // s_mov_b32 s4, s2
+                    0xBE85_0303, // s_mov_b32 s5, s3
+                    0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,
+                ],
+                true,
+            );
+            let s = with_switch(Some("all"), || structure(&p)).unwrap();
+            let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+            let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
+            assert_eq!(s.masks[&restored] == s.masks[&compare], intact);
+        }
+    }
+
+    /// `f` with `VICTORY_WAVE_MASK_COPIES` as `value` (`None`: unset), on this thread.
+    fn with_switch<T>(value: Option<&'static str>, f: impl FnOnce() -> T) -> T {
+        let was = crate::emit::TEST_MASK_COPIES.replace(Some(value));
+        let out = f();
+        crate::emit::TEST_MASK_COPIES.set(was);
+        out
+    }
+
+    #[test]
+    fn a_mask_restored_from_scalar_copies_is_recovered_only_where_the_switch_says() {
+        // As above, the copies intact.
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE84_046A, // s_mov_b64 s[4:5], vcc
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0xBF85_0004, // s_cbranch_scc1 -> join at 32
+                0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                0xBE83_036B, // s_mov_b32 s3, vcc_hi
+                0xBE84_0302, // s_mov_b32 s4, s2
+                0xBE85_0303, // s_mov_b32 s5, s3
+                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
+        // `forced`: the attempt a caller chose (`emit::with_mask_copies`), as the second
+        // attempt under `retry` is.
+        let recovered = |value: Option<&'static str>, hash: Option<&str>, forced: Option<bool>| {
+            let s = with_switch(value, || {
+                let run = || match hash {
+                    Some(h) => crate::emit::for_program(h, || structure(&p)),
+                    None => structure(&p),
+                };
+                match forced {
+                    Some(on) => crate::emit::with_mask_copies(on, run),
+                    None => run(),
+                }
+            })
+            .unwrap();
+            s.masks.get(&restored) == Some(&s.masks[&compare])
+        };
+        const SHADOW: &str = "f133e35efed2a48a";
+        const OTHER: &str = "0123456789abcdef";
+        // Unset or retry: not on a first attempt, for any program; on the second.
+        for value in [None, Some("retry")] {
+            for hash in [Some(SHADOW), Some(OTHER), None] {
+                assert!(!recovered(value, hash, None), "{value:?} {hash:?}");
+                assert!(recovered(value, hash, Some(true)), "{value:?} {hash:?}");
+            }
+        }
+        // 0: none (not the programs whose hash begins with a 0).
+        assert!(!recovered(Some("0"), Some(SHADOW), None));
+        assert!(!recovered(Some("0"), Some(OTHER), None));
+        // all: every program, from the start.
+        assert!(recovered(Some("all"), Some(OTHER), None));
+        assert!(recovered(Some("all"), None, None));
+        // A list: its programs, by the first digits of their hash.
+        assert!(recovered(Some("#01234567,abcd"), Some(OTHER), None));
+        assert!(!recovered(Some("01234567"), Some(SHADOW), None));
+        // The caller's choice wins over the switch.
+        assert!(!recovered(Some("all"), Some(OTHER), Some(false)));
+        assert!(recovered(Some("0"), Some(OTHER), Some(true)));
     }
 
     #[test]
