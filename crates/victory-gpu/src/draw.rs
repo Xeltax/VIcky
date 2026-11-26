@@ -988,8 +988,13 @@ impl State {
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
         use victory_shader::emit::{
-            USER_DISPATCH_THREADS, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+            USER_DISPATCH_THREADS, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
         };
+        // A dispatch runs whole; between the parts of a larger one the
+        // host sets it (`crate::indirect::record_parts`, `bound_split`).
+        if kind == USER_GROUP_BASE {
+            return 0;
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -2306,11 +2311,21 @@ impl State {
             return;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {gx}x{gy}x{gz}"), true));
+        list.note_op(|| {
+            let parts = if gx > crate::indirect::PART && crate::indirect::parts_on() {
+                format!(" in {} parts", crate::indirect::parts_of(gx))
+            } else {
+                String::new()
+            };
+            self.op_text(format!("dispatch {gx}x{gy}x{gz}{parts}"), true)
+        });
         match &ours {
             Some(ours) => self.bvh_copy_after(list, ours, [gx, gy, gz]),
-            // SAFETY: an open list with everything set.
-            None => unsafe { list.list.Dispatch(gx, gy, gz) },
+            // More groups in x than the host runs: in parts
+            // (`crate::indirect::record_parts`).
+            None => {
+                crate::indirect::dispatch_parts(&list.list, group_base(p), [gx, gy, gz]);
+            }
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
@@ -3209,6 +3224,47 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
+        // One dispatch record, which may ask for more groups in x than one
+        // dispatch runs: clamped into parts and run as one execution of up
+        // to `MOST_PARTS` commands whose count the clamp writes, each
+        // setting the number of its part's first group if the program
+        // reads its x number ([`group_base`]; `crate::indirect::bound_split`).
+        // (myokex's fix, ZSlayerHQ/victory-world-runtime 4436f8f, ran two
+        // executions, the constant set between them.) By default
+        // (`VICTORY_DISPATCH_PARTS` unset or `seen`) only a program seen
+        // asking for more (`crate::indirect::program_parts`, by its hash);
+        // the others go the plain way, their program numbered for the clamp
+        // to note. `VICTORY_DISPATCH_PARTS=all`: every one.
+        let base = if kind == DISPATCH { group_base(p) } else { None };
+        let single = kind == DISPATCH && max == 1;
+        let (program, parted) = match crate::indirect::parts_mode() {
+            crate::indirect::Parts::All => (0, single),
+            crate::indirect::Parts::Seen if single => {
+                p.stages.first().map_or((0, false), |stage| crate::indirect::program_parts(&stage.shader.hash))
+            }
+            _ => (0, false),
+        };
+        // (`VICTORY_DISPATCH_PLAIN`, not with `all` or `0`) What a single
+        // record that is not parted does instead of the plain path of before.
+        let plain = match p.stages.first() {
+            Some(stage) if single && !parted => crate::indirect::plain_for(&stage.shader.hash),
+            _ => crate::indirect::Plain::default(),
+        };
+        // The parts' command signature, and where it sets the number of
+        // each part's first group (none: from the records' second words).
+        let split = if parted {
+            match base {
+                Some(base) => crate::indirect::split_signature(&p.root, base).map(|s| (s, Some(base))),
+                None => host_signature(DISPATCH, crate::indirect::PART_STRIDE).map(|s| (s, None)),
+            }
+        } else if plain.rootsig && base.is_some() {
+            // One part, through the signature that sets the base.
+            base.and_then(|base| crate::indirect::split_signature(&p.root, base).map(|s| (s, Some(base))))
+        } else if plain.split || plain.rootsig {
+            host_signature(DISPATCH, crate::indirect::PART_STRIDE).map(|s| (s, None))
+        } else {
+            None
+        };
         let windowed = windows()
             && kind != DISPATCH
             && max == 1
@@ -3358,7 +3414,13 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
+                let bounded = if split.is_some() && parted {
+                    crate::indirect::bound_split(list, (&args.buffer, offset), count_arg, stride)
+                } else if split.is_some() {
+                    crate::indirect::bound_split_one(list, (&args.buffer, offset), count_arg, stride, program)
+                } else if single && program != 0 {
+                    crate::indirect::bound_noted(list, (&args.buffer, offset), count_arg, (kind, step, records), program)
+                } else if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
@@ -3423,23 +3485,50 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            let parts = match (&split, parted) {
+                (Some(_), true) => " in parts",
+                (Some(_), false) => " as one part (VICTORY_DISPATCH_PLAIN split or rootsig)",
+                (None, _) => "",
+            };
+            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}{parts}"), kind == DISPATCH)
         });
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
-        // SAFETY: an open list with everything set; the scratch buffer and
-        // host copies are kept alive by the list, and the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &bounded,
-                at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
-        };
+        if plain.wait {
+            // SAFETY: an open list; barriers that name no resource.
+            unsafe { list.list.ResourceBarrier(&crate::indirect::full_wait()) };
+        }
+        match &split {
+            // The parts' records, then their count.
+            Some((parts, sets)) => {
+                crate::indirect::execute_parts(&list.list, parts, *sets, &bounded, at);
+                if sets.is_some() {
+                    // Its root arguments are undefined after an execution
+                    // that set one: the next bind sets the root signature
+                    // again, and with it every argument.
+                    self.host_roots[1] = 0;
+                    self.host_pipeline = 0;
+                }
+            }
+            // SAFETY: an open list with everything set; the scratch buffer
+            // and host copies are kept alive by the list, and the signature
+            // is cached.
+            None => unsafe {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                )
+            },
+        }
+        if plain.after {
+            // SAFETY: an open list; barriers that name no resource.
+            unsafe { list.list.ResourceBarrier(&crate::indirect::full_wait()) };
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
@@ -3448,11 +3537,27 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            if single {
+                crate::indirect::note_path(parted && split.is_some());
+            }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
     }
+}
+
+/// Where a compute pipeline's program takes the number of its first thread
+/// group in x (`victory_shader::emit::USER_GROUP_BASE`): the root parameter
+/// of its user data and the dword in it. None for a program that does not
+/// read its group's number in x (every translated program that does asks
+/// for the dword), or a graphics pipeline.
+fn group_base(p: &HostPipeline) -> Option<(u32, u32)> {
+    let stage = p.stages.first().filter(|_| p.compute)?;
+    let (param, _) = stage.user_data?;
+    let base = RootType::Other(victory_shader::emit::USER_GROUP_BASE);
+    let word = stage.translated().host.user_data.iter().find(|u| u.root == base)?;
+    Some((param, word.index))
 }
 
 /// The host command signature for one argument of `kind` with records

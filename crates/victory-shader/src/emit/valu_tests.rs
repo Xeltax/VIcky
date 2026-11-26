@@ -112,7 +112,13 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
+    lower_words(&words, threads, lds_bytes, 0)
+}
 
+/// Lowers a whole program of [`build_cs`]'s layout (4 constants in
+/// `s0..s3`, the table in `s4`, the raw UAV at heap index 0); `rsrc2`: more
+/// bits of that register (the group numbers' enables).
+fn lower_words(words: &[u32], threads: u32, lds_bytes: u32, rsrc2: u32) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -147,7 +153,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: (5 << 1) | ((lds_bytes / 512) << 15), // 5 user SGPRs: s0..s4
+            rsrc2: rsrc2 | (5 << 1) | ((lds_bytes / 512) << 15), // 5 user SGPRs: s0..s4
             threads: [threads, 1, 1],
         }),
         code,
@@ -191,6 +197,134 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     }
 
     shader
+}
+
+/// `COMPUTE_PGM_RSRC2`'s enables of the group's number in x and in y, which
+/// then follow the user SGPRs in that order.
+const TGID_X: u32 = 1 << 7;
+const TGID_Y: u32 = 1 << 8;
+
+/// `MUBUF buffer_store_dword vdata, vaddr, s[srsrc:srsrc+3], 0 offen`.
+const fn buffer_store_dword_offen(vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// The user-data dword of the number of the part's first group, if the
+/// program asks for it.
+fn group_base_dword(shader: &HostShader) -> Option<u32> {
+    shader.user_data.iter().find(|u| u.root == RootType::Other(super::USER_GROUP_BASE)).map(|u| u.index)
+}
+
+/// A compute program that reads its group's number in x adds the number
+/// of the first group of the part that runs (`USER_GROUP_BASE`), also when
+/// it reads its number in y; one that reads only y (x enabled or not) does
+/// not ask for it.
+/// (myokex's test of ZSlayerHQ/victory-world-runtime 892d259, which asks
+/// for the number only of programs that read x alone.)
+#[test]
+fn a_group_number_in_x_counts_from_the_parts_first_group() {
+    const BASE: u32 = 65_535;
+    // The stored SGPR: the first one after the 5 user SGPRs (s5) is x when
+    // x is enabled, else y; s6 is y after x.
+    for (enabled, read, asks, expected) in [
+        (TGID_X, 5, true, BASE),
+        (TGID_X | TGID_Y, 5, true, BASE),
+        // x enabled but never read: no dword.
+        (TGID_X | TGID_Y, 6, false, 0),
+        (TGID_Y, 5, false, 0),
+    ] {
+        let words = [
+            // s5 is the table's high half below: the number is kept in s12.
+            vec![s_mov_b32(12, read), s_mov_b32(5, 0x80)],
+            s_load_dwordx4(8, 4).to_vec(),
+            vec![vop1(0x001, 0, sgpr(12))], // v_mov_b32 v0, s12
+            buffer_store_dword(0, 8, 0).to_vec(),
+            vec![S_ENDPGM],
+        ]
+        .concat();
+        let shader = lower_words(&words, 1, 0, enabled);
+        let base = group_base_dword(&shader);
+        assert_eq!(base.is_some(), asks, "enables {enabled:#x}, s{read}");
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(true) else {
+            eprintln!("no SM 6.6 WARP device; skipped");
+            return;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        if let Some(index) = base {
+            ud[index as usize] = BASE;
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        assert_eq!(out[0][0], expected, "enables {enabled:#x}, s{read}");
+    }
+}
+
+/// A dispatch of 98,000 groups in x, more than the host's 65,535, run in
+/// two parts as the runtime runs it (`victory-gpu`'s
+/// `indirect::record_parts`): every group stores its number plus one at
+/// its number's slot, so each of the 98,000 slots is written by exactly
+/// one group (98,000 groups ran) and nothing past them; on WARP and the
+/// hardware adapter.
+#[test]
+fn a_dispatch_of_98000_groups_in_parts_runs_every_group_once() {
+    const GROUPS: u32 = 98_000;
+    let words = [
+        vec![s_mov_b32(12, 5), s_mov_b32(5, 0x80)],
+        s_load_dwordx4(8, 4).to_vec(),
+        vec![
+            vop1(0x001, 0, sgpr(12)), // v_mov_b32 v0, s12 (the group's number in x)
+            vop2(0x1A, 2, 130, 0),    // v_lshlrev_b32 v2, 2, v0
+            vop2(0x25, 3, 129, 0),    // v_add_nc_u32 v3, 1, v0
+        ],
+        buffer_store_dword_offen(3, 2, 8).to_vec(),
+        vec![S_ENDPGM],
+    ]
+    .concat();
+    let shader = lower_words(&words, 1, 0, TGID_X);
+    let base = group_base_dword(&shader).expect("the program reads its x number");
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch_in_parts(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(GROUPS + 1)],
+                    samplers: &[],
+                    groups: [GROUPS, 1, 1],
+                },
+                (0, base),
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let wrong: Vec<(usize, u32)> =
+            out[0].iter().enumerate().filter(|&(i, &v)| v != if i < GROUPS as usize { i as u32 + 1 } else { 0 }).map(|(i, &v)| (i, v)).take(8).collect();
+        assert!(wrong.is_empty(), "{label}: slots not written by their own group (slot, value): {wrong:?}");
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device");
 }
 
 /// One GPU test at a time. With these tests on the hardware adapter and WARP

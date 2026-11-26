@@ -1370,6 +1370,11 @@ pub(crate) fn dred_on() -> bool {
 /// budget buffers, a run late).
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// The words of a list's budget buffer the clamp writes: the budget, the
+/// mesh records' notes (2), the dispatch records' (13: counts and the
+/// programs noted, `crate::indirect::note_budget_words`).
+const BUDGET_WORDS: usize = 3 + crate::indirect::DISPATCH_WORDS;
+
 /// Whether a list's indirect-work budget lives in the card's own memory
 /// (`VICTORY_INDIRECT_CARD_BUDGET=0` keeps it in memory the CPU maps, as
 /// before). The clamp charges it with atomics, at least two in a row for
@@ -7764,14 +7769,17 @@ impl HostList {
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
-            // asked for, the groups asked in all; with the card's copy, as
-            // the list's end copied them here): taken, then zeroed.
+            // asked for, the groups asked in all; dispatches: the largest
+            // group count asked for in x, those run in parts, their parts,
+            // those cut; with the card's copy, as the list's end copied
+            // them here): taken, then zeroed.
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
                 let words = at as *mut u32;
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
+                crate::indirect::note_budget_words(std::array::from_fn(|k| words.add(3 + k).read_volatile()));
+                for k in 0..BUDGET_WORDS {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -7805,10 +7813,11 @@ impl HostList {
         };
         // SAFETY: a live buffer.
         let at = unsafe { card.GetGPUVirtualAddress() };
-        let zeros = [0u64, 4, 8].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
-            Dest: at + offset,
-            Value: 0,
-        });
+        let zeros: [D3D12_WRITEBUFFERIMMEDIATE_PARAMETER; BUDGET_WORDS] =
+            std::array::from_fn(|k| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+                Dest: at + 4 * k as u64,
+                Value: 0,
+            });
         // SAFETY: an open list; the buffer is the list's own and in the
         // common state at the start of every recording.
         unsafe {
@@ -7846,7 +7855,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 8);
+            self.list.CopyBufferRegion(mapped, 4, card, 4, 4 * (BUDGET_WORDS as u64 - 1));
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -8729,7 +8738,8 @@ impl Meter {
         // (Run 200 counted indirect compute records asking for 77,000 to
         // 98,000 groups in x, 0.2 to 0.8 a frame, cut to the 65,535 one
         // dispatch runs; the counter went when the clamp's budget moved to
-        // the card's memory.)
+        // the card's memory. They now run in parts, counted here.)
+        crate::indirect::parts_line(frames);
         {
             let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
             tracing::info!(

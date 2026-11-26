@@ -775,6 +775,12 @@ impl State {
         partial: [u32; 3],
         mode: Mode,
     ) -> Result<Recorded, &'static str> {
+        // Ours dispatches the program's groups in one dispatch; past what
+        // the host runs in x, the program runs in parts instead
+        // (`crate::indirect::record_parts`).
+        if groups[0] > crate::indirect::PART && crate::indirect::parts_on() {
+            return Err("more groups in x than one dispatch runs (the program runs in parts)");
+        }
         let t = stage.translated();
         let (src_slot, dst_slot, constants_slot) = slots(&t.used, t.threads, partial)?;
         let roots = self.roots_ref(true);

@@ -98,6 +98,16 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// `DispatchX` call with `USE_THREAD_DIMENSIONS` (`flags & 0x20`), or 0
 /// for a normal thread-group dispatch (all threads in every group active).
 pub const USER_DISPATCH_THREADS: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host sets: the number
+/// of the first thread group in x of the part of a dispatch that runs. The
+/// console dispatches any number of groups in a dimension, the host at
+/// most 65,535, so a larger dispatch runs in parts and each part's groups
+/// count on from the parts before it; 0 for a dispatch that runs whole.
+/// Asked for by every compute program that reads its group's number in x,
+/// so a program has one translation whatever its dispatches ask.
+/// (myokex's fix, ZSlayerHQ/victory-world-runtime 892d259, there code
+/// 0x104 and for one-dimensional programs only.)
+pub const USER_GROUP_BASE: u32 = 0x105;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
