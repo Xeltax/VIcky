@@ -644,9 +644,73 @@ fn card_limits() -> (u64, u64) {
         // the shader writes of the smaller buffers are then found by the
         // card's hashes too, and with that the first room's walls were
         // drawn in every run.
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        let most = mb("VICTORY_CARD_BUFFERS_MB", 1024);
+        let Some(least) = min_kb(std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().as_deref()) else {
+            return (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), most);
+        };
+        tracing::info!(
+            "host copies of title buffers in the card's memory from {} KiB up (VICTORY_CARD_BUFFERS_MIN_KB), at most {} MB; \
+             the card's hashes over {}",
+            least >> 10,
+            most >> 20,
+            if card_hash_len() { "the title buffers' own bytes (VICTORY_CARD_HASH_LEN)" } else { "the copies' whole buffers" }
+        );
+        (least, most)
     })
 }
+
+/// `VICTORY_CARD_BUFFERS_MIN_KB=<KiB>` (unset: [`card_limits`]' least from
+/// `VICTORY_CARD_BUFFERS_MIN_MB`, never under 1 MiB), in bytes: the least
+/// size in KiB, so that it can go under 1 MiB; 64 is every title buffer
+/// (a copy's size is rounded up to 64 KiB). After fxceless' c36971b2 and
+/// avatarmanz's 17c4717b (the 4080 recipe of fork #1268 went from 25.7 to
+/// 32.0 fps with 64, `VICTORY_CARD_BUFFERS_MB=2048` and its tree's
+/// `VICTORY_FETCH_CHECK`). The copies under 1 MiB are nearly all there
+/// are, few bytes in all (fork run 274: 3,700 of 3,800, 30 MB); in the
+/// PC's memory every load, store and atomic a shader does on them crosses
+/// the bus (one tile-reset pass: 737,000 one-dword requests on a 288-byte
+/// and a 900 KiB buffer). What it costs: 64 KiB of the card a copy, and a
+/// hash and a compare pass more for each copy shaders write.
+/// Not set, or not a number above 0: `None`.
+fn min_kb(value: Option<&str>) -> Option<u64> {
+    value?.trim().parse::<u64>().ok().filter(|&kib| kib > 0).map(|kib| kib << 10)
+}
+
+/// Whether the card's hashes and compares of a copy in its memory cover the
+/// title buffer's own bytes (rounded up to the hash's 16-byte step) and
+/// not the copy's whole buffer ([`Shadow::card_hashed_len`]):
+/// `VICTORY_CARD_HASH_LEN=1` on, `=0` off; unset, on with
+/// `VICTORY_CARD_BUFFERS_MIN_KB` and off without it (as before). After
+/// fxceless' c36971b2 (avatarmanz's 17c4717b has it on by default).
+fn card_hash_len() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        hash_len_on(
+            std::env::var("VICTORY_CARD_HASH_LEN").ok().as_deref(),
+            min_kb(std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().as_deref()).is_some(),
+        )
+    })
+}
+
+/// [`card_hash_len`] from the switch's value and whether
+/// `VICTORY_CARD_BUFFERS_MIN_KB` is set.
+fn hash_len_on(value: Option<&str>, min_kb_set: bool) -> bool {
+    match value.map(str::trim) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => min_kb_set,
+    }
+}
+
+/// [`Shadow::card_hashed_len`] for a title buffer of `len` bytes whose copy
+/// on the card is `size` bytes.
+fn hashed_len(len: u64, size: u64, own: bool) -> u64 {
+    if own { len.next_multiple_of(16).min(size) } else { size }
+}
+
+/// Card copies of title buffers under 1 MiB made since the start
+/// (`VICTORY_CARD_BUFFERS_MIN_KB`), and their bytes.
+static CARD_SMALL: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -964,7 +1028,37 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{CardSpan, PIECE, card_piece_of, card_span_of, hash_len_on, hashed_len, joined, joined_piece_runs, min_kb};
+
+    /// `VICTORY_CARD_BUFFERS_MIN_KB`: a size in KiB above 0, in bytes;
+    /// anything else leaves `card_limits` as it was.
+    #[test]
+    fn the_least_card_copy_in_kib() {
+        assert_eq!(min_kb(Some("64")), Some(64 << 10));
+        assert_eq!(min_kb(Some(" 256 ")), Some(256 << 10));
+        assert_eq!(min_kb(Some("2048")), Some(2 << 20));
+        for unset in [None, Some(""), Some("0"), Some("-1"), Some("64k"), Some("1.5")] {
+            assert_eq!(min_kb(unset), None, "{unset:?}");
+        }
+    }
+
+    /// `VICTORY_CARD_HASH_LEN`: 1 on, 0 off, unset (or anything else) on
+    /// only with `VICTORY_CARD_BUFFERS_MIN_KB`; the bytes hashed are the
+    /// title buffer's own rounded up to 16, never past the copy's buffer.
+    #[test]
+    fn the_card_hashes_cover_the_title_buffers_own_bytes_when_asked() {
+        assert!(hash_len_on(Some("1"), false) && hash_len_on(Some(" 1 "), true));
+        assert!(!hash_len_on(Some("0"), true) && !hash_len_on(Some("0"), false));
+        assert!(hash_len_on(None, true) && !hash_len_on(None, false));
+        assert!(!hash_len_on(Some("yes"), false) && hash_len_on(Some("yes"), true));
+        let size = PIECE as u64;
+        assert_eq!(hashed_len(288, size, true), 288);
+        assert_eq!(hashed_len(289, size, true), 304);
+        assert_eq!(hashed_len(1, size, true), 16);
+        assert_eq!(hashed_len(size, size, true), size);
+        assert_eq!(hashed_len(3 * size + 5, 4 * size, true), 3 * size + 16);
+        assert_eq!(hashed_len(288, size, false), size);
+    }
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -5034,6 +5128,17 @@ impl Shadow {
         Some((&card.staging, before, card.size))
     }
 
+    /// Of a copy in the card's memory of `size` bytes: the bytes the card's
+    /// hash and compare passes walk. The whole buffer as before; with
+    /// [`card_hash_len`] the title buffer's own bytes, rounded up to the
+    /// hash's 16-byte step: the copy is the title buffer rounded up to 64
+    /// KiB, and a piece's thread walked all of it, 4,096 steps for a title
+    /// buffer of 288 bytes where 18 hold all that can go back to the title
+    /// (fetched pieces are cut to the title buffer too, [`Self::card_piece`]).
+    pub(crate) fn card_hashed_len(&self, size: u64) -> u64 {
+        hashed_len(self.len, size, card_hash_len())
+    }
+
     /// Shader writes are declared for a copy in the card's memory: makes
     /// its "before" twin with `make` (bytes to buffer) if it has none.
     /// Whether one was made now: the caller fills it, whole, from the
@@ -5479,11 +5584,27 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let (buffer, card) = match card_for(size) {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
+                if size < 1 << 20 {
+                    // Only with `VICTORY_CARD_BUFFERS_MIN_KB` (some 3,700
+                    // of them): the first 32, then every 256th.
+                    let n = CARD_SMALL[0].fetch_add(1, Ordering::Relaxed) + 1;
+                    let bytes = CARD_SMALL[1].fetch_add(size, Ordering::Relaxed) + size;
+                    if n <= 32 || n.is_multiple_of(256) {
+                        tracing::info!(
+                            start = format_args!("{:#x}", key.0),
+                            len,
+                            "a buffer's host copy under 1 MiB is in the card's memory (VICTORY_CARD_BUFFERS_MIN_KB): {n} such \
+                             copies so far, {} MB",
+                            bytes >> 20
+                        );
+                    }
+                } else {
+                    tracing::info!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        "a buffer's host copy is in the card's memory"
+                    );
+                }
                 let card = Card {
                     staging: buffer,
                     before: Mutex::default(),
