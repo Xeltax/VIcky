@@ -1060,8 +1060,9 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
-/// physical pages are too when they are consecutive pages of one
-/// allocation, and otherwise go through a buffer.
+/// physical pages are too when they are consecutive pages of one section
+/// (one allocation, unless `VICTORY_SECTION_MB` cuts it into several), and
+/// otherwise go through a buffer.
 fn into_destination(
     request: &Request,
     len: usize,
@@ -1094,8 +1095,8 @@ fn into_destination(
             (offset + len).div_ceil(PAGE),
         )
     };
-    // Consecutive pages of one allocation (the usual case): written in
-    // place through one view.
+    // Consecutive pages of one section (the usual case): written in place
+    // through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
         let filled = fill(window.bytes()).map(drop);
         drop(window);

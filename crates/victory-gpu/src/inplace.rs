@@ -272,12 +272,14 @@ struct Views {
     /// page is a write of the bytes every other view shows
     /// (`crate::watch` guards them all).
     pages: BTreeMap<(usize, u64), Vec<usize>>,
-    /// Sections by handle: bytes, and whether made committed.
-    sections: Vec<(usize, u64, bool)>,
+    /// Sections by handle: bytes, and whether made committed. Thousands
+    /// with `VICTORY_SECTION_MB` (the runtime's small sections), and looked
+    /// up at every store through a view of ours ([`write_own`]).
+    sections: BTreeMap<usize, (u64, bool)>,
 }
 
 static VIEWS: Mutex<Views> =
-    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
+    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: BTreeMap::new() });
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -286,11 +288,7 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    {
-        let mut v = views();
-        v.sections.retain(|s| s.0 != section);
-        v.sections.push((section, bytes, committed));
-    }
+    views().sections.insert(section, (bytes, committed));
     // A view of our own made on an earlier section that had this handle's
     // number shows that section's pages, not this one's: it is forgotten
     // (left mapped: nothing reads it any more) and the next store through
@@ -298,6 +296,24 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     let gone = OWN.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|own| own.remove(&section)).flatten();
     if gone.is_some() {
         tracing::info!(section, "a section handle's number came round again: our own view of the earlier section is forgotten");
+    }
+}
+
+/// The runtime is about to close `section`'s handle, which no title view
+/// shows any more, and the handle's number may then come round again for
+/// another section: the section is forgotten and our own view of it
+/// ([`write_own`]) unmapped, which also lets its pages go (a view keeps a
+/// section alive). The runtime calls it when it cuts allocations into
+/// small sections (`VICTORY_SECTION_MB`, sections that come and go with
+/// the title's allocations); without, it keeps to [`title_memory_section`]'s
+/// forgetting, as before.
+pub fn title_memory_section_closed(section: usize) {
+    views().sections.remove(&section);
+    let own = OWN.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|own| own.remove(&section)).flatten();
+    if let Some(own) = own {
+        // SAFETY: our own view, out of `OWN`: `write_own` stores through
+        // it only while it holds that lock and finds it there.
+        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: own.base as *mut c_void }) };
     }
 }
 
@@ -527,7 +543,7 @@ pub(crate) fn write_own(at: usize, bytes: &[u8], runs: &[(usize, usize)]) -> Opt
         if shown.len() > crate::watch::MANY_VIEWS {
             return None;
         }
-        let section_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
+        let section_bytes = v.sections.get(&section)?.0;
         (section, offset, shown, section_bytes)
     };
     if offset + bytes.len() as u64 > section_bytes {
@@ -549,11 +565,18 @@ pub(crate) fn write_own(at: usize, bytes: &[u8], runs: &[(usize, usize)]) -> Opt
                 );
                 return None;
             }
-            tracing::info!(
-                section,
-                mb = section_bytes >> 20,
-                "a view of our own on a section of title pages, for what shaders wrote (VICTORY_BACK_OWN_VIEW=1)"
-            );
+            // The first eight, then at every power of two: with
+            // `VICTORY_SECTION_MB` there may be thousands.
+            static MADE: AtomicU64 = AtomicU64::new(0);
+            let made = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+            if made <= 8 || made.is_power_of_two() {
+                tracing::info!(
+                    section,
+                    mb = section_bytes >> 20,
+                    made,
+                    "a view of our own on a section of title pages, for what shaders wrote (VICTORY_BACK_OWN_VIEW=1)"
+                );
+            }
             Some(Own {
                 base: at.Value as usize,
                 bytes: section_bytes,
@@ -1173,12 +1196,18 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    for &(_, bytes, committed) in &v.sections {
-        lines.push(format!(
-            "census, a section of {} MB, {}",
-            bytes >> 20,
-            if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" }
-        ));
+    // Sections alike are counted on one line (thousands of them with
+    // `VICTORY_SECTION_MB`).
+    let mut alike: BTreeMap<(u64, bool), usize> = BTreeMap::new();
+    for &section in v.sections.values() {
+        *alike.entry(section).or_default() += 1;
+    }
+    for ((bytes, committed), n) in alike {
+        let how = if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" };
+        lines.push(match n {
+            1 => format!("census, a section of {} MB, {how}", bytes >> 20),
+            n => format!("census, {n} sections of {} MB each, {how}", bytes >> 20),
+        });
     }
     lines
 }
@@ -1443,6 +1472,62 @@ mod tests {
             assert!(text.contains("census,   view memory, one run of a section (one placed buffer): 1 of"), "{text}");
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// Sections alike are one census line, a lone one keeps its own words,
+    /// and a closed section leaves the census.
+    #[test]
+    fn census_counts_sections_alike() {
+        // Handles no section has: numbers of the test's own, never opened.
+        let small = [0x5EC0_0001usize, 0x5EC0_0005, 0x5EC0_0009];
+        for &section in &small {
+            title_memory_section(section, 2 << 20, false);
+        }
+        title_memory_section(0x5EC0_000D, 6000 << 20, false);
+        let text = census_of(&[]).join("\n");
+        assert!(text.contains("census, 3 sections of 2 MB each, reserved: refused as a heap"), "{text}");
+        assert!(text.contains("census, a section of 6000 MB, reserved"), "{text}");
+        for section in small.into_iter().chain([0x5EC0_000D]) {
+            title_memory_section_closed(section);
+        }
+        let text = census_of(&[]).join("\n");
+        assert!(!text.contains("sections of 2 MB each") && !text.contains("6000 MB"), "{text}");
+    }
+
+    /// A section the runtime closes takes our own view of it along: the
+    /// view is unmapped (it would keep the section's pages alive) and the
+    /// section forgotten, before its handle's number can come round again.
+    #[test]
+    fn a_closed_section_lets_our_own_view_of_it_go() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        let bytes = 4 * K64;
+        // SAFETY: a section and a view of the test's own; the title's view
+        // is told gone before it is unmapped.
+        unsafe {
+            let handle = mem::CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, bytes as u32, std::ptr::null());
+            assert!(!handle.is_null());
+            let section = handle as usize;
+            title_memory_section(section, bytes as u64, true);
+            let title = mem::MapViewOfFile(handle, mem::FILE_MAP_WRITE, 0, 0, bytes).Value as usize;
+            assert_ne!(title, 0);
+            title_memory_view(title, bytes, section, 0);
+            // (`None` while another test changes a mapping: tried again.)
+            let at = title + K64 + 8;
+            let shown = (0..1000).find_map(|_| write_own(at, &[1, 2, 3], &[(0, 3)])).expect("stored through our own view");
+            assert_eq!(shown, vec![title + K64]);
+            assert_eq!(std::slice::from_raw_parts(at as *const u8, 3), [1, 2, 3]);
+            let own = OWN.lock().unwrap().as_ref().and_then(|own| own.get(&section)?.as_ref().map(|view| view.base));
+            let own = own.expect("our own view of the section");
+            views_gone(title, bytes);
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: title as *mut c_void });
+            title_memory_section_closed(section);
+            assert!(!views().sections.contains_key(&section));
+            assert!(OWN.lock().unwrap().as_ref().is_none_or(|own| !own.contains_key(&section)));
+            let mut info: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(mem::VirtualQuery(own as *const c_void, &mut info, size_of_val(&info)), 0);
+            assert_eq!(info.State, mem::MEM_FREE, "our own view is unmapped");
+            CloseHandle(handle);
         }
     }
 }
