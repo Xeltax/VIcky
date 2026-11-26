@@ -36,12 +36,22 @@ This branch is for making the title's compute ray tracing (the BVH structure bui
   - `0`: cut, as before.
   - The log line `dispatches in parts` counts both paths.
   - The translator changed, so the shader cache key changed: **warm the cache again after updating** (`victory translate --warm`).
+- **The submit thread's walls (2026-11-26 night, all opt-in; RT65–RT81 below).** Together they take the frame from about 5.0 to about 5.5–5.7 fps on the RTX 4080 (host `fps` lines, long frames included):
+  - `VICTORY_HEAP_PASS_BESIDE=1`: the pass over the heap's buffer views (once a frame, 110–200 ms inside one list call of the title) runs on a thread of ours; the title's recording thread leaves a placeholder and returns; the join is at the start of the submission. `VICTORY_HEAP_PASS_BESIDE_CHECK=1` compares one pass in 16 slot by slot (RT65: 0 of 5,178,864 slots differed).
+  - `VICTORY_HEAP_PASS_SPREAD=1`: each pass takes the written slots plus one sixteenth of all buffer slots, instead of every slot every 16th pass (a ~300 ms pass every 16 frames).
+  - With `VICTORY_FENCE_SENT=1`, the bytes the relay's merges keep as the title's now go up at the landing (on by default under the fence; `VICTORY_FENCE_SENT_PUT_UP=0` turns it off; `VICTORY_FENCE_SENT_PUT_UP_RUNS=4096` recommended, 64 by default is too low for this scene).
+  - `VICTORY_DENSE_PAGE_WHOLE=1` and `VICTORY_DENSE_PAGE_PATCH=1`: a card copy's page with more changed runs than `VICTORY_MERGE_RUNS` (the title's 182 MB heap: thousands of 1–3-byte runs a page) no longer makes the submitting thread wait for the card: a page no shader wrote lately goes up whole, others are patched on the card under a byte mask (`card = (card & ~mask) | (title & mask)`), queued behind the flights. `VICTORY_DENSE_PAGE_PATCH_CHECK=1` reads one page in 16 back (RT77: 0 wrong bytes). Settles went from 2.0 to 0 a frame.
+  - `VICTORY_GUARD_SUMMARY=1` (bits over the clean blocks) and `VICTORY_GUARD_ABSENT_KNOWN=1` (holes of view memory asked about once a frame, not at every asking): the guards' 32 ms a frame were 23 ms of `VirtualQuery` on uncommitted blocks (36,640 a frame); now 15–17 ms. `VICTORY_GUARD_ABSENT_CHECK=1` re-asks one answer in 64 (RT76b: 0 of 372,487 wrong). Also `VICTORY_GUARD_HOT`, `VICTORY_GUARD_VIEWS_BATCH` (no measurable gain).
+  - `VICTORY_FILL_LATCH_PIECE=1`: a fill that raced a flight latches only its 64 KiB piece, not every fill for the rest of the run (that run-wide latch cost 27–39 ms a frame when it tripped).
+  - `VICTORY_MERGE_RUNS=4096` with the above.
 
 **VIcky PRs merged:**
 - #23 (g0shtj0sh): main's opt-in `VICTORY_NO_WATCHDOG=1` hook (upstream #454, fork #364), for slower PCs whose runs the title's watchdog kills at the world's entry. Nothing changes when it is unset.
 - #24 (wololo-wololo): `VICTORY_BVH_CHECK=<frames>` (diagnostics) walks the ray-tracing structures that raw-pointer dispatches name and logs counts of what is wrong (task 2, section below).
 
 **Recommended with the builder on:** `VICTORY_BVH_COPY=skip VICTORY_HEAP_SYNC_CACHE=1 VICTORY_HEAP_BUFFERS_SKIP_SAME=1 VICTORY_HEAP_SYNC_THREADS=4 VICTORY_HEAP_SYNC_BESIDE=1 VICTORY_FENCE_SENT=1 VICTORY_BACK_JOIN=256 VICTORY_MEMORY_REFRESH=touched VICTORY_MEMORY_NAMED_WRITES=0 VICTORY_SNAPSHOT_POOL_MB=2048`, plus the fork's: `VICTORY_ASYNC_SUBMIT=1 VICTORY_QUEUE2=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_TEXTURE_NO_WAIT=1 VICTORY_COPY_PLAIN=1 VICTORY_JOIN_PARTS=1 VICTORY_BACK_OWN_VIEW=1 VICTORY_INDIRECT_GATHER=1 VICTORY_CARD_REHASH_RUNS=1`. Keep the capture harness rare (`VICTORY_CAPTURE_WORLD_EVERY=64`): a saved frame costs about 235 ms. If the title's watchdog ends the run at the world's entry (frames of 20–25 s while it loads), add `VICTORY_NO_WATCHDOG=1` (PR #23); it changes nothing once the world is up.
+
+**Fastest measured (RT81b/c, RTX 4080):** the above plus `VICTORY_HEAP_PASS_BESIDE=1 VICTORY_HEAP_PASS_SPREAD=1 VICTORY_FENCE_SENT_PUT_UP_RUNS=4096 VICTORY_MERGE_RUNS=4096 VICTORY_DENSE_PAGE_WHOLE=1 VICTORY_DENSE_PAGE_PATCH=1 VICTORY_GUARD_SUMMARY=1 VICTORY_GUARD_ABSENT_KNOWN=1 VICTORY_FILL_LATCH_PIECE=1`. A new build's first run carries the driver's background shader work for several minutes (process user time about 1,500 ms a 5-s line instead of about 900): measure from the second run.
 
 ## Run
 
@@ -263,6 +273,22 @@ Same window shot, builder on, `VICTORY_BVH_COPY=skip` and the recommended switch
 | RT54 | `VICTORY_JOIN_LISTS=24 VICTORY_JOIN_MOST=2` | 203–216 | worse: 16 submissions a frame |
 | RT56 / RT57 | heap pass skips its own unchanged slots | 188–194 / 188–189 | marginal alone, worse with the fence; dropped |
 | RT50c | snapshots kept across frames | 210–218 | correct, no gain (shaders that pick views by index make pieces stale); dropped |
+
+**RT61–RT81, the submit thread's walls** (RTX 4080, same scene; **fps from the host's `fps` lines, mean of the last 24 (about 2 minutes), long frames included** — the "usual frame" leaves out long frames and read 10–20 ms low):
+
+| run | change | fps (ms) | verdict |
+|---|---|---|---|
+| RT60c–RT63 | rt 9510272 (heap sync beside + safe early fence) | 4.96–5.15 (195–203) | the base of the night |
+| RT61 | `VICTORY_SPREAD=alt` + spare processors | worse (≈216 ms usual) | the widened groups spin; dropped on this 12-core part |
+| RT62 / RT63 | `VICTORY_REFRESH_ONCE`, `VICTORY_WIDE_REFRESH`, `VICTORY_VIEW_KNOWN` | ~4 ms / 0 / 0 | parked / dropped |
+| RT65 | heap pass beside, check on | slower | correct (0 of 5.18 M slots differed); recording is no longer the wall, the submit thread is (2 settles a frame) |
+| RT66d / RT68 | + settle fix, `VICTORY_MERGE_RUNS` 4096 / 65536 | 5.17 / worse | raising the caps only raises the runs wanted |
+| RT74 | + `VICTORY_DENSE_PAGE_WHOLE=1` | 4.48 | settles 2.0 → 0.8; names the page (the title's heap) |
+| RT76b | guard summary + `VICTORY_GUARD_ABSENT_KNOWN=1` | 4.82 (first run of its build) | guards 32 → 17 ms, submit thread 131 ms |
+| RT77 | + `VICTORY_DENSE_PAGE_PATCH=1`, check on | 5.34 (188) | settles 0.2, check 0 wrong bytes |
+| RT78 / RT78b | all of the above | 5.12 / 5.21 | the full heap pass every 16th frame and a run-wide fill latch remain |
+| RT79 / RT79b | + `VICTORY_D3D12_BACKGROUND=0` | 5.45 / 5.26 | **not adopted**: the character's hair washed out in both (picture A/B pending) |
+| **RT81b / RT81c** | + `VICTORY_HEAP_PASS_SPREAD=1 VICTORY_FILL_LATCH_PIECE=1` | **5.69 (176) / 5.48 (186)** | fastest, two clean runs; settles 0–0.3, submit thread 165 ms; picture as RT78 |
 
 - Next: copy numbers. Every builder-on run uses all 1,023 numbers of title memory by address by the second world frame, and later pages read zeros; that fits #24's count of structures with nodes of zeros and pointers far out. Recycling idle numbers is being written.
 
