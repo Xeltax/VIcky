@@ -577,14 +577,20 @@ macro_rules! timed {
 
 /// What one asking's walk of [`guard`] found, block by block, summed there
 /// and counted once (diagnostics): blocks reported written; of them, the
-/// ones still read-only by our hand; and blocks noted absent that are still
-/// uncommitted.
+/// ones still read-only by our hand; blocks noted absent that are still
+/// uncommitted; and with [`hot_frames`], blocks reported for being hot,
+/// blocks made hot, hot blocks guarded again to test them, and hot blocks
+/// guarded again for being reported too often ([`hot_ratio`]).
 #[derive(Default)]
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 struct Tally {
     written: u64,
     guarded: u64,
     absent: u64,
+    hot: u64,
+    made: u64,
+    retests: u64,
+    cooled: u64,
 }
 
 impl Tally {
@@ -596,7 +602,282 @@ impl Tally {
             add(C::GuardWritten, self.written);
             add(C::GuardWrittenGuarded, self.guarded);
             add(C::GuardAbsentSkipped, self.absent);
+            add(C::GuardHotReported, self.hot);
+            add(C::GuardHotMade, self.made);
+            add(C::GuardHotRetests, self.retests);
+            add(C::GuardHotCooled, self.cooled);
         }
+    }
+}
+
+/// Blocks found written in this many frames in a row are left writable
+/// (`VICTORY_GUARD_HOT=<n>`; unset or 0, off): hot.
+///
+/// In a steady scene the submitting thread spent ~28 ms a frame walking
+/// ranges that were not all clean (run RT69), guarding again the blocks
+/// the title had written, many of them every frame, and the other views of
+/// their pages: a call making each read-only on our thread, then on the
+/// title's a fault and a call making it writable again, frame after frame.
+/// A hot block is spared both: it stays writable, and every asking that
+/// covers it reports it written, so its copies take its 64 KiB at every
+/// asking. No write to it can be missed: a block reported at every asking
+/// needs no guard.
+///
+/// The other views of a hot block's physical page (2 to [`MANY_VIEWS`])
+/// are made hot with it, writable and reported at every asking: left
+/// guarded, a write through the hot one would not open them. A view of the
+/// page mapped later ([`views_mapped`]) ends that, and so does guarding a
+/// view with the others ([`protect_alias`]): the blocks are guarded again
+/// at their next asking. A block remapped is forgotten.
+///
+/// Once every [`HOT_RETEST`] frames a hot block is guarded again (with its
+/// other views): found written in the frame after, it is hot again; if
+/// not, it has gone cold. One reported much more often than it had been
+/// found written is guarded again at once ([`hot_ratio`]).
+/// `VICTORY_GUARD_HOT_CHECK=1` (diagnostics) checks each block made hot or
+/// tested again ([`check_hot`]).
+fn hot_frames() -> u64 {
+    #[cfg(test)]
+    if let Some(n) = TEST_HOT.get() {
+        return n;
+    }
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_GUARD_HOT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// A hot block stays hot while it is reported in a frame at most this many
+/// times as often as it was found written in the frame before it went hot
+/// (`VICTORY_GUARD_HOT_RATIO=<r>`; 2 if unset, 0 no bound). Past that it is
+/// guarded again, and not made hot again for [`HOT_RETEST`] frames.
+///
+/// Guarded, a block covered by k askings a frame and found written at m of
+/// them costs m calls making it read-only and m faults; hot, it costs k
+/// copies of its 64 KiB (and more where a texture lies on it, detiled and
+/// hashed again). A block the title writes once a frame and that every
+/// submission asks about is cheaper guarded.
+fn hot_ratio() -> u64 {
+    #[cfg(test)]
+    if let Some(r) = TEST_HOT_RATIO.get() {
+        return r;
+    }
+    static R: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *R.get_or_init(|| std::env::var("VICTORY_GUARD_HOT_RATIO").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2))
+}
+
+/// A hot block is guarded again after this many frames, to see whether it
+/// has gone cold; one guarded again by [`hot_ratio`] is not made hot again
+/// for as many.
+const HOT_RETEST: u64 = 64;
+
+/// A hot block ([`hot_frames`]): the frame it was made hot (or tested
+/// again), the most it may be reported in a frame ([`hot_ratio`]), and how
+/// often it was in the frame it was last reported in.
+#[derive(Clone, Copy)]
+struct Hotness {
+    since: u64,
+    most: u64,
+    frame: u64,
+    reports: u64,
+}
+
+/// A block found written lately ([`hot_frames`]): the last frame it was,
+/// in how many frames in a row, and how often in that frame and in the one
+/// before it.
+#[derive(Clone, Copy)]
+struct Streak {
+    last: u64,
+    frames: u64,
+    finds: u64,
+    before: u64,
+}
+
+/// What [`Hot::keeps`] says of a block found written.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Keep {
+    /// Guarded (again) as usual.
+    Guard,
+    /// Hot: left writable.
+    Hot,
+    /// To be made hot now, reported at most this many times a frame.
+    Make(u64),
+}
+
+/// The frames presented so far (in tests, as the test says).
+fn frame_now() -> u64 {
+    #[cfg(test)]
+    if let Some(frame) = TEST_FRAME.get() {
+        return frame;
+    }
+    crate::queue::presented()
+}
+
+/// [`hot_frames`] for one asking: the frames in a row that make a block
+/// hot (0: off), and this frame.
+#[derive(Clone, Copy)]
+struct Hot {
+    frames: u64,
+    frame: u64,
+}
+
+impl Hot {
+    /// For an asking under the lock: at the first asking of a frame, lets
+    /// go of the streaks of blocks not found written in the frame before,
+    /// and of the blocks kept cold until this frame.
+    fn now(g: &mut Guards) -> Self {
+        let frames = hot_frames();
+        if frames == 0 {
+            return Self { frames, frame: 0 };
+        }
+        let frame = frame_now();
+        if g.pruned != frame {
+            g.pruned = frame;
+            g.streak.retain(|_, s| s.last.saturating_add(1) >= frame);
+            g.cool.retain(|_, &mut until| until > frame);
+        }
+        Self { frames, frame }
+    }
+
+    /// For a block found written: whether it is hot and stays so, is to be
+    /// made hot now (the caller guards the run of blocks before it first,
+    /// then [`make_hot`]s it), or is guarded (again) as usual. It is noted
+    /// found written this frame, also when it was still read-only (written
+    /// through another view of its page, guarded at that view's asking):
+    /// whichever view is asked first in a frame, each view's blocks count
+    /// the frame.
+    fn keeps(self, g: &mut Guards, block: usize, tally: &mut Tally) -> Keep {
+        if self.frames == 0 {
+            return Keep::Guard;
+        }
+        if let Some(h) = g.hot.get_mut(&block) {
+            if self.frame.saturating_sub(h.since) < HOT_RETEST {
+                if h.frame != self.frame {
+                    h.frame = self.frame;
+                    h.reports = 0;
+                }
+                h.reports += 1;
+                if h.reports <= h.most {
+                    tally.hot += 1;
+                    return Keep::Hot;
+                }
+                // Asked about much more often than it was written: cheaper
+                // guarded, and not made hot again for a while.
+                g.hot.remove(&block);
+                g.cool.insert(block, self.frame.saturating_add(HOT_RETEST));
+                tally.cooled += 1;
+                return Keep::Guard;
+            }
+            // Guarded again, to see whether it has gone cold: found
+            // written in the frame after, it is hot again.
+            #[cfg(feature = "diagnostics")]
+            check_hot(g, block);
+            g.hot.remove(&block);
+            g.streak.insert(block, Streak { last: self.frame, frames: self.frames - 1, finds: 1, before: 0 });
+            tally.retests += 1;
+            return Keep::Guard;
+        }
+        let s = match g.streak.get(&block) {
+            Some(&s) if s.last == self.frame => Streak { finds: s.finds + 1, ..s },
+            Some(&s) if s.last.saturating_add(1) == self.frame => {
+                Streak { last: self.frame, frames: s.frames + 1, finds: 1, before: s.finds }
+            }
+            _ => Streak { last: self.frame, frames: 1, finds: 1, before: 0 },
+        };
+        if s.frames < self.frames || g.cool.get(&block).is_some_and(|&until| until > self.frame) {
+            g.streak.insert(block, s);
+            return Keep::Guard;
+        }
+        tally.made += 1;
+        tally.hot += 1;
+        let ratio = hot_ratio();
+        Keep::Make(if ratio == 0 { u64::MAX } else { ratio.saturating_mul(s.before.max(1)) })
+    }
+}
+
+/// Makes `block` hot in `frame` (see [`hot_frames`]), reported at most
+/// `most` times a frame, and with it every other view of its physical page
+/// (2 to [`MANY_VIEWS`] views): writable, out of the guards' sets, reported
+/// written at every asking. `block` is reported at this asking. A view
+/// read-only by our hand is made writable (`block` itself too if it was:
+/// written through another view, guarded at that view's asking).
+fn make_hot(g: &mut Guards, block: usize, frame: u64, most: u64) {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    let shown = if view_guard() { crate::inplace::pages_of(block * BLOCK) } else { Vec::new() };
+    let others = if (2..=MANY_VIEWS).contains(&shown.len()) { shown } else { Vec::new() };
+    let group: Vec<usize> = std::iter::once(block).chain(others.iter().map(|at| at / BLOCK)).collect();
+    for &b in &group {
+        if g.protected.remove(&b) {
+            g.clean.remove(b);
+            let mut old = 0;
+            // SAFETY: a block we made read-only.
+            unsafe { VirtualProtect((b * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        }
+        g.absent.remove(&b);
+        g.aliased.remove(&b);
+        g.streak.remove(&b);
+        let reports = u64::from(b == block);
+        g.hot.insert(b, Hotness { since: frame, most, frame, reports });
+    }
+    #[cfg(feature = "diagnostics")]
+    for &b in &group {
+        check_hot(g, b);
+    }
+}
+
+/// Hot blocks of `[start, end)` are no longer hot: guarded again at their
+/// next asking (they are writable and in none of the guards' sets).
+fn unhot(g: &mut Guards, start: usize, end: usize) {
+    if g.hot.is_empty() {
+        return;
+    }
+    let hot: Vec<usize> = g.hot.range(start / BLOCK..end.div_ceil(BLOCK)).map(|(&b, _)| b).collect();
+    for b in hot {
+        g.hot.remove(&b);
+    }
+}
+
+/// `VICTORY_GUARD_HOT_CHECK`, since the start: hot blocks checked, and of
+/// them the ones found otherwise than a hot block must be.
+#[cfg(feature = "diagnostics")]
+pub(crate) static HOT_CHECKS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// With `VICTORY_GUARD_HOT_CHECK=1`, for a block made hot or about to be
+/// guarded again to test it: whether it is as a hot block must be, in none
+/// of the guards' sets (`protected`, `clean` and its bits, `absent`,
+/// `aliased`), not read-only, and every other view of its page hot too
+/// (else a write through it would not be seen there). Counted, the first
+/// few that are not said in the log.
+#[cfg(feature = "diagnostics")]
+fn check_hot(g: &Guards, block: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_HOT_CHECK").is_some_and(|v| v == "1")) {
+        return;
+    }
+    HOT_CHECKS[0].fetch_add(1, Relaxed);
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    let read_only = n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READONLY;
+    let shown = if view_guard() { crate::inplace::pages_of(block * BLOCK) } else { Vec::new() };
+    let cold_views: Vec<usize> = if (2..=MANY_VIEWS).contains(&shown.len()) {
+        shown.into_iter().filter(|at| !g.hot.contains_key(&(at / BLOCK))).collect()
+    } else {
+        Vec::new()
+    };
+    let sets = [
+        g.protected.contains(&block),
+        g.clean.contains(block) || (keep_bits() && g.clean.has(block)),
+        g.absent.contains(&block),
+        g.aliased.contains(&block),
+    ];
+    if (read_only || !cold_views.is_empty() || sets.iter().any(|&b| b)) && HOT_CHECKS[1].fetch_add(1, Relaxed) < 32 {
+        tracing::warn!(
+            "VICTORY_GUARD_HOT_CHECK: hot block {:#x} is not as a hot block must be: read-only {read_only}, \
+             protected/clean/absent/aliased {sets:?}, other views of its page not hot: {cold_views:x?}",
+            block * BLOCK
+        );
     }
 }
 
@@ -633,6 +914,21 @@ struct Guards {
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
     viewed: BTreeSet<usize>,
+    /// With [`hot_frames`]: hot blocks, left writable and reported written
+    /// at every asking ([`Hotness`]). None is in `protected`, `clean`,
+    /// `absent` or `aliased`, and the other views of a hot block's page are
+    /// hot too.
+    hot: BTreeMap<usize, Hotness>,
+    /// With [`hot_frames`]: blocks found written lately ([`Streak`]; at
+    /// each new frame those not found written in the frame before are let
+    /// go of).
+    streak: BTreeMap<usize, Streak>,
+    /// With [`hot_frames`]: blocks guarded again for being reported more
+    /// often than they had been found written ([`hot_ratio`]), and the
+    /// frame until which they are not made hot again.
+    cool: BTreeMap<usize, u64>,
+    /// The frame `streak` and `cool` were last pruned at.
+    pruned: u64,
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -678,7 +974,7 @@ fn view_known() -> bool {
 
 impl Guards {
     /// Whether `block` is view memory the guards hold: read-only by our
-    /// hand, or noted absent (or, with [`view_known`], once guarded). With
+    /// hand, noted absent, or hot (or, with [`view_known`], once guarded). With
     /// `summed` ([`summary`]) a clean block, nearly every one asked about,
     /// is found by its bit first (every clean block is read-only by our
     /// hand), not looked up in the sets.
@@ -686,6 +982,7 @@ impl Guards {
         (summed && self.clean.has(block))
             || self.protected.contains(&block)
             || self.absent.contains(&block)
+            || self.hot.contains_key(&block)
             || (view_known() && self.viewed.contains(&block))
     }
 }
@@ -883,8 +1180,28 @@ pub(crate) fn guard_summary() -> bool {
 /// The frame line's clause on hot blocks (`VICTORY_GUARD_HOT`), given its
 /// counters per frame; empty while the switch is off.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn hot_clause(_made: f64, _reported: f64, _retests: f64) -> String {
-    String::new()
+pub(crate) fn hot_clause(made: f64, reported: f64, retests: f64, cooled: f64) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let frames = hot_frames();
+    if frames == 0 {
+        return String::new();
+    }
+    let (now, lately, cool) = {
+        let g = guards();
+        (g.hot.len(), g.streak.len(), g.cool.len())
+    };
+    let checks = if std::env::var_os("VICTORY_GUARD_HOT_CHECK").is_some_and(|v| v == "1") {
+        format!(", checks since the start: {} of {} failed", HOT_CHECKS[1].load(Relaxed), HOT_CHECKS[0].load(Relaxed))
+    } else {
+        String::new()
+    };
+    format!(
+        "; hot blocks (VICTORY_GUARD_HOT={frames}, ratio {}): {now} now ({lately} found written lately, {cool} kept \
+         cold), {made:.1} made hot, {reported:.0} reported written for being hot ({:.1} MB), {retests:.1} guarded \
+         again to test, {cooled:.1} for being reported too often{checks}",
+        hot_ratio(),
+        reported * BLOCK as f64 / 1e6
+    )
 }
 
 /// One check of `VICTORY_GUARD_SUMMARY_CHECK` in this many askings.
@@ -928,6 +1245,13 @@ fn check_summary(g: &Guards, first: usize, last: usize) {
 thread_local! {
     /// Tests: [`summary`] for this thread, whatever the environment says.
     static TEST_SUMMARY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Tests: [`hot_frames`], [`hot_ratio`] and the frame ([`frame_now`])
+    /// for this thread.
+    static TEST_HOT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static TEST_HOT_RATIO: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// Tests: [`views_batch`] for this thread.
+    static TEST_VIEWS_BATCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_FRAME: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -936,6 +1260,10 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     viewed: BTreeSet::new(),
+    hot: BTreeMap::new(),
+    streak: BTreeMap::new(),
+    cool: BTreeMap::new(),
+    pruned: 0,
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -1034,7 +1362,8 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardCheckNs, (walking - checking).as_nanos() as u64);
         let mut tally = Tally::default();
-        let _walked = walk_summed(&mut g, first, last, &mut written, &mut tally);
+        let hot = Hot::now(&mut g);
+        let _walked = walk_summed(&mut g, first, last, &mut written, &mut tally, hot);
         tally.count();
         #[cfg(feature = "diagnostics")]
         {
@@ -1064,12 +1393,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut next_clean = 0;
     let mut uncommitted_until = first;
     let mut tally = Tally::default();
+    let hot = Hot::now(&mut g);
     for block in first..=last {
         while next_clean < clean.len() && clean[next_clean] < block {
             next_clean += 1;
         }
         let is_clean = next_clean < clean.len() && clean[next_clean] == block;
-        let walk = Walk { run: &mut run, uncommitted_until: &mut uncommitted_until, written: &mut written, tally: &mut tally };
+        let walk = Walk { run: &mut run, uncommitted_until: &mut uncommitted_until, written: &mut written, tally: &mut tally, hot };
         step(&mut g, block, block >= last || is_clean, walk);
     }
     tally.count();
@@ -1087,9 +1417,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 /// not clean is reported written, unless it is noted absent and still
 /// wholly uncommitted. One still read-only by our hand (written through the
 /// runtime) is noted clean again; the others are guarded again in runs,
-/// each run ending at the next block that needs no guarding.
+/// each run ending at the next block that needs no guarding. With
+/// [`hot_frames`], a hot block is left writable and ends the run before it
+/// ([`Hot::keeps`]).
 fn step(g: &mut Guards, block: usize, clean: bool, walk: Walk<'_>) {
-    let Walk { run, uncommitted_until, written, tally } = walk;
+    let Walk { run, uncommitted_until, written, tally, hot } = walk;
     let mut open = !clean;
     if open && g.absent.contains(&block) {
         // Ordinary commits need no runtime mapping notification. Reuse
@@ -1107,13 +1439,30 @@ fn step(g: &mut Guards, block: usize, clean: bool, walk: Walk<'_>) {
     if open {
         written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
         tally.written += 1;
-        if g.protected.contains(&block) {
-            // Written through the runtime, still read-only.
+        let guarded = g.protected.contains(&block);
+        if guarded {
+            // Written through the runtime, or through another view of the
+            // page guarded at that view's asking: still read-only.
             g.clean.insert(block);
             tally.guarded += 1;
-        } else {
-            run.get_or_insert(block);
-            return;
+        }
+        match hot.keeps(g, block, tally) {
+            Keep::Guard if guarded => {}
+            Keep::Guard => {
+                run.get_or_insert(block);
+                return;
+            }
+            // Left writable.
+            Keep::Hot => {}
+            Keep::Make(most) => {
+                // The run before it first: another view of this page may
+                // be in it, and is made hot too.
+                if let Some(from) = run.take() {
+                    protect(g, from, block);
+                }
+                make_hot(g, block, hot.frame, most);
+                return;
+            }
         }
     }
     if let Some(from) = run.take() {
@@ -1123,12 +1472,14 @@ fn step(g: &mut Guards, block: usize, clean: bool, walk: Walk<'_>) {
 
 /// The state one asking's walk carries from block to block ([`step`]):
 /// the run of written blocks to guard again, the end of the uncommitted
-/// memory last asked about, the pages reported, what was found.
+/// memory last asked about, the pages reported, what was found, and
+/// [`hot_frames`] with this frame.
 struct Walk<'a> {
     run: &'a mut Option<usize>,
     uncommitted_until: &'a mut usize,
     written: &'a mut Vec<usize>,
     tally: &'a mut Tally,
+    hot: Hot,
 }
 
 /// [`guard`]'s walk of `[first, last)` with [`summary`]: the words of
@@ -1140,7 +1491,7 @@ struct Walk<'a> {
 /// clean meanwhile is the block it stands at or ones before it (the runs it
 /// guards again end there), so the later blocks read as they were when the
 /// asking began, as the set read once at the start gave them.
-fn walk_summed(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usize>, tally: &mut Tally) -> u64 {
+fn walk_summed(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usize>, tally: &mut Tally, hot: Hot) -> u64 {
     let mut run: Option<usize> = None;
     let mut uncommitted_until = first;
     let mut walked = 0;
@@ -1159,12 +1510,12 @@ fn walk_summed(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usiz
         walked += (end - block) as u64;
         while block < end {
             let clean = bits & (1 << (block % WORD)) != 0;
-            let walk = Walk { run: &mut run, uncommitted_until: &mut uncommitted_until, written: &mut *written, tally: &mut *tally };
+            let walk = Walk { run: &mut run, uncommitted_until: &mut uncommitted_until, written: &mut *written, tally: &mut *tally, hot };
             step(g, block, clean, walk);
             block += 1;
         }
     }
-    let walk = Walk { run: &mut run, uncommitted_until: &mut uncommitted_until, written: &mut *written, tally: &mut *tally };
+    let walk = Walk { run: &mut run, uncommitted_until: &mut uncommitted_until, written: &mut *written, tally: &mut *tally, hot };
     step(g, last, true, walk);
     walked
 }
@@ -1224,11 +1575,28 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     if !view_guard() {
         return;
     }
-    let views = timed!(
-        GuardViewLookups,
-        GuardViewLookupNs,
-        crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK))
-    );
+    let (start, end) = (from.saturating_mul(BLOCK), to.saturating_mul(BLOCK));
+    if views_batch() {
+        // The same pages, found under one taking of the views' lock, and
+        // their other views made read-only in runs.
+        let shared = timed!(GuardViewLookups, GuardViewLookupNs, crate::inplace::shared_between(start, end, MANY_VIEWS));
+        let mut others = Vec::new();
+        for (page, shown) in shared {
+            let block = page / BLOCK;
+            #[cfg(feature = "diagnostics")]
+            ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for alias in shown {
+                let alias = alias / BLOCK;
+                g.aliased.insert(alias);
+                if alias != block {
+                    others.push(alias);
+                }
+            }
+        }
+        protect_aliases(g, others);
+        return;
+    }
+    let views = timed!(GuardViewLookups, GuardViewLookupNs, crate::inplace::views_between(start, end));
     for (base, bytes) in views {
         let first = (base / BLOCK).max(from);
         let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
@@ -1240,16 +1608,84 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             if shown.len() < 2 || shown.len() > MANY_VIEWS {
                 continue;
             }
-            #[cfg(feature = "diagnostics")]
-            ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            for alias in shown {
-                let alias = alias / BLOCK;
-                g.aliased.insert(alias);
-                if alias != block {
-                    protect_alias(g, alias);
-                }
+            protect_with(g, block, shown);
+        }
+    }
+}
+
+/// [`protect`] for `block`, whose physical page every view in `shown`
+/// shows (its own included): the others are made read-only, and all noted
+/// guarded together.
+fn protect_with(g: &mut Guards, block: usize, shown: Vec<usize>) {
+    #[cfg(feature = "diagnostics")]
+    ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for alias in shown {
+        let alias = alias / BLOCK;
+        g.aliased.insert(alias);
+        if alias != block {
+            protect_alias(g, alias);
+        }
+    }
+}
+
+/// Whether [`protect`] finds the other views of a run's pages under one
+/// taking of the views' lock and makes them read-only in runs
+/// (`VICTORY_GUARD_VIEWS_BATCH=1`; off by default).
+///
+/// Off, the run's views are looked up, then each of their pages under the
+/// lock again, its views copied out (`views_between`, `pages_of`), and each
+/// other view is made read-only by a call of its own ([`protect_alias`]).
+/// With the title's threads on every processor such a call costs some 7 us
+/// however few its pages (each processor must forget them), and the other
+/// views of a run of pages often lie side by side too (a section mapped
+/// twice). On, the same pages are found under one taking of the lock
+/// (`crate::inplace::shared_between`), and their other views are made
+/// read-only by one call for each run of them ([`protect_aliases`]).
+fn views_batch() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_VIEWS_BATCH.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_VIEWS_BATCH").is_some_and(|v| v == "1"))
+}
+
+/// [`protect_alias`] for each of `blocks` (other views of pages just
+/// guarded), one call for each run of them side by side that is not
+/// read-only by our hand already, block by block where a run's call fails.
+fn protect_aliases(g: &mut Guards, mut blocks: Vec<usize>) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    blocks.sort_unstable();
+    blocks.dedup();
+    // Hot views of these pages are guarded with the others again.
+    for b in &blocks {
+        g.hot.remove(b);
+    }
+    blocks.retain(|b| !g.protected.contains(b));
+    let mut i = 0;
+    while i < blocks.len() {
+        let mut k = i + 1;
+        while k < blocks.len() && blocks[k] == blocks[k - 1] + 1 {
+            k += 1;
+        }
+        let (from, to) = (blocks[i], blocks[k - 1] + 1);
+        let mut old = 0;
+        // SAFETY: title view memory; only its protection changes.
+        let done = to - from > 1
+            && timed!(GuardViewProtects, GuardViewProtectNs, unsafe {
+                VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READONLY, &mut old)
+            }) != 0;
+        if done {
+            g.protected.extend(from..to);
+            if view_known() {
+                g.viewed.extend(from..to);
+            }
+        } else {
+            for &b in &blocks[i..k] {
+                protect_alias(g, b);
             }
         }
+        i = k;
     }
 }
 
@@ -1279,6 +1715,9 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// its copies took them, `open` would have opened it.
 fn protect_alias(g: &mut Guards, block: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    // A hot view of the page is guarded with the others again
+    // ([`hot_frames`]): reported written at its next asking, as below.
+    g.hot.remove(&block);
     if g.protected.contains(&block) {
         return;
     }
@@ -1510,6 +1949,9 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     }
     let mut g = guards();
     for &(at, n) in &ranges {
+        // A hot block now has another view, which a write through it would
+        // not open: guarded again, with its other views, at its next asking.
+        unhot(&mut g, at, at.saturating_add(n));
         if open_here(&mut g, at, at.saturating_add(n)) {
             #[cfg(feature = "diagnostics")]
             ALIASES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1602,6 +2044,21 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
+    }
+    // Nor hot, nor found written lately, nor kept cold.
+    unhot(&mut g, at, at.saturating_add(len));
+    let blocks = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    if !g.streak.is_empty() {
+        let streak: Vec<usize> = g.streak.range(blocks.clone()).map(|(&b, _)| b).collect();
+        for block in streak {
+            g.streak.remove(&block);
+        }
+    }
+    if !g.cool.is_empty() {
+        let cool: Vec<usize> = g.cool.range(blocks).map(|(&b, _)| b).collect();
+        for block in cool {
+            g.cool.remove(&block);
+        }
     }
     if view_known() {
         // The runtime calls this for two things only (`xmem`: `map` and
@@ -2246,6 +2703,30 @@ mod tests {
     /// ranges that cross the summary's words.
     #[test]
     fn the_summary_answers_as_the_set_does() {
+        the_summary_answers_as_the_set(None);
+    }
+
+    /// The same with hot blocks (`VICTORY_GUARD_HOT=2`), the frames going
+    /// by: blocks written in two frames in a row (and the blocks that will
+    /// not be made read-only, committed in part) go hot, the same at both
+    /// views, and are tested again after `HOT_RETEST` frames.
+    #[test]
+    fn the_summary_answers_as_the_set_does_with_hot_blocks() {
+        let _alone = hot_test();
+        the_summary_answers_as_the_set(Some(2));
+    }
+
+    /// The tests with hot blocks, one at a time. Each test numbers its own
+    /// frames ([`TEST_FRAME`]), and the first asking of a frame lets go of
+    /// the streaks of blocks not found written in the frame before: a test
+    /// at frame 5,000 would let go of those of a test at frame 11 (the
+    /// runtime has one count of frames).
+    fn hot_test() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: Mutex<()> = Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn the_summary_answers_as_the_set(hot: Option<u64>) {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -2270,7 +2751,7 @@ mod tests {
                     std::ptr::null(),
                 );
                 assert!(!section.is_null());
-                let high = (0x2B00_0000_0000 + n * 0x1000_0000) as *const _;
+                let high = (0x2B00_0000_0000 + n * 0x1000_0000 + usize::from(hot.is_some()) * 0x4000_0000) as *const _;
                 let mut view = MapViewOfFileEx(section, FILE_MAP_WRITE, 0, 0, SIZE, high);
                 if view.Value.is_null() {
                     view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE);
@@ -2309,7 +2790,13 @@ mod tests {
                 pages.map(|pages| pages.into_iter().map(|page| page - view / PAGE).collect::<Vec<_>>())
             })
         };
+        TEST_HOT.set(hot);
+        let mut hot_seen = 0;
         for round in 0..4000 {
+            if hot.is_some() && round % 8 == 0 {
+                TEST_FRAME.set(Some(100 + round as u64 / 8));
+                hot_seen += guards().hot.range(views[0] / BLOCK..views[0] / BLOCK + BLOCKS).count();
+            }
             match dice.below(10) {
                 0..=4 => {
                     let (from, to) = if dice.below(8) == 0 {
@@ -2366,7 +2853,12 @@ mod tests {
             let held = |view: usize, block: usize| {
                 let block = view / BLOCK + block;
                 assert_eq!(g.clean.has(block), g.clean.contains(block));
-                (g.protected.contains(&block), g.clean.contains(block), g.absent.contains(&block))
+                (
+                    g.protected.contains(&block),
+                    g.clean.contains(block),
+                    g.absent.contains(&block),
+                    g.hot.contains_key(&block),
+                )
             };
             for block in 0..BLOCKS {
                 assert_eq!(held(views[0], block), held(views[1], block), "block {block}");
@@ -2375,7 +2867,13 @@ mod tests {
                 assert!(g.clean.agrees(view / BLOCK, view / BLOCK + BLOCKS));
             }
         }
+        if hot.is_some() {
+            assert!(hot_seen > 0, "no block went hot");
+        }
         TEST_SUMMARY.set(None);
+        TEST_HOT.set(None);
+        TEST_HOT_RATIO.set(None);
+        TEST_FRAME.set(None);
         for view in views {
             title_memory_remapped(view, SIZE);
             // SAFETY: our view.
@@ -2397,6 +2895,426 @@ mod tests {
         a_write_is_reported_at_every_checked_view();
         a_page_of_many_views_is_guarded_one_view_at_a_time();
         TEST_SUMMARY.set(None);
+    }
+
+    /// The other views of a run's pages found under one taking of the
+    /// lock (`VICTORY_GUARD_VIEWS_BATCH`) are those found by the run's views
+    /// and then each of their pages: over runs at random across views of
+    /// one to four blocks laid side by side and apart, each page shown once
+    /// or in two to five views, or in more than `MANY_VIEWS`.
+    #[test]
+    fn the_other_views_found_at_once_are_those_found_page_by_page() {
+        let mut dice = Dice(0x05EE_D0FA_11A5);
+        let base = 0x6400_0000_0000usize;
+        let section = 0xA11A5;
+        // Views of 1-4 blocks, now side by side, now apart; the section's
+        // pages are shown by several of them at random.
+        let mut at = base;
+        let mut laid = Vec::new();
+        for _ in 0..200 {
+            let blocks = 1 + dice.below(4);
+            let offset = dice.below(40) * BLOCK;
+            crate::inplace::title_memory_view(at, blocks * BLOCK, section, offset as u64);
+            laid.push((at, blocks));
+            at += (blocks + dice.below(2) * dice.below(3)) * BLOCK;
+        }
+        // One page of the section in more views than are guarded together.
+        for n in 0..=MANY_VIEWS {
+            crate::inplace::title_memory_view(at + n * BLOCK, BLOCK, section, (60 * BLOCK) as u64);
+        }
+        let end = at + (MANY_VIEWS + 1) * BLOCK;
+        let page_by_page = |start: usize, stop: usize| {
+            let mut out = Vec::new();
+            for (view, bytes) in crate::inplace::views_between(start, stop) {
+                for block in (view / BLOCK).max(start / BLOCK)..view.saturating_add(bytes).div_ceil(BLOCK).min(stop / BLOCK) {
+                    let shown = crate::inplace::pages_of(block * BLOCK);
+                    if (2..=MANY_VIEWS).contains(&shown.len()) {
+                        out.push((block * BLOCK, shown));
+                    }
+                }
+            }
+            out
+        };
+        let mut shared_seen = 0;
+        for _ in 0..2000 {
+            let first = base / BLOCK + dice.below((end - base) / BLOCK);
+            let last = first + 1 + dice.below(12);
+            let (start, stop) = (first * BLOCK, last * BLOCK);
+            let once = crate::inplace::shared_between(start, stop, MANY_VIEWS);
+            assert_eq!(once, page_by_page(start, stop), "{start:#x}..{stop:#x}");
+            shared_seen += once.len();
+        }
+        assert!(shared_seen > 0);
+        assert!(laid.iter().any(|&(at, _)| crate::inplace::pages_of(at).len() >= 2));
+        title_memory_remapped(base, end - base);
+    }
+
+    /// The view tests with the other views found at once and guarded in
+    /// runs (`VICTORY_GUARD_VIEWS_BATCH`).
+    #[test]
+    fn the_view_tests_with_the_views_in_runs() {
+        let _alone = hot_test();
+        TEST_VIEWS_BATCH.set(Some(true));
+        a_write_through_another_view_is_reported_at_the_guarded_one();
+        a_view_mapped_beside_a_guarded_one_makes_it_check_again();
+        a_write_told_at_one_view_is_reported_at_the_others();
+        a_write_is_reported_at_every_checked_view();
+        a_page_of_many_views_is_guarded_one_view_at_a_time();
+        the_other_views_of_a_hot_page_are_hot();
+        for summed in [false, true] {
+            for ratio in [0, 2] {
+                no_write_is_missed(summed, ratio);
+            }
+        }
+        TEST_VIEWS_BATCH.set(None);
+    }
+
+    /// A pagefile section of `bytes`, mapped once (no title view); its
+    /// address.
+    fn one_view(bytes: usize) -> usize {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        // SAFETY: a fresh pagefile section, mapped; the view holds its own
+        // reference once the handle is closed.
+        unsafe {
+            let section =
+                CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, bytes as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, bytes);
+            CloseHandle(section);
+            assert!(!view.Value.is_null());
+            view.Value as usize
+        }
+    }
+
+    /// With `VICTORY_GUARD_HOT=3`: a block the title writes in three frames
+    /// in a row is left writable (its writes fault no more) and reported at
+    /// every asking, the blocks beside it guarded as before. After
+    /// `HOT_RETEST` frames it is guarded again: written in the frame after,
+    /// it is hot again at once; not written, it has gone cold. A remapping
+    /// forgets it.
+    #[test]
+    fn a_block_written_every_frame_goes_hot() {
+        let _alone = hot_test();
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        const SIZE: usize = 4 * BLOCK;
+        let view = one_view(SIZE);
+        TEST_HOT.set(Some(3));
+        TEST_HOT_RATIO.set(Some(0));
+        let at_frame = |frame: u64| TEST_FRAME.set(Some(frame));
+        let page = |block: usize| (view + block * BLOCK) / PAGE;
+        let ask = || guard(view, view + SIZE).expect("view memory");
+        let write = |block: usize| {
+            // SAFETY: a byte of our view, through the handler if guarded.
+            unsafe { ((view + block * BLOCK + 8) as *mut u8).write_volatile(1) };
+        };
+        let none: Vec<usize> = Vec::new();
+        // The first asking reports every block, as found written: some
+        // frames before the ones counted.
+        at_frame(990);
+        assert_eq!(ask(), (0..4).map(page).collect::<Vec<_>>());
+        for frame in 1001..=1002 {
+            at_frame(frame);
+            assert!(!writable(view + BLOCK), "guarded");
+            write(1);
+            assert_eq!(ask(), [page(1)]);
+            assert_eq!(ask(), none, "guarded again");
+        }
+        at_frame(1003);
+        write(1);
+        assert_eq!(ask(), [page(1)]);
+        assert!(writable(view + BLOCK), "hot: left writable");
+        assert!(guards().known(view / BLOCK + 1, false), "still known as view memory");
+        assert_eq!(ask(), [page(1)], "reported at every asking");
+        write(1);
+        write(2);
+        assert_eq!(ask(), [page(1), page(2)]);
+        assert_eq!(ask(), [page(1)], "the block beside it guarded again as before");
+        at_frame(1003 + HOT_RETEST - 1);
+        assert_eq!(ask(), [page(1)]);
+        assert!(writable(view + BLOCK));
+        // Tested again: reported once more and guarded.
+        at_frame(1003 + HOT_RETEST);
+        assert_eq!(ask(), [page(1)]);
+        assert!(!writable(view + BLOCK));
+        assert_eq!(ask(), none);
+        // Written in the frame after: hot again.
+        at_frame(1003 + HOT_RETEST + 1);
+        write(1);
+        assert_eq!(ask(), [page(1)]);
+        assert!(writable(view + BLOCK), "hot again");
+        // Tested again and not written in the frame after: cold.
+        at_frame(1003 + 2 * HOT_RETEST + 1);
+        assert_eq!(ask(), [page(1)]);
+        at_frame(1003 + 2 * HOT_RETEST + 2);
+        assert_eq!(ask(), none);
+        at_frame(1003 + 2 * HOT_RETEST + 3);
+        write(1);
+        assert_eq!(ask(), [page(1)]);
+        assert!(!writable(view + BLOCK), "cold: guarded again as any block");
+        assert_eq!(ask(), none);
+        // Hot once more, then remapped: forgotten.
+        for frame in 1003 + 2 * HOT_RETEST + 4..1003 + 2 * HOT_RETEST + 6 {
+            at_frame(frame);
+            write(1);
+            assert_eq!(ask(), [page(1)]);
+        }
+        assert!(guards().hot.contains_key(&(view / BLOCK + 1)));
+        title_memory_remapped(view, SIZE);
+        {
+            let g = guards();
+            assert!(g.hot.range(view / BLOCK..view / BLOCK + 4).next().is_none());
+            assert!(g.streak.range(view / BLOCK..view / BLOCK + 4).next().is_none());
+        }
+        TEST_HOT.set(None);
+        TEST_HOT_RATIO.set(None);
+        TEST_FRAME.set(None);
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+    }
+
+    /// With `VICTORY_GUARD_HOT=2` and `VICTORY_GUARD_HOT_RATIO=2`: a block
+    /// found written once a frame goes hot reported at most twice a frame;
+    /// asked about a third time, it is guarded again and not made hot for
+    /// `HOT_RETEST` frames. One found written three times a frame stays hot
+    /// through six askings a frame.
+    #[test]
+    fn a_hot_block_asked_about_more_often_than_written_is_guarded_again() {
+        let _alone = hot_test();
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        const SIZE: usize = 2 * BLOCK;
+        let view = one_view(SIZE);
+        TEST_HOT.set(Some(2));
+        TEST_HOT_RATIO.set(Some(2));
+        let at_frame = |frame: u64| TEST_FRAME.set(Some(frame));
+        let page = |block: usize| (view + block * BLOCK) / PAGE;
+        let ask = || guard(view, view + SIZE).expect("view memory");
+        let write = |block: usize| {
+            // SAFETY: a byte of our view, through the handler if guarded.
+            unsafe { ((view + block * BLOCK + 8) as *mut u8).write_volatile(1) };
+        };
+        let none: Vec<usize> = Vec::new();
+        at_frame(90);
+        assert_eq!(ask(), [page(0), page(1)]);
+        at_frame(101);
+        write(1);
+        assert_eq!(ask(), [page(1)]);
+        at_frame(102);
+        write(1);
+        assert_eq!(ask(), [page(1)], "made hot");
+        assert!(writable(view + BLOCK));
+        assert_eq!(ask(), [page(1)], "reported a second time");
+        assert_eq!(ask(), [page(1)], "a third: reported, and guarded again");
+        assert!(!writable(view + BLOCK));
+        assert_eq!(ask(), none);
+        // Written every frame, it is not made hot again for a while.
+        for frame in 103..105 {
+            at_frame(frame);
+            write(1);
+            assert_eq!(ask(), [page(1)]);
+            assert!(!writable(view + BLOCK), "kept cold");
+        }
+        at_frame(102 + HOT_RETEST - 1);
+        write(1);
+        assert_eq!(ask(), [page(1)]);
+        at_frame(102 + HOT_RETEST);
+        write(1);
+        assert_eq!(ask(), [page(1)]);
+        assert!(writable(view + BLOCK), "hot again");
+        title_memory_remapped(view, SIZE);
+        // Found written three times a frame: reported up to six.
+        at_frame(500);
+        assert_eq!(ask(), [page(0), page(1)]);
+        at_frame(511);
+        for _ in 0..3 {
+            write(0);
+            assert_eq!(ask(), [page(0)]);
+        }
+        at_frame(512);
+        write(0);
+        assert_eq!(ask(), [page(0)], "made hot");
+        for n in 2..=6 {
+            assert_eq!(ask(), [page(0)], "asking {n}");
+            assert!(writable(view), "hot through asking {n}");
+        }
+        assert_eq!(ask(), [page(0)]);
+        assert!(!writable(view), "guarded again at the seventh");
+        TEST_HOT.set(None);
+        TEST_HOT_RATIO.set(None);
+        TEST_FRAME.set(None);
+        title_memory_remapped(view, SIZE);
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+    }
+
+    /// With `VICTORY_GUARD_HOT=2`: the page written through one view in two
+    /// frames in a row goes hot at both of its views, whichever is asked
+    /// first: a write through either is reported at both, at every asking,
+    /// with no fault. A third view of the page mapped ends it: the views
+    /// are guarded together again.
+    #[test]
+    fn the_other_views_of_a_hot_page_are_hot_with_it() {
+        let _alone = hot_test();
+        the_other_views_of_a_hot_page_are_hot();
+    }
+
+    fn the_other_views_of_a_hot_page_are_hot() {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        TEST_HOT.set(Some(2));
+        TEST_HOT_RATIO.set(Some(0));
+        let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
+        TEST_FRAME.set(Some(5));
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 0), pages(one, 1)]));
+        assert_eq!(guard(two, two + SIZE), Some(vec![pages(two, 0), pages(two, 1)]));
+        // Asked first: the first view, then the second.
+        for (frame, first) in [(11, [one, two]), (12, [two, one])] {
+            TEST_FRAME.set(Some(frame));
+            assert!(!writable(one) && !writable(two));
+            // SAFETY: the first view, opened by the handler.
+            unsafe { ((one + 8) as *mut u8).write_volatile(frame as u8) };
+            for view in first {
+                assert_eq!(guard(view, view + SIZE), Some(vec![pages(view, 0)]), "frame {frame}");
+            }
+        }
+        assert!(writable(one) && writable(two), "both views of the page hot");
+        assert!(!writable(one + BLOCK) && !writable(two + BLOCK), "the next page guarded as before");
+        TEST_FRAME.set(Some(13));
+        // SAFETY: the second view, writable.
+        unsafe { ((two + 8) as *mut u8).write_volatile(1) };
+        for _ in 0..2 {
+            assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 0)]));
+            assert_eq!(guard(two, two + SIZE), Some(vec![pages(two, 0)]));
+        }
+        // A third view: every view of the section's pages is checked again,
+        // and guarded together.
+        // SAFETY: the section of `two_views`, still open.
+        let third = unsafe { MapViewOfFile(section as *mut std::ffi::c_void, FILE_MAP_WRITE, 0, 0, SIZE) }.Value as usize;
+        assert_ne!(third, 0);
+        crate::inplace::title_memory_view(third, SIZE, section, 0);
+        assert!(guards().hot.range(one / BLOCK..one / BLOCK + 2).next().is_none());
+        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 0), pages(one, 1)]));
+        assert!(!writable(one) && !writable(two) && !writable(third), "guarded together");
+        assert_eq!(guard(two, two + SIZE), Some(vec![pages(two, 0), pages(two, 1)]));
+        assert_eq!(guard(third, third + SIZE), Some(vec![pages(third, 0), pages(third, 1)]));
+        TEST_HOT.set(None);
+        TEST_HOT_RATIO.set(None);
+        TEST_FRAME.set(None);
+        drop_views(section, &[one, two, third], SIZE);
+    }
+
+    /// Whatever the order of writes through either view of the pages (by
+    /// the title, faulting where guarded, and by the runtime, told first),
+    /// of askings at either view and of frames, with blocks going hot and
+    /// cold (`VICTORY_GUARD_HOT=2`, tested again after `HOT_RETEST` frames)
+    /// and views remapped: every block written since an asking at its view
+    /// last covered it is reported at the next asking there, and the hot
+    /// blocks are as they must be. As before, and with the summary.
+    #[test]
+    fn no_write_is_missed_with_hot_blocks() {
+        let _alone = hot_test();
+        for summed in [false, true] {
+            for ratio in [0, 2] {
+                no_write_is_missed(summed, ratio);
+            }
+        }
+    }
+
+    fn no_write_is_missed(summed: bool, ratio: u64) {
+        use windows_sys::Win32::System::Memory::VirtualProtect;
+        const BLOCKS: usize = 8;
+        const SIZE: usize = BLOCKS * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        let views = [one, two];
+        TEST_SUMMARY.set(Some(summed));
+        TEST_HOT.set(Some(2));
+        TEST_HOT_RATIO.set(Some(ratio));
+        let mut frame = 5000;
+        TEST_FRAME.set(Some(frame));
+        let mut dice = Dice(0xC0FF_EE00_1234_5678 ^ u64::from(summed) ^ (ratio << 8));
+        // Blocks written since an asking at that view last covered them.
+        let mut dirty = [[true; BLOCKS]; 2];
+        let (mut hot_seen, mut cold_seen) = (0, 0);
+        for round in 0..6000usize {
+            match dice.below(16) {
+                0..=5 => {
+                    let (v, b) = (dice.below(2), dice.below(BLOCKS));
+                    // SAFETY: a byte of our view, through the handler if guarded.
+                    unsafe { ((views[v] + b * BLOCK + 8 + round % 64) as *mut u8).write_volatile(round as u8) };
+                    dirty[0][b] = true;
+                    dirty[1][b] = true;
+                }
+                6..=11 => {
+                    let v = dice.below(2);
+                    let from = dice.below(BLOCKS);
+                    let to = from + 1 + dice.below(BLOCKS - from);
+                    let pages = guard(views[v] + from * BLOCK, views[v] + to * BLOCK).expect("view memory");
+                    for b in from..to {
+                        assert!(
+                            !dirty[v][b] || pages.contains(&((views[v] + b * BLOCK) / PAGE)),
+                            "view {v} block {b} written and not reported, round {round}, summary {summed}, ratio {ratio}"
+                        );
+                        dirty[v][b] = false;
+                    }
+                }
+                12 => {
+                    // The runtime writes, telling the guards first.
+                    let (v, b) = (dice.below(2), dice.below(BLOCKS));
+                    let n = (1 + dice.below(2)).min(BLOCKS - b);
+                    writing(views[v] + b * BLOCK, n * BLOCK);
+                    for k in b..b + n {
+                        // SAFETY: a byte of our view, opened by `writing`.
+                        unsafe { ((views[v] + k * BLOCK + 16) as *mut u8).write_volatile(round as u8) };
+                        dirty[0][k] = true;
+                        dirty[1][k] = true;
+                    }
+                }
+                13 | 14 => {
+                    frame += 1;
+                    TEST_FRAME.set(Some(frame));
+                }
+                _ => {
+                    // Now and then the runtime maps a view anew: forgotten,
+                    // writable, its other views checked again.
+                    if dice.below(8) == 0 {
+                        let v = dice.below(2);
+                        title_memory_remapped(views[v], SIZE);
+                        let mut old = 0;
+                        // SAFETY: our view; only its protection changes.
+                        assert_ne!(unsafe { VirtualProtect(views[v] as *const _, SIZE, PAGE_READWRITE, &mut old) }, 0);
+                        crate::inplace::title_memory_view(views[v], SIZE, section, 0);
+                    }
+                }
+            }
+            let g = guards();
+            for b in 0..BLOCKS {
+                let [x, y] = views.map(|view| view / BLOCK + b);
+                for (block, other) in [(x, y), (y, x)] {
+                    if !g.hot.contains_key(&block) {
+                        cold_seen += 1;
+                        continue;
+                    }
+                    hot_seen += 1;
+                    assert!(g.hot.contains_key(&other), "block {b}: the other view of a hot page is not hot, round {round}");
+                    assert!(
+                        !g.protected.contains(&block)
+                            && !g.clean.contains(block)
+                            && !g.clean.has(block)
+                            && !g.absent.contains(&block)
+                            && !g.aliased.contains(&block),
+                        "block {b}: a hot block in the guards' sets, round {round}"
+                    );
+                    assert!(writable(block * BLOCK), "block {b}: a hot block not writable, round {round}");
+                }
+            }
+        }
+        assert!(hot_seen > 0 && cold_seen > 0, "{hot_seen} hot and {cold_seen} cold");
+        TEST_SUMMARY.set(None);
+        TEST_HOT.set(None);
+        TEST_HOT_RATIO.set(None);
+        TEST_FRAME.set(None);
+        drop_views(section, &views, SIZE);
     }
 
     /// For timing, about what a steady scene's frame asks: 3,600 ranges

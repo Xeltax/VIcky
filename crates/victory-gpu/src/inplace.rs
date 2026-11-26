@@ -377,6 +377,35 @@ pub(crate) fn pages_of(page: usize) -> Vec<usize> {
     v.pages.get(&(section, offset + within as u64)).cloned().unwrap_or_default()
 }
 
+/// The 64 KiB pages of `[start, end)` that title views show elsewhere too:
+/// for each page of a view there whose physical page is shown in 2 to
+/// `most` views in all, its address and the address of the page in every
+/// view that shows it (its own included). What [`views_between`] and then
+/// [`pages_of`] for each page of those views say, under one taking of the
+/// lock and with no list made for a page shown once (`crate::watch`'s
+/// guards, for a run of blocks they guard again).
+pub(crate) fn shared_between(start: usize, end: usize, most: usize) -> Vec<(usize, Vec<usize>)> {
+    let mut out = Vec::new();
+    if start >= end {
+        return out;
+    }
+    let v = views();
+    let first = v.views.range(..=start).next_back().filter(|&(&base, view)| base + view.0 > start);
+    for (&base, &(bytes, section, offset)) in first.into_iter().chain(v.views.range(start.saturating_add(1)..end)) {
+        let mut page = base + start.saturating_sub(base).div_ceil(K64) * K64;
+        let stop = base.saturating_add(bytes).min(end);
+        while page < stop {
+            if let Some(shown) = v.pages.get(&(section, offset + (page - base) as u64))
+                && (2..=most).contains(&shown.len())
+            {
+                out.push((page, shown.clone()));
+            }
+            page += K64;
+        }
+    }
+    out
+}
+
 /// The title views that show any of the physical bytes `[offset, offset +
 /// len)` of `section`, as `(address, bytes)` ranges in address order; not
 /// those of a page shown in very many views (`MANY_VIEWS`).

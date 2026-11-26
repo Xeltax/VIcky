@@ -181,11 +181,13 @@ pub(crate) enum C {
     GuardViewProtects,
     GuardViewProtectNs,
     /// With `VICTORY_GUARD_HOT`: blocks reported written at an asking
-    /// because they are hot (left writable), blocks made hot, and hot
-    /// blocks guarded again to see whether they went cold.
+    /// because they are hot (left writable), blocks made hot, hot blocks
+    /// guarded again to see whether they went cold, and hot blocks guarded
+    /// again for being reported too often (`VICTORY_GUARD_HOT_RATIO`).
     GuardHotReported,
     GuardHotMade,
     GuardHotRetests,
+    GuardHotCooled,
 }
 const COUNTERS: usize = 128;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1238,7 +1240,8 @@ pub(crate) fn log(frames: f64) {
         crate::watch::hot_clause(
             c[C::GuardHotMade as usize],
             c[C::GuardHotReported as usize],
-            c[C::GuardHotRetests as usize]
+            c[C::GuardHotRetests as usize],
+            c[C::GuardHotCooled as usize]
         ),
         crate::watch::SUMMARY_CHECKS[1].load(Relaxed),
         crate::watch::SUMMARY_CHECKS[0].load(Relaxed),
