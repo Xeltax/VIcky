@@ -4892,6 +4892,34 @@ impl Shadow {
         self.update_free(from, to)
     }
 
+    /// Diagnostics (`VICTORY_REFRESH_FRONT_CHECK=1`, `crate::host::front`):
+    /// [`Shadow::update`] of `[address, address + len)`, and of the range's
+    /// first `most` bytes inside the buffer, how many were compared and how
+    /// many the update changed in the copy.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn update_compared(&self, address: usize, len: usize, most: usize) -> (usize, usize) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        if self.place.is_some() || from >= to {
+            self.update(address, len);
+            return (0, 0);
+        }
+        let n = (to - from).min(most);
+        // SAFETY: `[from, from + n)` lies inside the buffer, so inside the
+        // copy's mapping (read as `refresh_check` reads it).
+        let held = || unsafe { std::slice::from_raw_parts(self.data.add(from - start).cast_const(), n) };
+        let before = held().to_vec();
+        self.update(address, len);
+        let after = held();
+        let mut differed = 0;
+        for (a, b) in before.chunks(4096).zip(after.chunks(4096)) {
+            if a != b {
+                differed += a.iter().zip(b).filter(|(x, y)| x != y).count();
+            }
+        }
+        (n, differed)
+    }
+
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {

@@ -212,13 +212,18 @@ pub(crate) enum C {
     FrontPairsViews,
     FrontPairsLate,
     /// Host copies brought up to date (`Shadow::update` from the
-    /// submission's batch), and their microseconds: all of them, and of
-    /// them the ones before a step that gives a copy to shaders
-    /// (`Batch::flush_one`).
+    /// submission's batch), and their microseconds: all of them, of them
+    /// the ones before a step that gives a copy to shaders
+    /// (`Batch::flush_one`), and those ahead of a part's steps
+    /// (`VICTORY_REFRESH_FRONT=1`); and the front's copies left alone as up
+    /// to date in the submission already.
     Updates,
     UpdateUs,
     UpdatesOne,
     UpdateOneUs,
+    UpdatesFront,
+    UpdateFrontUs,
+    FrontKept,
     /// `watch::writes` asked by those updates (once per stretch between the
     /// ranges shaders are writing) and their nanoseconds; of all its
     /// askings (textures' too), the ones the journal answered under an
@@ -1200,9 +1205,20 @@ fn pairs_clause(c: &[f64]) -> String {
 /// they were done, with what is inside them.
 fn split_clause(c: &[f64]) -> String {
     let ms = |v: f64| v / 1e3;
+    let front = if crate::host::front::on() {
+        format!(
+            ", {:.0} ahead of a part's steps {:.2} ms ({:.0} more left alone as up to date){}",
+            c[C::UpdatesFront as usize],
+            ms(c[C::UpdateFrontUs as usize]),
+            c[C::FrontKept as usize],
+            crate::host::front::check_clause(),
+        )
+    } else {
+        String::new()
+    };
     format!(
         "copies split: fills {:.2} ms, title copies {:.2} ms, askings ahead {:.2} ms, {:.0} updates of host copies \
-         {:.2} ms ({:.0} before a shader write {:.2} ms; inside them {:.0} askings of the journal or the guards \
+         {:.2} ms ({:.0} before a shader write {:.2} ms{front}; inside them {:.0} askings of the journal or the guards \
          {:.2} ms, pages found written copied {:.2} ms); of all askings (textures' too) {:.0} answered by the journal, \
          collecting its pages {:.2} ms",
         ms(c[C::FillUs as usize]),

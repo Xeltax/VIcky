@@ -6468,9 +6468,17 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
-        // VIcky (diagnostics, [`front`]): the submission's refreshes by part.
-        #[cfg(feature = "diagnostics")]
-        front::count(&front::walk(runs), &views);
+        // VIcky ([`front`]): the submission's refreshes by part; with
+        // `VICTORY_REFRESH_FRONT=1` the first part's copies are brought up
+        // to date now, the others' after the step that starts each.
+        if front::on() || cfg!(feature = "diagnostics") {
+            let walk = front::walk(runs, front::on());
+            #[cfg(feature = "diagnostics")]
+            front::count(&walk.parts, &views);
+            if front::on() {
+                batch.front_begin(walk);
+            }
+        }
         drop(views);
         for (i, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
@@ -6490,6 +6498,7 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        batch.front_end();
         crate::watch::ask_once_end();
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
@@ -8095,6 +8104,10 @@ impl HostList {
                         add(C::Runs, 1);
                         add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
+                    // A part begins ([`front`]).
+                    if matches!(step, Step::Run(_)) && front::on() {
+                        batch.front_next();
+                    }
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
@@ -8136,6 +8149,10 @@ impl HostList {
             preparing(1, copied as u64);
             #[cfg(feature = "diagnostics")]
             add(if matches!(step, Step::Fill(..)) { C::FillUs } else { C::CopyStepUs }, us);
+            // After a title copy a part begins ([`front`]), counted apart.
+            if matches!(step, Step::Copy(..)) && front::on() {
+                batch.front_next();
+            }
         }
     }
 }
@@ -8215,6 +8232,17 @@ fn refresh_once() -> bool {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
+    /// VIcky ([`front`], `VICTORY_REFRESH_FRONT=1`): the copies to bring up
+    /// to date at the start of each part of the submission still to come,
+    /// the last part first.
+    front_parts: Vec<Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>>,
+    /// By copy (its address): the range brought up to date ahead of the
+    /// steps of the part being run.
+    front: std::collections::HashMap<usize, (usize, usize)>,
+    /// Diagnostics (`VICTORY_REFRESH_FRONT_CHECK=1`): the part being run is
+    /// checked.
+    #[cfg(feature = "diagnostics")]
+    front_checked: bool,
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
@@ -8238,16 +8266,26 @@ enum Refreshed {
     Flush,
     /// Before a step gives the copy to shaders ([`Batch::flush_one`]).
     One,
+    /// Ahead of a part's steps ([`front`]).
+    Front,
 }
 
-/// VIcky: a submission's refreshes by part (diagnostics).
-#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
-mod front;
+/// VIcky: a submission's refreshes by part, `VICTORY_REFRESH_FRONT`.
+pub(crate) mod front;
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
+        // Brought up to date ahead of the part's steps ([`front`]).
+        if self.front_covers(shadow, address, len) {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::Skipped, 1);
+                crate::copystat::add(crate::copystat::C::SkippedBytes, len as u64);
+            }
+            return;
+        }
         // Brought up to date in this submission already ([`refresh_once`];
         // nothing is in `current` without the switch).
         if let Some(&(_, from, to)) = self.current.get(&key)
@@ -8288,16 +8326,17 @@ impl Batch {
         Self::brought(&mut self.current, &shadow, from, to);
     }
 
-    /// With [`refresh_once`]: `[from, to)` of `shadow`'s copy was brought
-    /// up to date. Kept: its union with what was up to date if they touch,
-    /// else the larger of the two.
+    /// With [`refresh_once`] (and [`front`], whose rule it is):
+    /// `[from, to)` of `shadow`'s copy was brought up to date. Kept: its
+    /// union with what was up to date if they touch, else the larger of the
+    /// two.
     fn brought(
         current: &mut std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         from: usize,
         to: usize,
     ) {
-        if !refresh_once() || from >= to {
+        if !(refresh_once() || front::on()) || from >= to {
             return;
         }
         let entry = current
@@ -8327,6 +8366,10 @@ impl Batch {
                     add(C::UpdatesOne, 1);
                     add(C::UpdateOneUs, us);
                 }
+                Refreshed::Front => {
+                    add(C::UpdatesFront, 1);
+                    add(C::UpdateFrontUs, us);
+                }
             }
         }
         preparing(0, us);
@@ -8346,6 +8389,7 @@ impl Batch {
         self.textures.clear();
         // Where it writes is not known: no copy counts as up to date.
         self.current.clear();
+        self.front.clear();
     }
 
     /// [`Batch::title_written`] for a write of ours whose place is known
@@ -8355,6 +8399,8 @@ impl Batch {
     fn title_wrote(&mut self, at: usize, len: usize) {
         self.flush();
         self.textures.clear();
+        // The next part's front is brought once the copy is done.
+        self.front.clear();
         let end = at + len;
         self.current.retain(|_, entry| {
             let (from, to) = (entry.1, entry.2);
