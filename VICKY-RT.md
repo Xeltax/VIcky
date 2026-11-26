@@ -16,7 +16,7 @@ This branch is for making the title's compute ray tracing (the BVH structure bui
 | #346 | Gargalindis | stores through title memory by address mark their copy; only marked copies are snapshotted and compared |
 | #1032 | UwUCammie | with `VICTORY_COPY_PLAIN=1`, shader writes go back into title memory in place, guarded, instead of by kernel call (`VICTORY_WRITE_PLAIN=0` turns it off) |
 
-**VIcky's own commits.** All are opt-in.
+**VIcky's own commits.** All are opt-in, except the dispatch parts (last item).
 - `VICTORY_BACK_JOIN=<bytes>` writes nearby runs of shader writes back as one kernel call. The builder's output gave about 850,000 runs a frame, one `NtWriteVirtualMemory` each.
 - `VICTORY_MEMORY_REFRESH=touched`: shaders note which copies they read (no extra store), and only those are refreshed, plus every copy once in 8 frames.
 - `VICTORY_MEMORY_NAMED_WRITES=0`: a copy that is only named by a constant and never marked stops being snapshotted.
@@ -28,6 +28,14 @@ This branch is for making the title's compute ray tracing (the BVH structure bui
 - `VICTORY_HEAP_SYNC_BESIDE=1`: the heap sync runs on a thread of its own beside the refreshes; the submitting thread only waits at the join (about 25 ms a frame less on it). RT48b below.
 - `VICTORY_FENCE_SENT=1`: the frame-begin fence (the value the title signals and waits on before recording the next frame) is published to the title when everything before it is sent, not when the card has run it; it still lands in order and never goes backwards. While a value is ahead, a byte that both the card and the title changed stays the title's in the relay's merges (the console's order: the card's writes before a signal are done when its value is reached). `VICTORY_FENCE_SENT_CHECK=1` counts the bytes each rule kept (diagnostics, about 40 ms a frame); `VICTORY_FENCE_SENT_KEEP_TITLE=1` also stores only the 4-byte words the card wrote (slower). RT55–RT60c below. **It pays only together with `VICTORY_HEAP_SYNC_BESIDE=1`**: each alone gives about 200 ms a frame, the two together about 180–189.
 - Shader clean-up passes (`fx-rt-shaderopt`, see `VICKY.md`): audited and checked side by side, two fixes (resource handles stay in their block, as in fork PR #317; no folding of two empty latches), wave operations kept by default (new default 63), pass names and per-program `VICTORY_SHADER_OPT_NOT` / `_ONLY`. The translator changed, so the shader cache key changed: **warm the cache again after updating** (`victory translate --warm`).
+- **Dispatches in parts, on by default** (branch `fx-rt-dispatchsplit`): myokex's fix, from ZSlayerHQ/victory-world-runtime `4436f8f` and `892d259`, ported.
+  - The problem: the host runs at most 65,535 thread groups in a dimension of one dispatch; the console runs any number. A full-screen compute pass asks for about 72,000 to 76,000 groups in x. It was cut at 65,535, which left a blocky strip along the bottom of the frame.
+  - The fix: translated compute programs add a first-group number the host sets to their group number in x, and a larger dispatch runs in parts (up to 16).
+  - `VICTORY_DISPATCH_PARTS` unset (or `seen`): a single-record indirect dispatch runs in parts only once its program has been seen asking for more. RT67: strip gone, 186 ms a frame, no cost.
+  - `all`: every single-record indirect dispatch runs in parts. RT64a: strip gone, but about 20 ms of card time a frame more on an RTX 4080.
+  - `0`: cut, as before.
+  - The log line `dispatches in parts` counts both paths.
+  - The translator changed, so the shader cache key changed: **warm the cache again after updating** (`victory translate --warm`).
 
 **VIcky PRs merged:**
 - #23 (g0shtj0sh): main's opt-in `VICTORY_NO_WATCHDOG=1` hook (upstream #454, fork #364), for slower PCs whose runs the title's watchdog kills at the world's entry. Nothing changes when it is unset.
@@ -283,6 +291,11 @@ Same window shot, builder on, `VICTORY_BVH_COPY=skip` and the recommended switch
 4. **Is the dark area lit?** Compare builder on and off at the same scene. Which pass reads the traversal result: the RT shadow/GI denoiser, or reflections? `VICTORY_CAPTURE_WORLD_ALSO` dumps the per-frame ops list.
 5. **#814 against #346.** #814 (staronthehorizon) has a GPU dirty-page bitmask plus Series S live RT. Who can run both on the same card and scene?
 6. **Page pool in place: tried, gains little alone.** Fork #772 (`VICTORY_INPLACE=3 VICTORY_INPLACE_POOL=1`) put 18,870 windows (5.8 GB) in place and held in a run, but the frame barely changed (690–865 ms with GPU timing on). About 2,700 windows stay refused: page-pool views whose pages the title maps in scattered order, which would need tile mappings (those remove the device on NVIDIA). `VICTORY_INPLACE_POOL=1` also commits 6.1 GB up front, so it needs a big pagefile. Being tested now: the page directory pointing straight at the opened sections (`VICTORY_MEMORY_ARENAS=1`), so scattered pages need no tile mapping.
+
+**Open: the dark lower-right quarter of the picture.** It predates the dispatch parts.
+- It is lit only when plain single-record indirect dispatches go through the parts' command signature, which sets a root constant (`VICTORY_DISPATCH_PLAIN=rootsig`, RT72, at the cost of `all`).
+- These did not light it: a full wait before each of them (RT71), a full wait after (RT73), and the parts' records and count without the root constant (RT70).
+- A bisect by program (`VICTORY_DISPATCH_PLAIN_ONLY=<hash beginnings>`) is pending.
 
 ### Bigger projects (research leads, 2026-11-25)
 

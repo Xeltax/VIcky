@@ -94,7 +94,7 @@ groupshared uint all_asked;
 // Notes the dispatch's program (`has_count` from bit 8 on), if given, when
 // its record asked for `asked` groups in x, more than one dispatch runs and
 // no more than the parts run: its dispatches run in parts from then on
-// (VICTORY_DISPATCH_PARTS=seen).
+// (VICTORY_DISPATCH_PARTS unset or seen).
 void note_program(uint asked) {
     uint program = has_count >> 8;
     if (program != 0 && asked > PART && asked <= PARTS * PART) {
@@ -483,7 +483,7 @@ pub(crate) fn bound_split(
 /// ([`program_parts`]): a record asking for more groups in x than one
 /// dispatch runs, and no more than the parts run, is clamped as before and
 /// its program noted in the list's budget words 7 to 15, which
-/// [`note_budget_words`] takes a list late (`VICTORY_DISPATCH_PARTS=seen`).
+/// [`note_budget_words`] takes a list late ([`Parts::Seen`], the default).
 pub(crate) fn bound_noted(
     list: &HostList,
     src: (&ID3D12Resource, u64),
@@ -591,19 +591,22 @@ const SPLIT_BYTES: u64 = PARTS_COUNT_AT + 4;
 pub(crate) enum Parts {
     /// `0`: none; cut as before.
     Off,
-    /// Unset (or anything else): direct dispatches past [`PART`] groups in
-    /// x, and every indirect dispatch of one record through the parted
-    /// path ([`bound_split`]), whose command signature and count cost every
-    /// such dispatch a little (RT64b: about 20 ms of card time a frame
-    /// more, part of it the work the cut pass now does).
+    /// `all`: direct dispatches past [`PART`] groups in x, and every
+    /// indirect dispatch of one record through the parted path
+    /// ([`bound_split`]). Its command signature sets a root constant, and
+    /// that costs each such execution about 20 microseconds of card time
+    /// (RT64b: about 20 ms a frame more on an RTX 4080, for some 970 of
+    /// them).
     All,
-    /// `seen`: direct dispatches as with [`Parts::All`]; an indirect
-    /// dispatch of one record through the parted path only if its program
-    /// (by its hash, whatever pipeline or record it comes from) has been
-    /// seen asking for more groups in x than one dispatch runs (noted by
-    /// the clamp, [`bound_noted`], and known a list late: its first such
-    /// dispatch runs cut, as before); the others through the plain path,
-    /// as before the parts.
+    /// Unset (or `seen`, or anything else), the default: direct dispatches
+    /// as with [`Parts::All`]; an indirect dispatch of one record through
+    /// the parted path only if its program (by its hash, whatever pipeline
+    /// or record it comes from) has been seen asking for more groups in x
+    /// than one dispatch runs (noted by the clamp, [`bound_noted`], and
+    /// known a list late: its first such dispatch runs cut, as before); the
+    /// others through the plain path, as before the parts. It fixes the
+    /// strip along the bottom of the frame at no cost (RT67: 186 ms a frame,
+    /// one program seen, one parted execution a frame).
     Seen,
 }
 
@@ -611,8 +614,8 @@ pub(crate) enum Parts {
 fn parse_parts(value: Option<&str>) -> Parts {
     match value.map(str::trim) {
         Some("0") => Parts::Off,
-        Some("seen") => Parts::Seen,
-        _ => Parts::All,
+        Some("all") => Parts::All,
+        _ => Parts::Seen,
     }
 }
 
@@ -628,12 +631,14 @@ pub(crate) fn parts_on() -> bool {
     parts_mode() != Parts::Off
 }
 
-/// With [`Parts::Seen`], what a single-record indirect dispatch that does
-/// not take the parted path does instead (`VICTORY_DISPATCH_PLAIN`, any of
-/// these, comma-separated; none by default: the plain path of before the
-/// parts). For telling why RT67 (seen) left the lower-right quarter of the
-/// picture dark where RT64 (every such dispatch parted) lit it, which no
-/// difference in the records explains:
+/// With [`Parts::Seen`] (the default), what a single-record indirect
+/// dispatch that does not take the parted path does instead
+/// (`VICTORY_DISPATCH_PLAIN`, any of these, comma-separated; none by
+/// default: the plain path of before the parts). For telling why RT67
+/// (seen) left the lower-right quarter of the picture dark where RT64
+/// (every such dispatch parted) lit it, which no difference in the records
+/// explains. RT72 (`rootsig`) lit it, RT70 (`split`), RT71 (`wait`) and
+/// RT73 (`after`) did not: the root-constant signature itself does it.
 /// - `split`: everything the parted path does but the root constant: the
 ///   clamp's part records and their count ([`bound_split_one`]: one part at
 ///   most, its program noted), run through a plain dispatch signature from
@@ -685,8 +690,8 @@ fn parse_plain(value: Option<&str>) -> Plain {
     plain
 }
 
-/// The variants `VICTORY_DISPATCH_PLAIN` asks for ([`Plain`]); none unless
-/// `VICTORY_DISPATCH_PARTS=seen`.
+/// The variants `VICTORY_DISPATCH_PLAIN` asks for ([`Plain`]); none with
+/// `VICTORY_DISPATCH_PARTS=all` or `0`.
 pub(crate) fn plain_mode() -> Plain {
     static MODE: std::sync::OnceLock<Plain> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
@@ -784,7 +789,7 @@ fn programs_seen(noted: &[u32]) {
             tracing::info!(
                 program = %programs.hashes[number as usize - 1],
                 "an indirect dispatch asked for more than {PART} groups in x: its program's indirect dispatches \
-                 run in parts from now on (VICTORY_DISPATCH_PARTS=seen)"
+                 run in parts from now on (VICTORY_DISPATCH_PARTS unset or seen)"
             );
         }
     }
@@ -908,7 +913,7 @@ pub(crate) fn parts_line(frames: f64) {
          seen asking for more in x",
         match (parts_mode(), plain_mode()) {
             (Parts::Off, _) => "off".to_owned(),
-            (Parts::All, _) => "on".to_owned(),
+            (Parts::All, _) => "all".to_owned(),
             (Parts::Seen, plain) if plain == Plain::default() => "seen".to_owned(),
             (Parts::Seen, plain) => format!(
                 "seen, VICTORY_DISPATCH_PLAIN {}{}",
@@ -3233,15 +3238,18 @@ void main(uint3 g : SV_GroupID) {
         }
     }
 
-    /// `VICTORY_DISPATCH_PARTS`: `0` none, `seen` only programs seen asking
-    /// for more, anything else (or unset) every single-record dispatch.
+    /// `VICTORY_DISPATCH_PARTS`: `0` none, `all` every single-record
+    /// dispatch, anything else (or unset) only programs seen asking for
+    /// more.
     #[test]
-    fn the_parts_switch_reads_off_seen_and_on() {
-        assert_eq!(parse_parts(None), Parts::All);
-        assert_eq!(parse_parts(Some("1")), Parts::All);
-        assert_eq!(parse_parts(Some("0")), Parts::Off);
+    fn the_parts_switch_reads_off_all_and_seen() {
+        assert_eq!(parse_parts(None), Parts::Seen);
         assert_eq!(parse_parts(Some("seen")), Parts::Seen);
         assert_eq!(parse_parts(Some(" seen ")), Parts::Seen);
+        assert_eq!(parse_parts(Some("1")), Parts::Seen);
+        assert_eq!(parse_parts(Some("all")), Parts::All);
+        assert_eq!(parse_parts(Some(" all ")), Parts::All);
+        assert_eq!(parse_parts(Some("0")), Parts::Off);
     }
 
     /// A program keeps its number; once the clamp notes it (budget words 7

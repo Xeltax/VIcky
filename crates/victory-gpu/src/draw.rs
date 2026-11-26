@@ -3367,10 +3367,11 @@ impl State {
         // setting the number of its part's first group if the program
         // reads its x number ([`group_base`]; `crate::indirect::bound_split`).
         // (myokex's fix, ZSlayerHQ/victory-world-runtime 4436f8f, ran two
-        // executions, the constant set between them.) With
-        // `VICTORY_DISPATCH_PARTS=seen` only a program seen asking for more
-        // (`crate::indirect::program_parts`, by its hash); the others go
-        // the plain way, their program numbered for the clamp to note.
+        // executions, the constant set between them.) By default
+        // (`VICTORY_DISPATCH_PARTS` unset or `seen`) only a program seen
+        // asking for more (`crate::indirect::program_parts`, by its hash);
+        // the others go the plain way, their program numbered for the clamp
+        // to note. `VICTORY_DISPATCH_PARTS=all`: every one.
         let base = if kind == DISPATCH { group_base(p) } else { None };
         let single = kind == DISPATCH && max == 1;
         let (program, parted) = match crate::indirect::parts_mode() {
@@ -3380,8 +3381,8 @@ impl State {
             }
             _ => (0, false),
         };
-        // (`VICTORY_DISPATCH_PLAIN`, with `seen`) What a single record that
-        // is not parted does instead of the plain path of before.
+        // (`VICTORY_DISPATCH_PLAIN`, not with `all` or `0`) What a single
+        // record that is not parted does instead of the plain path of before.
         let plain = match p.stages.first() {
             Some(stage) if single && !parted => crate::indirect::plain_for(&stage.shader.hash),
             _ => crate::indirect::Plain::default(),
