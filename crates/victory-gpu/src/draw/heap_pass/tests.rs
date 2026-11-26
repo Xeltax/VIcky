@@ -1142,3 +1142,46 @@ fn the_due_window_keeps_what_the_full_pass_keeps() {
     }
     TEST_FAST.set(None);
 }
+
+/// What a pass counts of its slots (`parts`): with the cache of made views,
+/// buffer views made and kept in it, one of the same view copied from it,
+/// a record of no view of ours; at the next pass, the views made from their
+/// record already; every view with a copy and range.
+#[test]
+fn a_pass_counts_what_its_slots_came_to() {
+    use parts::Count;
+    if crate::host::host().is_none() {
+        return;
+    }
+    TEST_FAST.set(Some((1 << 10, false, false)));
+    let Some((object, heap, host)) = title_heap(64) else {
+        TEST_FAST.set(None);
+        return;
+    };
+    let base = 0x61_0000_0000u64;
+    crate::shadow::register(0x7e57_6101, base, 0x1_0000);
+    // At different addresses: the cache keeps two records a set, and the
+    // set is chosen by the record's low bits (the address of a placed view).
+    for slot in 1..=4 {
+        write(heap, slot, buffer_view(base + 0x1000 * u64::from(slot), 0x1000, 0, 8));
+    }
+    // The view of slot 1 again; slot 6 never written.
+    write(heap, 5, buffer_view(base + 0x1000, 0x1000, 0, 8));
+    let mut ranges = Ranges::new();
+    let mut slots: Vec<u32> = (1..=6).collect();
+    let took = buffers_taken(heap, host, &mut slots, &mut ranges, None, true);
+    let of = |took: &parts::Took| {
+        [Count::Miss, Count::Hit, Count::NotOurs, Count::Same, Count::Range, Count::NoRange].map(|c| took.of(c))
+    };
+    assert_eq!(of(&took), [4, 1, 1, 0, 5, 0], "{took:?}");
+    assert_eq!(took.of(Count::Chunks), 1, "one chunk under one lock");
+    assert!(took.of(Count::Lookups) > 0);
+    assert_eq!(ranges.len(), 5);
+    let took = buffers_taken(heap, host, &mut slots, &mut ranges, None, true);
+    assert_eq!(of(&took), [0, 0, 1, 5, 5, 0], "{took:?}");
+    assert!(!parts::counting(), "the pass's counting ended with it");
+    crate::shadow::unregister(0x7e57_6101, base);
+    forget(host);
+    assert_eq!(release(object), 0);
+    TEST_FAST.set(None);
+}

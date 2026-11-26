@@ -104,7 +104,10 @@
 //!
 //! A line with the frame line says per frame the time on the recording
 //! thread, on our thread and waited for the passes, and the check's counts
-//! ([`line`]).
+//! ([`line`]); another one, where the time of a pass goes and what its
+//! slots came to ([`parts`]).
+
+pub(crate) mod parts;
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -161,9 +164,25 @@ pub(crate) fn buffers(
     host: &HostHeap,
     slots: &mut [u32],
     ranges: &mut Ranges,
-    mut found: Option<&mut Vec<Found>>,
+    found: Option<&mut Vec<Found>>,
     marks: bool,
 ) {
+    let began = Instant::now();
+    let took = buffers_taken(heap, host, slots, ranges, found, marks);
+    parts::add(&[took], began.elapsed(), std::time::Duration::ZERO);
+}
+
+/// [`buffers`], with what this thread counted and timed of it
+/// ([`parts::Took`]).
+pub(crate) fn buffers_taken(
+    heap: &Heap,
+    host: &HostHeap,
+    slots: &mut [u32],
+    ranges: &mut Ranges,
+    mut found: Option<&mut Vec<Found>>,
+    marks: bool,
+) -> parts::Took {
+    use parts::{Count, Part, enter};
     // VIcky (`VICTORY_HEAP_SYNC_CACHE`): in slot order (the set of
     // changed slots gives them in no order). Each slot is made by itself,
     // so the order changes nothing of what is made; in order, the slots'
@@ -173,6 +192,7 @@ pub(crate) fn buffers(
     if cache_size() > 0 {
         slots.sort_unstable();
     }
+    let mut taking = parts::Taking::begin();
     let mut alive = !GONE.load(Relaxed) && crate::descriptor::host::device_removed().is_none();
     super::HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Relaxed);
     // VIcky (`VICTORY_HEAP_SYNC_CACHE`): the copies a slot's making
@@ -183,12 +203,20 @@ pub(crate) fn buffers(
     let shared = cache_size() > 0;
     let mut made_ahead: VecDeque<(Option<View>, Lookups)> = VecDeque::new();
     for (n, &index) in slots.iter().enumerate() {
-        ranges.remove(&index);
+        if !shared && n % PASS_CHUNK == 0 {
+            taking.chunk();
+        }
+        {
+            let _ranges = enter(Part::Ranges);
+            ranges.remove(&index);
+        }
         let Some(handle) = heap.handle(index) else {
+            parts::count(Count::Past);
             continue;
         };
         let (view, mut lookups) = if shared {
             if made_ahead.is_empty() {
+                taking.chunk();
                 // This slot and the next ones that have a handle.
                 let ahead: Vec<(u32, u64)> = slots[n..]
                     .iter()
@@ -230,28 +258,40 @@ pub(crate) fn buffers(
         }
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
-        let Some((shadow, address, len)) = buffer_copy_with(&view, &mut lookups) else {
+        let copy = {
+            let _copy = enter(Part::Copy);
+            buffer_copy_with(&view, &mut lookups)
+        };
+        let Some((shadow, address, len)) = copy else {
+            parts::count(Count::NoRange);
             if let Some(found) = found.as_deref_mut() {
                 found.push(Found { index, view: Some(view), range: None });
             }
             continue;
         };
+        parts::count(Count::Range);
         let (shadow, address, len) = if shared {
             super::HEAP_PASS_FAST[0].fetch_add(1, Relaxed);
             super::HEAP_PASS_FAST[1].fetch_add(lookups.asked(), Relaxed);
+            let _copy = enter(Part::Copy);
             super::shared_copy_checked(&view, (shadow, address, len))
         } else {
             (shadow, address, len)
         };
         #[cfg(feature = "diagnostics")]
-        if host.shows(index, &shadow.buffer) == Some(false) {
-            super::HEAP_VIEWS_ELSEWHERE.fetch_add(1, Relaxed);
+        {
+            let _shows = enter(Part::Shows);
+            if host.shows(index, &shadow.buffer) == Some(false) {
+                super::HEAP_VIEWS_ELSEWHERE.fetch_add(1, Relaxed);
+            }
         }
         if let Some(found) = found.as_deref_mut() {
             found.push(Found { index, view: Some(view), range: Some((shadow.id(), address, address + len)) });
         }
+        let _ranges = enter(Part::Ranges);
         ranges.insert(index, (shadow, address, address + len));
     }
+    taking.end()
 }
 
 /// Per host copy (by its address), the span the kept ranges cover on it.
@@ -1307,6 +1347,7 @@ static CHECKS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// waited for one.
 pub(crate) fn line(frames: f64) {
     spread_line();
+    parts::line();
     if !beside() {
         return;
     }

@@ -200,6 +200,36 @@ struct Made {
     cache_tried: bool,
 }
 
+/// [`HostHeap::made`] locked by the pass over buffer views
+/// ([`HostHeap::made_counted`]): on a pass's thread, how long it was held is
+/// counted when it goes.
+struct MadeCounted<'a> {
+    made: std::sync::MutexGuard<'a, Made>,
+    held: Option<std::time::Instant>,
+}
+
+impl Drop for MadeCounted<'_> {
+    fn drop(&mut self) {
+        if let Some(held) = self.held {
+            crate::draw::heap_pass::parts::held(held.elapsed());
+        }
+    }
+}
+
+impl std::ops::Deref for MadeCounted<'_> {
+    type Target = Made;
+
+    fn deref(&self) -> &Made {
+        &self.made
+    }
+}
+
+impl std::ops::DerefMut for MadeCounted<'_> {
+    fn deref_mut(&mut self) -> &mut Made {
+        &mut self.made
+    }
+}
+
 impl Made {
     /// The host slot title slot `title` is made in, if it has one (none is
     /// taken here): its own below the window, its pool slot past it.
@@ -1442,6 +1472,7 @@ impl HostHeap {
         if title >= self.title_count {
             return None;
         }
+        crate::draw::heap_pass::parts::count(crate::draw::heap_pass::parts::Count::Mapped);
         {
             let map = made.map.as_mut()?;
             if let Some(host) = map.host(title) {
@@ -1504,18 +1535,25 @@ impl HostHeap {
     /// leaves the sets even if its host slot was never made. `marks` as for
     /// [`HostHeap::note_buffer_marking`].
     fn empty_slot(&self, made: &mut Made, title: u32, for_draw: bool, marks: bool) {
+        use crate::draw::heap_pass::parts::{Part, enter};
         match made.host(title) {
             Some(host) if made.keys[host as usize] != 0 => {
                 made.keys[host as usize] = 0;
-                self.make_null(host);
+                {
+                    let _create = enter(Part::Create);
+                    self.make_null(host);
+                }
+                let _note = enter(Part::Note);
                 let _ = self.note_buffer_marking(title, None, false, marks);
             }
             // Left for later and stale since: out of the sets and the stride table.
             _ if for_draw => {
+                let _note = enter(Part::Note);
                 let _ = self.note_buffer_marking(title, None, false, marks);
             }
             _ => {}
         }
+        let _map = enter(Part::Map);
         self.unmap(made, title);
     }
 
@@ -2241,6 +2279,7 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        let _keep = crate::draw::heap_pass::parts::enter(crate::draw::heap_pass::parts::Part::Keep);
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
             // A running submission may still read the old resource through
@@ -2565,15 +2604,42 @@ impl HostHeap {
     /// where they waited for a slot. `lookups` has one for each slot;
     /// `marks` as for [`HostHeap::mirror_with`].
     pub(crate) fn mirror_chunk(&self, slots: &[(u32, u64)], lookups: &mut [Lookups], marks: bool) -> Vec<Option<View>> {
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::draw::heap_pass::parts::{Part, enter};
+        let mut made = self.made_counted();
         slots
             .iter()
             .zip(lookups)
             .map(|(&(index, handle), lookups)| {
-                let record = self.record_at(index, handle, true)?;
+                let record = {
+                    let _read = enter(Part::Read);
+                    self.record_at(index, handle, true)?
+                };
+                let _decide = enter(Part::Decide);
                 self.mirror_made(&mut made, (index, handle, true, marks), record, lookups)
             })
             .collect()
+    }
+
+    /// `made` locked by the pass over buffer views: on a pass's thread, the
+    /// wait for the lock and how long it is held are counted
+    /// (`crate::draw::heap_pass::parts`).
+    fn made_counted(&self) -> MadeCounted<'_> {
+        use crate::draw::heap_pass::parts;
+        if !parts::counting() {
+            return MadeCounted { made: self.made.lock().unwrap_or_else(|e| e.into_inner()), held: None };
+        }
+        let made = match self.made.try_lock() {
+            Ok(made) => made,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let _wait = parts::enter(parts::Part::Wait);
+                let began = std::time::Instant::now();
+                let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                parts::waited(began.elapsed());
+                made
+            }
+        };
+        MadeCounted { made, held: Some(std::time::Instant::now()) }
     }
 
     /// Makes title slot `index`'s host slot (its own, or with a heap map
@@ -2593,8 +2659,13 @@ impl HostHeap {
     /// written for the pass over buffer views (false: that pass's own making
     /// with `VICTORY_HEAP_PASS_ONE_LOOK=1`, [`HostHeap::note_buffer_marking`]).
     pub(crate) fn mirror_with(&self, index: u32, handle: u64, lookups: &mut Lookups, marks: bool) -> Option<View> {
-        let record = self.record_at(index, handle, true)?;
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::draw::heap_pass::parts::{Part, enter};
+        let record = {
+            let _read = enter(Part::Read);
+            self.record_at(index, handle, true)?
+        };
+        let mut made = self.made_counted();
+        let _decide = enter(Part::Decide);
         self.mirror_made(&mut made, (index, handle, true, marks), record, lookups)
     }
 
@@ -2602,6 +2673,7 @@ impl HostHeap {
     /// the slot has no host slot at all; else the record's three words.
     fn record_at(&self, index: u32, handle: u64, for_draw: bool) -> Option<[u32; 3]> {
         if index >= self.mirrored() {
+            crate::draw::heap_pass::parts::count(crate::draw::heap_pass::parts::Count::Past);
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2641,19 +2713,29 @@ impl HostHeap {
         [tag, i, generation]: [u32; 3],
         lookups: &mut Lookups,
     ) -> Option<View> {
+        use crate::draw::heap_pass::parts::{Count, Part, count, enter};
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        let view = {
+            let _view = enter(Part::View);
+            (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
+        };
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
+            count(Count::NotOurs);
             self.empty_slot(made, index, for_draw, marks);
             return None;
         };
-        let Some((host, taken)) = self.host_slot(made, index) else {
+        let host = {
+            let _map = enter(Part::Map);
+            self.host_slot(made, index)
+        };
+        let Some((host, taken)) = host else {
             // Past the window with the pool used up: the slot reads the
             // guard. What the title wrote is noted all the same (the sets
             // of slots shaders pick by index retry it).
+            count(Count::NoHost);
             if !for_draw {
                 for stale in self.note_buffer(index, Some(&view), false) {
                     if stale != index {
@@ -2663,11 +2745,18 @@ impl HostHeap {
             }
             return Some(view);
         };
+        if taken {
+            count(Count::Taken);
+        }
         if taken || made.keys[host as usize] != key {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
-            for stale in self.note_buffer_marking(index, Some(&view), for_draw, marks) {
+            let stale = {
+                let _note = enter(Part::Note);
+                self.note_buffer_marking(index, Some(&view), for_draw, marks)
+            };
+            for stale in stale {
                 if stale != index {
                     self.unmake(made, stale);
                 }
@@ -2707,15 +2796,22 @@ impl HostHeap {
             } else {
                 self.make_slot(made, &view, key, host, lookups)
             };
+            if kept.is_none() && !later {
+                count(Count::Unmade);
+            }
             if kept.is_none() && !self.sampler {
+                let _create = enter(Part::Create);
                 null_for(&view, self.cpu(host));
             }
             self.keep(host, kept.flatten());
             if taken {
+                let _map = enter(Part::Map);
                 self.publish(made, index);
                 #[cfg(feature = "diagnostics")]
                 note_pool(made);
             }
+        } else {
+            count(Count::Same);
         }
         Some(view)
     }
@@ -2728,18 +2824,18 @@ impl HostHeap {
         let at = self.cpu(host);
         let size = cache_size();
         if size == 0 || self.sampler {
-            return make_with(view, at, lookups);
+            return made_otherwise(view, at, lookups);
         }
         let Some(extent) = cacheable(view) else {
             FAST[Fast::NotCacheable as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return make_with(view, at, lookups);
+            return made_otherwise(view, at, lookups);
         };
         if !made.cache_tried {
             made.cache_tried = true;
             made.cache = RecordCache::new(size, self.step);
         }
         let Some(cache) = made.cache.as_mut() else {
-            return make_with(view, at, lookups);
+            return made_otherwise(view, at, lookups);
         };
         cache.make(view, key, extent, at, lookups)
     }
@@ -2770,7 +2866,17 @@ impl HostHeap {
     /// host copy that is brought up to date for it).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
-        let host = self.made.lock().unwrap_or_else(|e| e.into_inner()).host(index)?;
+        let made = match self.made.try_lock() {
+            Ok(made) => made,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                crate::draw::heap_pass::parts::count(crate::draw::heap_pass::parts::Count::ShowsWaited);
+                self.made.lock().unwrap_or_else(|e| e.into_inner())
+            }
+        };
+        let host = made.host(index);
+        drop(made);
+        let host = host?;
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         let shown = kept.get(host as usize)?.as_ref()?;
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
@@ -3042,7 +3148,7 @@ impl Lookups {
     /// [`crate::shadow::find`].
     fn find(&mut self, address: u64, len: u64) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
         if !self.kept {
-            return crate::shadow::find(address, len);
+            return looked_up(address, len, crate::shadow::find);
         }
         Self::ask(&mut self.finds, address, len, crate::shadow::find)
     }
@@ -3050,7 +3156,7 @@ impl Lookups {
     /// [`crate::shadow::exact`].
     fn exact(&mut self, address: u64, len: u64) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
         if !self.kept {
-            return crate::shadow::exact(address, len);
+            return looked_up(address, len, crate::shadow::exact);
         }
         Self::ask(&mut self.exacts, address, len, crate::shadow::exact)
     }
@@ -3065,12 +3171,25 @@ impl Lookups {
         if let Some((_, _, found)) = asked.iter().flatten().find(|a| (a.0, a.1) == (address, len)) {
             return found.clone();
         }
-        let found = look(address, len);
+        let found = looked_up(address, len, look);
         if let Some(room) = asked.iter_mut().find(|a| a.is_none()) {
             *room = Some((address, len, found.clone()));
         }
         found
     }
+}
+
+/// `look(address, len)`, timed and counted for the pass over buffer views
+/// (`crate::draw::heap_pass::parts`).
+fn looked_up(
+    address: u64,
+    len: u64,
+    look: fn(u64, u64) -> Option<std::sync::Arc<crate::shadow::Shadow>>,
+) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    use crate::draw::heap_pass::parts;
+    let _lookup = parts::enter(parts::Part::Lookup);
+    parts::count(parts::Count::Lookups);
+    look(address, len)
 }
 
 /// VIcky (`VICTORY_HEAP_SYNC_CACHE`): buffer views made before, by the
@@ -3185,6 +3304,7 @@ impl RecordCache {
         at: D3D12_CPU_DESCRIPTOR_HANDLE,
         lookups: &mut Lookups,
     ) -> Option<Kept> {
+        use crate::draw::heap_pass::parts;
         use std::sync::atomic::Ordering::Relaxed;
         self.tick = self.tick.wrapping_add(1);
         if let Some(e) = self.find(key) {
@@ -3204,15 +3324,19 @@ impl RecordCache {
                         }
                     }
                     let host = host()?;
-                    // SAFETY: a slot of a heap shaders do not see, holding a
-                    // view of `shown`'s buffer (alive: `shown` holds it), into
-                    // a slot of ours of the same kind.
-                    unsafe {
-                        host.device
-                            .CopyDescriptorsSimple(1, at, self.at(e), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
-                    };
+                    {
+                        let _create = parts::enter(parts::Part::Create);
+                        // SAFETY: a slot of a heap shaders do not see, holding a
+                        // view of `shown`'s buffer (alive: `shown` holds it), into
+                        // a slot of ours of the same kind.
+                        unsafe {
+                            host.device
+                                .CopyDescriptorsSimple(1, at, self.at(e), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                        };
+                    }
                     self.entries[e].used = self.tick;
                     FAST[Fast::Hits as usize].fetch_add(1, Relaxed);
+                    parts::count(parts::Count::Hit);
                     return Some(Some(shown.buffer.clone()));
                 }
                 _ => {
@@ -3229,13 +3353,18 @@ impl RecordCache {
         let e = self.room(key);
         // (An entry is empty while it is made: a failed making leaves none.)
         self.entries[e].key = 0;
-        let kept = plan.create(self.at(e))?;
-        let host = host()?;
-        // SAFETY: as above, the view just made.
-        unsafe {
-            host.device
-                .CopyDescriptorsSimple(1, at, self.at(e), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        let kept = {
+            let _create = parts::enter(parts::Part::Create);
+            let kept = plan.create(self.at(e))?;
+            let host = host()?;
+            // SAFETY: as above, the view just made.
+            unsafe {
+                host.device
+                    .CopyDescriptorsSimple(1, at, self.at(e), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+            };
+            kept
         };
+        parts::count(parts::Count::Miss);
         self.entries[e] = Cached {
             key,
             whole: plan.whole.id(),
@@ -4052,6 +4181,21 @@ fn twin_uav(
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     make_with(view, at, &mut Lookups::each())
+}
+
+/// [`make_with`] for a slot [`HostHeap::make_slot`] makes without the cache
+/// of made views: timed and counted for the pass over buffer views
+/// (`crate::draw::heap_pass::parts`).
+fn made_otherwise(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, lookups: &mut Lookups) -> Option<Kept> {
+    use crate::draw::heap_pass::parts;
+    let kept = {
+        let _create = parts::enter(parts::Part::Create);
+        make_with(view, at, lookups)
+    };
+    if kept.is_some() {
+        parts::count(parts::Count::Other);
+    }
+    kept
 }
 
 /// [`make`], asking `lookups` for the host copies of buffers.
