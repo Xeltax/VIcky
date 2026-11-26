@@ -52,7 +52,7 @@ This branch is for making the title's compute ray tracing (the BVH structure bui
 
 **Recommended with the builder on:** `VICTORY_BVH_COPY=skip VICTORY_HEAP_SYNC_CACHE=1 VICTORY_HEAP_BUFFERS_SKIP_SAME=1 VICTORY_HEAP_SYNC_THREADS=4 VICTORY_HEAP_SYNC_BESIDE=1 VICTORY_FENCE_SENT=1 VICTORY_BACK_JOIN=256 VICTORY_MEMORY_REFRESH=touched VICTORY_MEMORY_NAMED_WRITES=0 VICTORY_SNAPSHOT_POOL_MB=2048`, plus the fork's: `VICTORY_ASYNC_SUBMIT=1 VICTORY_QUEUE2=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_TEXTURE_NO_WAIT=1 VICTORY_COPY_PLAIN=1 VICTORY_JOIN_PARTS=1 VICTORY_BACK_OWN_VIEW=1 VICTORY_INDIRECT_GATHER=1 VICTORY_CARD_REHASH_RUNS=1`. Keep the capture harness rare (`VICTORY_CAPTURE_WORLD_EVERY=64`): a saved frame costs about 235 ms. If the title's watchdog ends the run at the world's entry (frames of 20–25 s while it loads), add `VICTORY_NO_WATCHDOG=1` (PR #23); it changes nothing once the world is up.
 
-**Fastest measured (RT81b/c, RTX 4080):** the above plus `VICTORY_HEAP_PASS_BESIDE=1 VICTORY_HEAP_PASS_SPREAD=1 VICTORY_FENCE_SENT_PUT_UP_RUNS=4096 VICTORY_MERGE_RUNS=4096 VICTORY_DENSE_PAGE_WHOLE=1 VICTORY_DENSE_PAGE_PATCH=1 VICTORY_GUARD_SUMMARY=1 VICTORY_GUARD_ABSENT_KNOWN=1 VICTORY_FILL_LATCH_PIECE=1`. A new build's first run carries the driver's background shader work for several minutes (process user time about 1,500 ms a 5-s line instead of about 900): measure from the second run.
+**Fastest measured (RT81b/c, RTX 4080, before the dispatch parts were merged):** the above plus `VICTORY_HEAP_PASS_BESIDE=1 VICTORY_HEAP_PASS_SPREAD=1 VICTORY_FENCE_SENT_PUT_UP_RUNS=4096 VICTORY_MERGE_RUNS=4096 VICTORY_DENSE_PAGE_WHOLE=1 VICTORY_DENSE_PAGE_PATCH=1 VICTORY_GUARD_SUMMARY=1 VICTORY_GUARD_ABSENT_KNOWN=1 VICTORY_FILL_LATCH_PIECE=1`. On this branch, with the dispatch parts on (the full-screen pass now runs all its tiles: about 5–10 ms more card time), the same settings give 5.12 / 5.35 fps (RT82c/d); 5.69 / 5.48 was without them. A new build's first run carries the driver's background shader work for several minutes (process user time about 1,500 ms a 5-s line instead of about 900): measure from the second run.
 
 ## Run
 
@@ -290,6 +290,7 @@ Same window shot, builder on, `VICTORY_BVH_COPY=skip` and the recommended switch
 | RT78 / RT78b | all of the above | 5.12 / 5.21 | the full heap pass every 16th frame and a run-wide fill latch remain |
 | RT79 / RT79b | + `VICTORY_D3D12_BACKGROUND=0` | 5.45 / 5.26 | **not adopted**: the character's hair washed out in both (picture A/B pending) |
 | **RT81b / RT81c** | + `VICTORY_HEAP_PASS_SPREAD=1 VICTORY_FILL_LATCH_PIECE=1` | **5.69 (176) / 5.48 (186)** | fastest, two clean runs; settles 0–0.3, submit thread 165 ms; picture as RT78 |
+| RT82c / RT82d | the same on this branch (7e8e6a8: + dispatch parts) | 5.12 / 5.35 (the first two runs of the build were the driver's) | the bottom strip fixed; the price of the full pass |
 
 - Next: copy numbers. Every builder-on run uses all 1,023 numbers of title memory by address by the second world frame, and later pages read zeros; that fits #24's count of structures with nodes of zeros and pointers far out. Recycling idle numbers is being written.
 
