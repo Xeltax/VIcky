@@ -1501,17 +1501,18 @@ impl HostHeap {
     /// Title slot `title` holds no view (`made` locked): its host slot reads
     /// nothing and leaves the sets of the slots shaders pick by index (as
     /// the fork did), and a pool slot is given back. `for_draw`: the slot
-    /// leaves the sets even if its host slot was never made.
-    fn empty_slot(&self, made: &mut Made, title: u32, for_draw: bool) {
+    /// leaves the sets even if its host slot was never made. `marks` as for
+    /// [`HostHeap::note_buffer_marking`].
+    fn empty_slot(&self, made: &mut Made, title: u32, for_draw: bool, marks: bool) {
         match made.host(title) {
             Some(host) if made.keys[host as usize] != 0 => {
                 made.keys[host as usize] = 0;
                 self.make_null(host);
-                let _ = self.note_buffer(title, None, false);
+                let _ = self.note_buffer_marking(title, None, false, marks);
             }
             // Left for later and stale since: out of the sets and the stride table.
             _ if for_draw => {
-                let _ = self.note_buffer(title, None, false);
+                let _ = self.note_buffer_marking(title, None, false, marks);
             }
             _ => {}
         }
@@ -1551,7 +1552,7 @@ impl HostHeap {
             })
             .collect();
         for &title in &dead {
-            self.empty_slot(made, title, true);
+            self.empty_slot(made, title, true, true);
         }
         // The first passes at warn level, the rest at debug.
         static PASSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2012,6 +2013,20 @@ impl HostHeap {
     /// stale ([`Spans`]): out of the queue of textures already, their host
     /// slots are the caller's to make null (it holds `made`).
     fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<u32> {
+        self.note_buffer_marking(index, view, seen, true)
+    }
+
+    /// [`HostHeap::note_buffer`]; `marks`: whether the note of a buffer
+    /// slot (or of one that leaves the buffer slots) marks it as written
+    /// since the pass over buffer views last looked
+    /// ([`HostHeap::buffer_changes`]). VIcky (`VICTORY_HEAP_PASS_ONE_LOOK=1`,
+    /// `crate::draw::heap_pass::one_look`): not when that pass makes a slot
+    /// it looks at. The pass keeps the range of the view it makes there and
+    /// then; the mark only had its next pass look at the slot a second time
+    /// and find it made. A write of the title after the making marks the
+    /// slot as before (its note is the sync's, `marks` set), and so does a
+    /// draw's making.
+    fn note_buffer_marking(&self, index: u32, view: Option<&View>, seen: bool, marks: bool) -> Vec<u32> {
         if self.sampler {
             return Vec::new();
         }
@@ -2026,10 +2041,7 @@ impl HostHeap {
         let plain = !self.noted.is_empty() && view.is_some_and(plain_buffer);
         if plain && self.noted_plain(index) {
             self.note_stride(index, view.and_then(view_stride));
-            self.changed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(index);
+            self.mark_changed(index, marks);
             FAST[Fast::NotesSkipped as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if check_now() {
                 self.check_noted(index);
@@ -2105,16 +2117,26 @@ impl HostHeap {
             buffers.remove(&index)
         };
         if was {
-            self.changed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(index);
+            self.mark_changed(index, marks);
         }
         drop(buffers);
         // (A note of any other kind, or of none, makes the next one a full
         // one again.)
         self.set_noted(index, plain);
         stale
+    }
+
+    /// Marks title slot `index` as written since the pass over buffer views
+    /// last looked; without `marks` (the pass's own making,
+    /// [`HostHeap::note_buffer_marking`]), counts the mark spared if the
+    /// slot was not marked already ([`PASS_MARKS_SPARED`]).
+    fn mark_changed(&self, index: u32, marks: bool) {
+        let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
+        if marks {
+            changed.insert(index);
+        } else if !changed.contains(&index) {
+            PASS_MARKS_SPARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Writes title slot `index`'s element stride into the table shaders
@@ -2526,7 +2548,7 @@ impl HostHeap {
                 let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
                 for &(index, handle) in chunk {
                     if let Some(record) = self.record_at(index, handle, false) {
-                        self.mirror_made(&mut made, (index, handle, false), record, &mut Lookups::each());
+                        self.mirror_made(&mut made, (index, handle, false, true), record, &mut Lookups::each());
                     }
                 }
             }
@@ -2540,15 +2562,16 @@ impl HostHeap {
     /// with `made` locked once for all of them (the pass over buffer views
     /// with `VICTORY_HEAP_SYNC_CACHE`, a chunk at a time): what each
     /// slot's mirror does is the same, other threads wait for the chunk
-    /// where they waited for a slot. `lookups` has one for each slot.
-    pub(crate) fn mirror_chunk(&self, slots: &[(u32, u64)], lookups: &mut [Lookups]) -> Vec<Option<View>> {
+    /// where they waited for a slot. `lookups` has one for each slot;
+    /// `marks` as for [`HostHeap::mirror_with`].
+    pub(crate) fn mirror_chunk(&self, slots: &[(u32, u64)], lookups: &mut [Lookups], marks: bool) -> Vec<Option<View>> {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         slots
             .iter()
             .zip(lookups)
             .map(|(&(index, handle), lookups)| {
                 let record = self.record_at(index, handle, true)?;
-                self.mirror_made(&mut made, (index, handle, true), record, lookups)
+                self.mirror_made(&mut made, (index, handle, true, marks), record, lookups)
             })
             .collect()
     }
@@ -2561,16 +2584,18 @@ impl HostHeap {
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         let record = self.record_at(index, handle, for_draw)?;
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        self.mirror_made(&mut made, (index, handle, for_draw), record, &mut Lookups::each())
+        self.mirror_made(&mut made, (index, handle, for_draw, true), record, &mut Lookups::each())
     }
 
     /// [`HostHeap::mirror`] for a draw, with the host copies its making
     /// looks up kept in `lookups`, for the caller to ask again
-    /// ([`buffer_copy_with`]).
-    pub(crate) fn mirror_with(&self, index: u32, handle: u64, lookups: &mut Lookups) -> Option<View> {
+    /// ([`buffer_copy_with`]). `marks`: whether its making marks the slot as
+    /// written for the pass over buffer views (false: that pass's own making
+    /// with `VICTORY_HEAP_PASS_ONE_LOOK=1`, [`HostHeap::note_buffer_marking`]).
+    pub(crate) fn mirror_with(&self, index: u32, handle: u64, lookups: &mut Lookups, marks: bool) -> Option<View> {
         let record = self.record_at(index, handle, true)?;
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        self.mirror_made(&mut made, (index, handle, true), record, lookups)
+        self.mirror_made(&mut made, (index, handle, true, marks), record, lookups)
     }
 
     /// The part of [`HostHeap::mirror`] before `made` is locked: `None` if
@@ -2607,11 +2632,12 @@ impl HostHeap {
     /// The rest of [`HostHeap::mirror`], with `made` locked by the caller
     /// (one lock for several slots: [`HostHeap::mirror_due`],
     /// [`HostHeap::mirror_chunk`]): title slot `index` at `handle`, which
-    /// held `record` when [`HostHeap::record_at`] read it.
+    /// held `record` when [`HostHeap::record_at`] read it; `marks` as for
+    /// [`HostHeap::mirror_with`].
     fn mirror_made(
         &self,
         made: &mut Made,
-        (index, handle, for_draw): (u32, u64, bool),
+        (index, handle, for_draw, marks): (u32, u64, bool, bool),
         [tag, i, generation]: [u32; 3],
         lookups: &mut Lookups,
     ) -> Option<View> {
@@ -2621,7 +2647,7 @@ impl HostHeap {
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            self.empty_slot(made, index, for_draw);
+            self.empty_slot(made, index, for_draw, marks);
             return None;
         };
         let Some((host, taken)) = self.host_slot(made, index) else {
@@ -2641,7 +2667,7 @@ impl HostHeap {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
-            for stale in self.note_buffer(index, Some(&view), for_draw) {
+            for stale in self.note_buffer_marking(index, Some(&view), for_draw, marks) {
                 if stale != index {
                     self.unmake(made, stale);
                 }
@@ -3321,6 +3347,12 @@ const MIRROR_CHUNK: usize = 64;
 /// The slots of the pass over buffer views made under one lock
 /// ([`HostHeap::mirror_chunk`]).
 pub(crate) const PASS_CHUNK: usize = 64;
+
+/// VIcky (`VICTORY_HEAP_PASS_ONE_LOOK=1`): the marks the pass over buffer
+/// views did not set on slots it made ([`HostHeap::note_buffer_marking`]),
+/// of slots not marked already: each a look of its next pass spared. Taken
+/// by the spread's line (`crate::draw::heap_pass`).
+pub(crate) static PASS_MARKS_SPARED: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// While [`HostHeap::mirror_due`] mirrors a chunk on this thread: the
@@ -5470,7 +5502,7 @@ mod fast_tests {
                 .iter()
                 .map(|&i| {
                     let mut lookups = Lookups::each();
-                    let copy = heap.mirror_with(i, handle(i), &mut lookups).and_then(|v| buffer_copy_with(&v, &mut lookups));
+                    let copy = heap.mirror_with(i, handle(i), &mut lookups, true).and_then(|v| buffer_copy_with(&v, &mut lookups));
                     (i, copy)
                 })
                 .collect();
@@ -5481,7 +5513,7 @@ mod fast_tests {
         for chunk in sorted.chunks(PASS_CHUNK) {
             let ahead: Vec<(u32, u64)> = chunk.iter().map(|&i| (i, handle(i))).collect();
             let mut lookups: Vec<Lookups> = ahead.iter().map(|_| Lookups::kept()).collect();
-            let views = heap.mirror_chunk(&ahead, &mut lookups);
+            let views = heap.mirror_chunk(&ahead, &mut lookups, true);
             for ((&i, view), lookups) in chunk.iter().zip(views).zip(&mut lookups) {
                 out.push((i, view.and_then(|v| buffer_copy_with(&v, lookups))));
             }

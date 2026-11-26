@@ -710,3 +710,435 @@ fn the_spread_pass_keeps_what_the_full_pass_keeps() {
     }
     TEST_FAST.set(None);
 }
+
+/// With `VICTORY_HEAP_PASS_DUE`, on a model of a heap whose buffer slots
+/// come and go and are written (every note of a slot marks it, as
+/// `HostHeap::note_buffer` does): in any 16 passes in a row, a slot that was
+/// a buffer slot at each of their calls is looked at at least once; a slot
+/// is in a window only if no pass looked at it in the 15 before; and in 16
+/// passes over a heap nothing writes, every buffer slot is looked at once.
+#[test]
+fn the_due_windows_look_at_every_buffer_slot_once_in_any_16_passes() {
+    let mut next = draws(0x5eed_5b1e_ad00_0004);
+    let mut slots: BTreeSet<u32> = (0..3_000).chain(40_000..41_000).collect();
+    let mut changed: HashSet<u32> = slots.iter().copied().collect();
+    let mut looks = Looks::default();
+    // Per slot, the passes it was a buffer slot at and the passes that
+    // looked at it (one bit a pass).
+    let (mut present, mut came) = (HashMap::<u32, u128>::new(), HashMap::<u32, u128>::new());
+    let passes = 112u32;
+    for n in 0..passes {
+        // Passes 64 to 95: nothing written.
+        if !(64..96).contains(&n) {
+            match n % 4 {
+                0 => {
+                    let from = (next() % 120_000) as u32;
+                    for i in from..from + (next() % 3_000) as u32 {
+                        slots.insert(i);
+                        changed.insert(i);
+                    }
+                }
+                1 => {
+                    let from = (next() % 120_000) as u32;
+                    let to = from + (next() % 2_000) as u32;
+                    let gone: Vec<u32> = slots.range(from..to).copied().collect();
+                    for i in gone {
+                        slots.remove(&i);
+                        changed.insert(i);
+                    }
+                }
+                2 => {
+                    for _ in 0..400 {
+                        let i = (next() % 120_000) as u32;
+                        if !slots.remove(&i) {
+                            slots.insert(i);
+                        }
+                        changed.insert(i);
+                    }
+                }
+                // Buffer slots written again.
+                _ => {
+                    let all: Vec<u32> = slots.iter().copied().collect();
+                    for _ in 0..2_000 {
+                        changed.insert(all[(next() % all.len() as u64) as usize]);
+                    }
+                }
+            }
+        }
+        let written: Vec<u32> = changed.drain().collect();
+        let taken = written.len();
+        let (list, _) = choose_due(
+            u64::from(n),
+            &mut looks,
+            written,
+            || slots.iter().copied().collect(),
+            |unseen| unseen.into_iter().filter(|i| slots.contains(i)).collect(),
+        );
+        let before = if n == 0 { 0 } else { ((1u128 << n.min(15)) - 1) << (n - n.min(15)) };
+        if n > 0 {
+            for &i in &list[taken..] {
+                assert!(slots.contains(&i), "pass {n}: slot {i} in the window is a buffer slot");
+                let came = came.get(&i).copied().unwrap_or(0);
+                assert_eq!(came & before, 0, "pass {n}: slot {i} in the window was looked at in the 15 passes before");
+            }
+        }
+        for &i in &slots {
+            *present.entry(i).or_default() |= 1u128 << n;
+        }
+        for &i in &list {
+            let came = came.entry(i).or_default();
+            assert_eq!(*came & (1u128 << n), 0, "pass {n}: slot {i} twice");
+            *came |= 1u128 << n;
+        }
+    }
+    for start in 0..=passes - 16 {
+        let these = ((1u128 << 16) - 1) << start;
+        for (&i, &present) in &present {
+            if present & these == these {
+                let times = (came.get(&i).copied().unwrap_or(0) & these).count_ones();
+                assert!(times >= 1, "slot {i}, a buffer slot throughout passes {start} to {}", start + 15);
+                // Nothing written in them: once.
+                if (64..=80).contains(&start) {
+                    assert_eq!(times, 1, "slot {i}, passes {start} to {}", start + 15);
+                }
+            }
+        }
+    }
+}
+
+/// A model of a title heap for the slots the passes look at: slots
+/// `0..fixed` written once before the first pass, the rest a ring the title
+/// writes `per_pass` slots of before each pass, on from where it stopped (a
+/// ring two passes long is two areas written in turns); a written slot holds
+/// a buffer view if a hash of its index says so (`share` in 100).
+#[derive(Clone, Copy, Debug)]
+struct Layout {
+    heap: u32,
+    fixed: u32,
+    per_pass: u32,
+    share: u64,
+}
+
+/// Over `passes` passes on `layout` (the first over every buffer slot), the
+/// mean per pass from the 32nd on of: the slots looked at, those taken as
+/// written, those in the window, and the buffer slots. `due`:
+/// `VICTORY_HEAP_PASS_DUE` (else the windows of turns); `one_look`:
+/// `VICTORY_HEAP_PASS_ONE_LOOK` (else a pass's making of a slot the title
+/// wrote marks it again).
+fn looked_on(layout: Layout, due: bool, one_look: bool, passes: u64) -> [f64; 4] {
+    /// The title's write of slot `i` (a buffer view or not): noted, and
+    /// left for the pass to make.
+    #[derive(Default)]
+    struct Title {
+        slots: BTreeSet<u32>,
+        changed: HashSet<u32>,
+        unmade: HashSet<u32>,
+    }
+    impl Title {
+        fn write(&mut self, i: u32, buffer: bool) {
+            if buffer {
+                self.slots.insert(i);
+                self.changed.insert(i);
+                self.unmade.insert(i);
+            } else {
+                self.unmade.remove(&i);
+                if self.slots.remove(&i) {
+                    self.changed.insert(i);
+                }
+            }
+        }
+    }
+    let buffer = |i: u32| (u64::from(i).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) % 100 < layout.share;
+    let mut title = Title::default();
+    for i in 0..layout.fixed {
+        title.write(i, buffer(i));
+    }
+    let ring = layout.heap - layout.fixed;
+    let (mut at, mut looks, mut sums, mut counted) = (0, Looks::default(), [0f64; 4], 0f64);
+    for n in 0..passes {
+        for _ in 0..layout.per_pass {
+            let i = layout.fixed + at;
+            title.write(i, buffer(i));
+            at = (at + 1) % ring;
+        }
+        let written: Vec<u32> = title.changed.drain().collect();
+        let taken = written.len();
+        let mut in_window = 0;
+        let slots = &title.slots;
+        let (mut list, afresh) = if due {
+            choose_due(n, &mut looks, written, || slots.iter().copied().collect(), |unseen| {
+                let window: Vec<u32> = unseen.into_iter().filter(|i| slots.contains(i)).collect();
+                in_window = window.len();
+                window
+            })
+        } else {
+            choose(n, true, written, || slots.iter().copied().collect(), |turn| {
+                let window = window(slots, turn);
+                in_window = window.len();
+                window
+            })
+        };
+        afresh.apply(&mut HashMap::<u32, ()>::new(), &mut list);
+        // The pass makes the slots the title wrote; without the switch
+        // that marks them again.
+        for &i in &list {
+            if title.unmade.remove(&i) && !one_look {
+                title.changed.insert(i);
+            }
+        }
+        if n >= 32 {
+            for (sum, x) in sums.iter_mut().zip([list.len(), taken, in_window, title.slots.len()]) {
+                *sum += x as f64;
+            }
+            counted += 1.0;
+        }
+    }
+    sums.map(|sum| sum / counted)
+}
+
+/// On models of the title's heap at a sixteenth of RT81b's (1,245,184 slots,
+/// some 460,000 of them buffer slots, some 45,000 buffer slots written a
+/// pass): the title's writes as a ring over the whole heap, and as two areas
+/// written in turns beside slots written once. The pass's own making marked
+/// every slot the title wrote a second time, and `VICTORY_HEAP_PASS_ONE_LOOK`
+/// halves the slots taken as written; the turn's window holds a sixteenth
+/// of the buffer slots, and `VICTORY_HEAP_PASS_DUE`'s only those no pass
+/// looked at in the last 16: next to none with the ring, the slots written
+/// once with the two areas. (`--nocapture` prints the numbers.)
+#[test]
+fn the_passes_look_at_fewer_slots_on_models_of_the_heap() {
+    let layouts = [
+        ("a ring over the heap", Layout { heap: 77_824, fixed: 0, per_pass: 7_600, share: 37 }),
+        ("two areas in turns", Layout { heap: 77_824, fixed: 62_626, per_pass: 7_599, share: 37 }),
+    ];
+    for (name, layout) in layouts {
+        let [before, one, due, both] =
+            [(false, false), (false, true), (true, false), (true, true)].map(|(due, one)| looked_on(layout, due, one, 96));
+        for (how, [looked, taken, window, slots]) in
+            [("before", before), ("one look", one), ("due", due), ("one look and due", both)]
+        {
+            println!(
+                "{name}, {how}: {looked:.0} slots a pass, {taken:.0} taken as written, {window:.0} in the window, of \
+                 {slots:.0} buffer slots"
+            );
+        }
+        assert_eq!(before[3], both[3], "{name}: the same buffer slots");
+        assert!(before[3] > 25_000.0 && before[3] < 32_000.0, "{name}: {before:?}");
+        // Marked again by the making: twice the slots written.
+        assert!(one[1] < 0.6 * before[1], "{name}: {one:?} against {before:?}");
+        assert!(due[2] < before[2], "{name}: {due:?} against {before:?}");
+        assert!(both[0] < 0.7 * before[0], "{name}: {both:?} against {before:?}");
+    }
+    let ring = looked_on(layouts[0].1, true, true, 96);
+    let turns = looked_on(layouts[0].1, false, true, 96);
+    assert!(ring[2] < 0.1 * turns[2], "{ring:?} against {turns:?}");
+}
+
+/// With `VICTORY_HEAP_PASS_ONE_LOOK`, a slot the title writes once is
+/// looked at once: by the pass after the write, which makes it, and not by
+/// the next one; one the title writes again after that making is looked at
+/// again, its new range kept; one written again between the call and the
+/// making (beside) is looked at by the next pass too. Without the switch
+/// the making marks the slot and the next pass looks at it a second time.
+/// In place and beside, alike (the check counts the slots of the pass
+/// beside, and finds each as at the call).
+#[test]
+fn a_slot_written_once_is_looked_at_once() {
+    let Some(device) = crate::host::host() else {
+        return;
+    };
+    for one_look in [false, true] {
+        TEST_SPREAD.set(Some(false));
+        TEST_ONE_LOOK.set(Some(one_look));
+        let (Some(here), Some(beside)) = (title_heap(32), title_heap(32)) else {
+            TEST_SPREAD.set(None);
+            TEST_ONE_LOOK.set(None);
+            return;
+        };
+        let base = 0x5f_0000_0000u64 + (u64::from(one_look) << 28);
+        let id = 0x7e57_5f01 + usize::from(one_look);
+        crate::shadow::register(id, base, 0x1_0000);
+        let both = |slot: u32, first: u32| {
+            write(here.1, slot, buffer_view(base, 0x1_0000, first, 8));
+            write(beside.1, slot, buffer_view(base, 0x1_0000, first, 8));
+        };
+        both(3, 0);
+        both(4, 8);
+        // Per pass: the first element of slot 3's view written before it
+        // (none: nothing written), and the slots it looks at with the
+        // switch and without.
+        let rounds: [(Option<u32>, usize, usize); 5] = [
+            // Over every buffer slot.
+            (None, 2, 2),
+            // Slot 3 written: looked at once; without, slots 3 and 4 again.
+            (Some(16), 1, 2),
+            // Nothing written: without, slot 3 again.
+            (None, 0, 1),
+            // Written again after the making.
+            (Some(24), 1, 1),
+            (None, 0, 1),
+        ];
+        for (n, (first, with, without)) in rounds.into_iter().enumerate() {
+            if let Some(first) = first {
+                both(3, first);
+            }
+            let frame = 0x5f00 + n as u64;
+            let lists = [(); 2].map(|()| device.new_list().expect("a list"));
+            let made = in_place(&lists[0], here.1, here.2, frame);
+            let run = Run::new();
+            let pass = run.pass.clone();
+            start(&lists[1], beside.1, beside.2, frame, run, true);
+            lists[1].join_heap_passes();
+            let checked = pass.checked().expect("a checked pass");
+            let want = if one_look { with } else { without };
+            assert_eq!(made.slots, want, "pass {n}, one look {one_look}: in place");
+            assert_eq!(checked.slots, want as u64, "pass {n}, one look {one_look}: beside");
+            assert_eq!((checked.differed, checked.changed), (0, 0), "pass {n}, one look {one_look}");
+            assert_eq!(kept(here.2), kept(beside.2), "pass {n}, one look {one_look}: the ranges kept");
+            for list in lists {
+                list.close();
+            }
+        }
+        let copy = crate::shadow::find(base, 0x1_0000).expect("a copy");
+        assert_eq!(kept(beside.2).get(&3), Some(&(copy.id(), base + 24 * 16, base + 32 * 16)), "the new range");
+        // Beside: slot 4 written before the call and again before the
+        // making; the pass makes it from the second record, and the next
+        // one looks at it again (the second write's mark), once.
+        write(beside.1, 4, buffer_view(base, 0x1_0000, 40, 8));
+        for (n, want) in [(5u64, 1u64), (6, 1), (7, 0)] {
+            let list = device.new_list().expect("a list");
+            let run = Run::new();
+            let pass = run.pass.clone();
+            let hold = (n == 5).then(hold_lane);
+            start(&list, beside.1, beside.2, 0x5f00 + n, run, true);
+            if hold.is_some() {
+                write(beside.1, 4, buffer_view(base, 0x1_0000, 48, 8));
+            }
+            drop(hold);
+            list.join_heap_passes();
+            let checked = pass.checked().expect("a checked pass");
+            assert_eq!(checked.slots, want, "pass {n}, one look {one_look}");
+            assert_eq!(checked.differed, 0, "pass {n}, one look {one_look}");
+            list.close();
+        }
+        assert_eq!(kept(beside.2).get(&4), Some(&(copy.id(), base + 48 * 16, base + 56 * 16)), "made from the second record");
+        crate::shadow::unregister(id, base);
+        for heap in [&here, &beside] {
+            forget(heap.2);
+        }
+        for heap in [here, beside] {
+            assert_eq!(release(heap.0), 0);
+        }
+    }
+    TEST_SPREAD.set(None);
+    TEST_ONE_LOOK.set(None);
+}
+
+/// Sets [`spread`], [`due_window`] and [`one_look`] on this thread (`None`:
+/// as the environment says).
+fn switches(on: Option<bool>) {
+    TEST_SPREAD.set(on);
+    TEST_DUE.set(on);
+    TEST_ONE_LOOK.set(on);
+}
+
+/// Three heaps written alike: passed over in place with a pass over every
+/// buffer slot each 16th pass, and with the spread, `VICTORY_HEAP_PASS_DUE`
+/// and `VICTORY_HEAP_PASS_ONE_LOOK` in place and beside (checked every
+/// pass); with the cache of made views and without. 24 buffer slots in runs
+/// of several turns and on two buffers; before each pass after the first,
+/// one of them written (each again 24 passes later), and one turned into a
+/// constant view and back. At every pass the three keep the same ranges, in
+/// place and beside show the same buffers, and the check finds every slot as
+/// at the call; a pass looks at the slot written for it and at the ones no
+/// pass looked at in the 15 before: none up to pass 15, then the slots of
+/// the first pass not written since, then each slot written 16 passes
+/// before.
+#[test]
+fn the_due_window_keeps_what_the_full_pass_keeps() {
+    let Some(device) = crate::host::host() else {
+        return;
+    };
+    let runs = 8u32;
+    let slots: Vec<u32> = (0..runs).flat_map(|r| [r * RUN + 5, r * RUN + 20, r * RUN + 40]).collect();
+    for cache in [0usize, 1 << 10] {
+        TEST_FAST.set(Some((cache, false, false)));
+        let (Some(full), Some(here), Some(beside)) = (title_heap(runs * RUN), title_heap(runs * RUN), title_heap(runs * RUN))
+        else {
+            TEST_FAST.set(None);
+            return;
+        };
+        let base = 0x60_0000_0000u64 + ((cache as u64) << 28);
+        let (one, two) = (0x7e57_6001 + cache, 0x7e57_6002 + cache);
+        crate::shadow::register(one, base, 0x10_0000);
+        crate::shadow::register(two, base + 0x100_0000, 0x1000);
+        let all = |slot: u32, view: View| {
+            for heap in [full.1, here.1, beside.1] {
+                write(heap, slot, view.clone());
+            }
+        };
+        for (k, &slot) in slots.iter().enumerate() {
+            let k = k as u32;
+            all(slot, match k % 3 {
+                2 => buffer_view(base + 0x100_0000, 0x1000, k % 32, 4),
+                _ => buffer_view(base, 0x10_0000, 4 * k, 8),
+            });
+        }
+        for n in 0..=40u64 {
+            if n > 0 {
+                all(slots[((n - 1) % 24) as usize], buffer_view(base, 0x10_0000, 300 + n as u32, 8));
+            }
+            if n == 20 {
+                all(slots[3], View::Constant(base + 0x400, 256));
+            }
+            if n == 22 {
+                all(slots[3], buffer_view(base, 0x10_0000, 900, 8));
+            }
+            let frame = 0x6000 + n;
+            let lists = [(); 3].map(|()| device.new_list().expect("a list"));
+            switches(Some(false));
+            in_place(&lists[0], full.1, full.2, frame);
+            switches(Some(true));
+            let made = in_place(&lists[1], here.1, here.2, frame);
+            let run = Run::new();
+            let pass = run.pass.clone();
+            start(&lists[2], beside.1, beside.2, frame, run, true);
+            switches(None);
+            lists[2].join_heap_passes();
+            let want = match n {
+                0 => Some(24),
+                1..=15 => Some(1),
+                // The 8 slots of the first pass not written since.
+                16 => Some(9),
+                17..=19 => Some(2),
+                _ => None,
+            };
+            if let Some(want) = want {
+                assert_eq!(made.slots, want, "pass {n}, cache {cache}: in place");
+            }
+            assert!(made.slots <= 3 || n == 0 || n == 16, "pass {n}, cache {cache}: {} slots", made.slots);
+            let checked = pass.checked().expect("a checked pass");
+            assert_eq!(checked.slots, made.slots as u64, "pass {n}, cache {cache}: beside");
+            assert_eq!((checked.differed, checked.changed), (0, 0), "pass {n}, cache {cache}");
+            let due = kept(here.2);
+            assert_eq!(due, kept(beside.2), "pass {n}, cache {cache}: in place and beside");
+            for slot in 0..runs * RUN {
+                assert_eq!(here.2.made(slot), beside.2.made(slot), "pass {n}, cache {cache}, slot {slot}: made");
+                assert_eq!(here.2.shown_raw(slot), beside.2.shown_raw(slot), "pass {n}, cache {cache}, slot {slot}");
+            }
+            assert_eq!(due, kept(full.2), "pass {n}, cache {cache}: with the window of slots due and without the spread");
+            for list in lists {
+                list.close();
+            }
+        }
+        crate::shadow::unregister(one, base);
+        crate::shadow::unregister(two, base + 0x100_0000);
+        for heap in [&full, &here, &beside] {
+            forget(heap.2);
+        }
+        for heap in [full, here, beside] {
+            assert_eq!(release(heap.0), 0);
+        }
+    }
+    TEST_FAST.set(None);
+}

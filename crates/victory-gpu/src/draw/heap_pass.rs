@@ -21,6 +21,11 @@
 //! before it reads the steps of the lists that need it
 //! (`HostList::join_heap_passes`, at the start of `Host::submit`).
 //!
+//! With VIcky's `VICTORY_HEAP_PASS_ONE_LOOK=1` ([`one_look`]) a slot the
+//! pass makes is not marked as written again by that making, and with
+//! `VICTORY_HEAP_PASS_DUE=1` ([`due_window`]) the spread's window holds only
+//! the buffer slots no pass looked at in the last 16.
+//!
 //! What the pass reads, and when:
 //! - Title memory: only the record of each slot it looks at, three words
 //!   read in place when the pass gets to the slot, under the lock of the
@@ -148,13 +153,16 @@ pub(crate) struct Found {
 
 /// The pass over the buffer views of `heap` (its host heap `host`) for
 /// `slots`, up to the ranges, kept in `ranges`. With `found`, what each
-/// slot came to is noted there too (the check).
+/// slot came to is noted there too (the check). `marks`: whether the making
+/// of a slot marks it as written for the next pass (without
+/// `VICTORY_HEAP_PASS_ONE_LOOK=1`, [`one_look`]).
 pub(crate) fn buffers(
     heap: &Heap,
     host: &HostHeap,
     slots: &mut [u32],
     ranges: &mut Ranges,
     mut found: Option<&mut Vec<Found>>,
+    marks: bool,
 ) {
     // VIcky (`VICTORY_HEAP_SYNC_CACHE`): in slot order (the set of
     // changed slots gives them in no order). Each slot is made by itself,
@@ -188,7 +196,7 @@ pub(crate) fn buffers(
                     .take(PASS_CHUNK)
                     .collect();
                 let mut lookups: Vec<Lookups> = ahead.iter().map(|_| Lookups::kept()).collect();
-                let views = host.mirror_chunk(&ahead, &mut lookups);
+                let views = host.mirror_chunk(&ahead, &mut lookups, marks);
                 made_ahead.extend(views.into_iter().zip(lookups));
             }
             let Some(made) = made_ahead.pop_front() else {
@@ -197,7 +205,7 @@ pub(crate) fn buffers(
             made
         } else {
             let mut lookups = Lookups::each();
-            (host.mirror_with(index, handle, &mut lookups), lookups)
+            (host.mirror_with(index, handle, &mut lookups, marks), lookups)
         };
         let Some(view) = view else {
             if let Some(found) = found.as_deref_mut() {
@@ -321,7 +329,7 @@ pub(crate) fn in_place(list: &HostList, heap: &Heap, host: &HostHeap, frame: u64
     let (mut slots, afresh) = slots_for(host, *passes);
     afresh.apply(ranges, &mut slots);
     *passes += 1;
-    buffers(heap, host, &mut slots, ranges, None);
+    buffers(heap, host, &mut slots, ranges, None, !one_look());
     let views = ranges.len() as u32;
     let spans = spans(ranges);
     drop(kept);
@@ -383,8 +391,150 @@ pub(crate) fn spread() -> bool {
 
 #[cfg(test)]
 thread_local! {
-    /// Tests: [`spread`] for this thread, whatever the environment says.
+    /// Tests: [`spread`], [`one_look`] and [`due_window`] for this thread,
+    /// whatever the environment says.
     static TEST_SPREAD: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_ONE_LOOK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_DUE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// VIcky: whether the pass's own making of a slot leaves the slot unmarked
+/// (`VICTORY_HEAP_PASS_ONE_LOOK=1`; off by default). A title write marks a
+/// buffer slot as written (`HostHeap::note_buffer`) and the pass looks at
+/// it; the pass makes it, and that making marked it again, so the next pass
+/// looked at every slot the title wrote a second time, to find it made and
+/// keep the range it had just kept (RT81b: some 90,000 slots a pass taken as
+/// written, for some 40,000 buffer views made a frame). With the switch the
+/// making does not mark the slot; a write of the title after it marks it as
+/// before, as does a draw's making, and the spread's window still comes to
+/// it within 16 passes. Read at the call (the pass beside is handed it,
+/// [`Call`]).
+pub(crate) fn one_look() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_ONE_LOOK.get() {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_HEAP_PASS_ONE_LOOK").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "the pass over the heap's buffer views does not mark the slots it makes as written again: a slot the title \
+                 writes once is looked at once (VICTORY_HEAP_PASS_ONE_LOOK=1)"
+            );
+        }
+        on
+    })
+}
+
+/// VIcky: whether the spread's window holds the buffer slots no pass looked
+/// at in the last [`TURNS`] passes ([`Looks`]) instead of all the buffer
+/// slots of the pass's turn (`VICTORY_HEAP_PASS_DUE=1`, with
+/// `VICTORY_HEAP_PASS_SPREAD=1`; off by default). In RT81b the window held
+/// some 29,000 slots a pass, and only buffer slots: the title writes buffer
+/// views all over the heap (the windows ran from slot 4 to 1,245,119), a
+/// slot stays a buffer slot until it is written with something else, and
+/// the set of them had grown to some 460,000 (16 windows), up from 71,000 at
+/// the first pass; while the title wrote some 40,000 of them a frame, each
+/// then looked at as written. A slot looked at, for whatever reason, needs
+/// no look for the next 15 passes: each buffer slot is still looked at at
+/// least once in any 16 passes in a row.
+pub(crate) fn due_window() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_DUE.get() {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_HEAP_PASS_DUE").is_some_and(|v| v == "1");
+        if on && !spread() {
+            tracing::warn!("VICTORY_HEAP_PASS_DUE=1 does nothing without VICTORY_HEAP_PASS_SPREAD=1");
+        } else if on {
+            tracing::info!(
+                "the spread's window holds the buffer slots no pass over the heap's buffer views looked at in the last 16, \
+                 instead of all the buffer slots of the pass's turn (VICTORY_HEAP_PASS_DUE=1)"
+            );
+        }
+        on
+    })
+}
+
+/// VIcky (`VICTORY_HEAP_PASS_DUE=1`): per host heap, when the passes last
+/// looked at each slot.
+static LOOKS: Mutex<Option<HashMap<usize, Looks>>> = Mutex::new(None);
+
+/// Which pass over a heap last looked at each slot, for the window of the
+/// slots due ([`Looks::take`]). Noted at the calls, in their order, with
+/// the slots each pass is handed (whether or not it gets to run them).
+#[derive(Default)]
+pub(crate) struct Looks {
+    /// Per title slot, the number of the pass that last looked at it, plus
+    /// one; 0: none did.
+    last: Vec<u32>,
+    /// Per pass number modulo [`TURNS`], the slots the last such pass
+    /// looked at, each once. One a later pass looked at again is in that
+    /// pass's list too, and is skipped here when the list is taken.
+    looked: [Vec<u32>; TURNS as usize],
+}
+
+impl Looks {
+    /// Notes that pass `stamp - 1` looks at `index`.
+    fn stamp(&mut self, index: u32, stamp: u32) {
+        let at = index as usize;
+        if at >= self.last.len() {
+            self.last.resize(at + 1, 0);
+        }
+        self.last[at] = stamp;
+    }
+
+    /// Pass `n` looks at `all` (the first pass over a heap: every buffer
+    /// slot).
+    fn first(&mut self, n: u64, all: &[u32]) {
+        let stamp = (n as u32).wrapping_add(1);
+        for &i in all {
+            self.stamp(i, stamp);
+        }
+        self.looked[(n % TURNS) as usize] = all.to_vec();
+    }
+
+    /// The window of pass `n` besides `written` (the slots it looks at as
+    /// written since the last pass): of the slots pass `n - 16` looked at,
+    /// those no pass looked at since that `still` keeps (the ones still
+    /// buffer slots). Notes both as looked at by pass `n`.
+    ///
+    /// A slot that is a buffer slot at the call of pass `n` is looked at by
+    /// one of the passes `n - 16` to `n`. Say the last pass before `n` that
+    /// looked at it is `p`. If `p` is `n - 16`, the slot is in `p`'s list
+    /// and no pass looked at it since: it is in this window. If `p` is
+    /// earlier, the call of `p + 16` found it in `p`'s list in the same way,
+    /// so it was not a buffer slot then (that window would have had it): it
+    /// became one again before this call by a note that marked it (every
+    /// note of a buffer view marks the slot but the pass's own making, which
+    /// is of a slot its pass looks at), and the next call took it as
+    /// written: this one, since none in between looked at it. (A slot no
+    /// pass looked at became a buffer slot after the first pass over the
+    /// heap, by such a note, in the same way.)
+    pub(crate) fn take(&mut self, n: u64, written: &[u32], still: impl FnOnce(Vec<u32>) -> Vec<u32>) -> Vec<u32> {
+        let turn = (n % TURNS) as usize;
+        let stamp = (n as u32).wrapping_add(1);
+        let then = stamp.wrapping_sub(TURNS as u32);
+        let mut looked = std::mem::take(&mut self.looked[turn]);
+        for &i in written {
+            self.stamp(i, stamp);
+        }
+        // (Each slot once: a written one is stamped now, and a list holds
+        // each of its slots once.)
+        looked.retain(|&i| self.last.get(i as usize) == Some(&then));
+        let window = still(looked);
+        for &i in &window {
+            self.stamp(i, stamp);
+        }
+        let mut now = Vec::with_capacity(written.len() + window.len());
+        now.extend_from_slice(written);
+        now.extend_from_slice(&window);
+        self.looked[turn] = now;
+        window
+    }
 }
 
 /// Each buffer slot is looked at once in this many passes, with the spread
@@ -435,17 +585,29 @@ pub(crate) enum Afresh {
     /// the window of the turn and the slots written since the last one
     /// (`VICTORY_HEAP_PASS_SPREAD`).
     Turn(u32),
+    /// None up front: the pass looks at the slots written since the last
+    /// one and those due (`VICTORY_HEAP_PASS_DUE`, [`Looks::take`]), each
+    /// slot's range dropped when the pass gets to it. A slot that leaves
+    /// the buffer slots is marked by that note (or, made by the pass
+    /// itself, has its range dropped there), so no kept range is left that
+    /// no pass looks at.
+    Listed,
 }
 
 impl Afresh {
-    /// Drops the kept ranges the pass makes afresh. For a turn, `slots`
-    /// (the written ones, then the window) are put in order, each once.
+    /// Drops the kept ranges the pass makes afresh. For a turn and a list,
+    /// `slots` (the written ones, then the window) are put in order, each
+    /// once.
     fn apply<V>(self, ranges: &mut HashMap<u32, V>, slots: &mut Vec<u32>) {
         match self {
             Afresh::None => {}
             Afresh::All => ranges.clear(),
             Afresh::Turn(turn) => {
                 ranges.retain(|&index, _| turn_of(index) != turn);
+                slots.sort_unstable();
+                slots.dedup();
+            }
+            Afresh::Listed => {
                 slots.sort_unstable();
                 slots.dedup();
             }
@@ -479,21 +641,71 @@ fn choose(
     }
 }
 
-/// [`choose`] for pass `n` over `host`, at the call; the window is counted
-/// for the line.
+/// [`choose`] for pass `n` over `host`, at the call, or with
+/// `VICTORY_HEAP_PASS_DUE=1` [`choose_due`]; the slots taken as written and
+/// the window are counted for the line.
 fn slots_for(host: &HostHeap, n: u64) -> (Vec<u32>, Afresh) {
     // The marks are taken whichever slots the pass looks at.
     let changed = host.buffer_changes();
-    choose(n, spread(), changed, || host.buffer_slots(), |turn| {
-        let window = host.with_buffer_slots(|slots| window(slots, turn));
+    let written = changed.len() as u64;
+    let counted = |turn: u32, window: &[u32]| {
         let mut s = SPREAD.lock().unwrap_or_else(|e| e.into_inner());
         let s = s.get_or_insert_with(Default::default);
         s.windows += 1;
+        s.written += written;
         s.window_slots += window.len() as u64;
         s.window_most = s.window_most.max(window.len() as u64);
-        s.last = Some((turn, window.first().copied(), window.last().copied()));
+        s.last = Some((turn, window.iter().min().copied(), window.iter().max().copied()));
+    };
+    if spread() && due_window() {
+        let mut looks = LOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        let looks = looks
+            .get_or_insert_with(Default::default)
+            .entry(std::ptr::from_ref(host) as usize)
+            .or_default();
+        return choose_due(n, looks, changed, || host.buffer_slots(), |mut unseen| {
+            // In order (the set's nodes walked forward), and a chunk at a
+            // time under the set's lock, which every note of a buffer slot
+            // takes.
+            unseen.sort_unstable();
+            let window: Vec<u32> = unseen
+                .chunks(4096)
+                .flat_map(|chunk| {
+                    host.with_buffer_slots(|slots| chunk.iter().copied().filter(|i| slots.contains(i)).collect::<Vec<u32>>())
+                })
+                .collect();
+            counted((n % TURNS) as u32, &window);
+            window
+        });
+    }
+    choose(n, spread(), changed, || host.buffer_slots(), |turn| {
+        let window = host.with_buffer_slots(|slots| window(slots, turn));
+        counted(turn, &window);
         window
     })
+}
+
+/// [`choose`] with the spread and `VICTORY_HEAP_PASS_DUE=1`: the first pass
+/// over a heap looks at every buffer slot (`all`), the next ones at the
+/// slots written since the last (`changed`) and at the window of the slots
+/// due ([`Looks::take`], `still` keeping those still buffer slots). Both are
+/// noted in `looks`.
+fn choose_due(
+    n: u64,
+    looks: &mut Looks,
+    changed: Vec<u32>,
+    all: impl FnOnce() -> Vec<u32>,
+    still: impl FnOnce(Vec<u32>) -> Vec<u32>,
+) -> (Vec<u32>, Afresh) {
+    if n == 0 {
+        let all = all();
+        looks.first(n, &all);
+        return (all, Afresh::All);
+    }
+    let window = looks.take(n, &changed, still);
+    let mut slots = changed;
+    slots.extend(window);
+    (slots, Afresh::Listed)
 }
 
 /// A pass at least this long is counted on the spread's line.
@@ -510,9 +722,10 @@ struct Spread {
     us: u64,
     longest: u64,
     long: u64,
-    /// Windows taken, their slots, the largest, and the last one's turn,
-    /// first and last slot.
+    /// Windows taken, the slots taken as written with them, the windows'
+    /// slots, the largest, and the last one's turn, first and last slot.
     windows: u64,
+    written: u64,
     window_slots: u64,
     window_most: u64,
     last: Option<(u32, Option<u32>, Option<u32>)>,
@@ -567,16 +780,28 @@ fn spread_line() {
     let each: Vec<String> = each.iter().map(|us| format!("{:.0}", *us as f64 / 1000.0)).collect();
     let (turn, first, last) = s.last.unwrap_or((0, None, None));
     let at = |slot: Option<u32>| slot.map_or_else(|| "-".to_string(), |s| s.to_string());
+    let windows = s.windows.max(1) as f64;
+    let spared = crate::descriptor::host::PASS_MARKS_SPARED.swap(0, Relaxed);
+    let window = if due_window() {
+        "the buffer slots no pass looked at in the last 16, VICTORY_HEAP_PASS_DUE=1"
+    } else {
+        "the buffer slots of the pass's turn"
+    };
     tracing::info!(
         "the pass over buffer views spread (VICTORY_HEAP_PASS_SPREAD=1) since the last line: {} passes of {:.0} slots, \
-         {:.0} of them in the window (at most {}); the last window at turn {turn} of {TURNS} (slots {} to {}); \
-         {:.1} ms a pass, {:.1} ms at most, {} of at least {} ms; the longest pass of each second: [{}] ms",
+         {:.0} of them taken as written since the last pass and {:.0} in the window (at most {}; {window}); the last \
+         window at turn {turn} of {TURNS} (slots {} to {}); marks of slots the passes made spared \
+         (VICTORY_HEAP_PASS_ONE_LOOK={}): {:.0} a pass; {:.1} ms a pass, {:.1} ms at most, {} of at least {} ms; the \
+         longest pass of each second: [{}] ms",
         s.passes,
         s.slots as f64 / s.passes.max(1) as f64,
-        s.window_slots as f64 / s.windows.max(1) as f64,
+        s.written as f64 / windows,
+        s.window_slots as f64 / windows,
         s.window_most,
         at(first),
         at(last),
+        u8::from(one_look()),
+        spared as f64 / windows,
         s.us as f64 / 1000.0 / s.passes.max(1) as f64,
         s.longest as f64 / 1000.0,
         s.long,
@@ -773,6 +998,9 @@ struct Call {
     slots: Vec<u32>,
     /// The kept ranges the pass drops first ([`Afresh`]).
     afresh: Afresh,
+    /// Whether its making marks the slots it makes ([`one_look`], read at
+    /// the call).
+    marks: bool,
     frame: u64,
     called: Instant,
     /// With the check: what the pass in place would have found at the
@@ -818,6 +1046,7 @@ pub(crate) fn start(list: &HostList, heap: &Heap, host: &HostHeap, frame: u64, r
         host: key,
         slots,
         afresh,
+        marks: !one_look(),
         frame,
         called,
         at_call,
@@ -859,7 +1088,7 @@ fn run(call: Call) -> Option<(Vec<Range>, Option<Checked>)> {
     count(C::QueuedUs, (began - call.called).as_micros() as u64);
     #[cfg(test)]
     let _fast = TestFast::here(call.fast);
-    let Call { heap, start, host, mut slots, afresh, frame, at_call, .. } = call;
+    let Call { heap, start, host, mut slots, afresh, marks, frame, at_call, .. } = call;
     let (refreshes, found) = crate::descriptor::with_heap(heap, start, |heap| {
         let here = heap.host().filter(|h| std::ptr::from_ref(*h) as usize == host)?;
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
@@ -869,7 +1098,7 @@ fn run(call: Call) -> Option<(Vec<Range>, Option<Checked>)> {
             .or_insert_with(|| (0, Ranges::new()));
         afresh.apply(ranges, &mut slots);
         let mut found = at_call.is_some().then(Vec::new);
-        buffers(heap, here, &mut slots, ranges, found.as_mut());
+        buffers(heap, here, &mut slots, ranges, found.as_mut(), marks);
         let views = ranges.len() as u32;
         let spans = spans(ranges);
         drop(kept);
@@ -1152,6 +1381,9 @@ fn forget(host: &HostHeap) {
     }
     if let Some(calls) = CALLS.lock().unwrap().as_mut() {
         calls.remove(&key);
+    }
+    if let Some(looks) = LOOKS.lock().unwrap().as_mut() {
+        looks.remove(&key);
     }
 }
 
