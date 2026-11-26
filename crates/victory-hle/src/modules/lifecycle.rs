@@ -177,13 +177,12 @@ extern "system" fn window_proc(
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
-    // Alt or F10 puts a window into menu mode: the system runs a modal menu
-    // loop on the thread that owns the window, which is the title's. The
-    // title then stops (no frames, no input) until a key ends the loop, and
-    // nothing shows it, since the window has no menu bar;
-    // the title aborts itself about half a minute later. A console has no window
-    // menu. The mouse still opens it from the title bar.
-    if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
+    // Both keyboard and mouse system menus put the title's window thread
+    // into a modal loop. The title can be waiting for that thread to finish
+    // rendering, so starting a menu here can stop its heartbeat.
+    if message == wm::WM_SYSCOMMAND
+        && matches!((wparam & 0xFFF0) as u32, wm::SC_KEYMENU | wm::SC_MOUSEMENU)
+    {
         return 0;
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.
@@ -419,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn the_keyboard_menu_never_reaches_the_title() {
+    fn the_system_menus_never_reach_the_title() {
         let null = std::ptr::null_mut();
         let hwnd = CreateWindowExW(
             0,
@@ -443,12 +442,14 @@ mod tests {
         unsafe {
             let title = wm::GetPropW(hwnd, TITLE_PROC);
             wm::SetPropW(hwnd, TITLE_PROC, recording as *const () as *mut c_void);
-            let command = |c: u32, key: u8| {
-                wm::SendMessageW(hwnd, wm::WM_SYSCOMMAND, c as usize, LPARAM::from(key))
+            let command = |c: u32, argument: LPARAM| {
+                wm::SendMessageW(hwnd, wm::WM_SYSCOMMAND, c as usize, argument)
             };
             command(wm::SC_KEYMENU, 0); // Alt or F10
-            command(wm::SC_KEYMENU, b' '); // Alt+Space
+            command(wm::SC_KEYMENU, LPARAM::from(b' ')); // Alt+Space
             command(wm::SC_KEYMENU | 1, 0); // the low bits are the system's
+            command(wm::SC_MOUSEMENU, 0);
+            command(wm::SC_MOUSEMENU | 3, 0xF003C);
             command(wm::SC_MINIMIZE, 0);
             wm::SetPropW(hwnd, TITLE_PROC, title);
             wm::DestroyWindow(hwnd);
