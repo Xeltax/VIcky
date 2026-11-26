@@ -123,16 +123,115 @@ struct Card {
     before: Mutex<Option<ID3D12Resource>>,
     /// Offsets of the copy whose bytes changed on the CPU's side and have
     /// not gone to the card's side yet.
-    dirty: Mutex<Vec<(usize, usize)>>,
+    dirty: Mutex<DirtyNotes>,
     /// With [`relay`]: the offsets that went from `dirty` to the card's
-    /// side, each with the number of the send that took it
+    /// side, with the number of the send that took them
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
-    sent: Mutex<Vec<(usize, usize, u64)>>,
+    sent: Mutex<SentNotes>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
     /// What the card's compare said of each piece ([`Dense`]).
     dense: Dense,
+}
+
+/// [`Card::dirty`]: the offsets of a copy in the card's memory whose bytes
+/// changed on the CPU's side and have not gone up yet, kept in order so
+/// that those a merged stretch overlaps are found by a binary search
+/// ([`DirtyNotes::overlapping`]). The merge of every fetched piece
+/// (`Shadow::card_merge_relay`) walked all of them, and with the title's
+/// dense tables there were thousands (25,700 changed runs a frame in
+/// RT66d, against some 1,500 pieces merged).
+#[derive(Default)]
+struct DirtyNotes {
+    ranges: Vec<(usize, usize)>,
+    /// `ranges` is out of order, or two of them overlap or touch: put in
+    /// order (as [`joined`] leaves ranges) at the next look.
+    unsorted: bool,
+}
+
+impl DirtyNotes {
+    /// Offsets `[from, to)` (`from < to`) changed: joined with the last
+    /// range if they overlap or touch it, else a range of their own, as
+    /// before.
+    fn add(&mut self, from: usize, to: usize) {
+        let n = self.ranges.len();
+        if n == 0 {
+            self.ranges.push((from, to));
+            return;
+        }
+        let last = self.ranges[n - 1];
+        if from <= last.1 && to >= last.0 {
+            self.ranges[n - 1] = (last.0.min(from), last.1.max(to));
+            // Grown back over the one before.
+            if n >= 2 && self.ranges[n - 1].0 <= self.ranges[n - 2].1 {
+                self.unsorted = true;
+            }
+        } else {
+            // Before the last (it does not touch it): out of order.
+            if from <= last.1 {
+                self.unsorted = true;
+            }
+            self.ranges.push((from, to));
+        }
+    }
+
+    /// All of them, in order and joined where they overlap or touch (as
+    /// [`joined`]): they go up now.
+    fn take(&mut self) -> Vec<(usize, usize)> {
+        self.unsorted = false;
+        joined(std::mem::take(&mut self.ranges))
+    }
+
+    /// Onto `out`: the ranges that overlap `[from, to)`. Their union there
+    /// is that of the ranges as noted, which is all a merge leaves out
+    /// ([`outside`]).
+    fn overlapping(&mut self, from: usize, to: usize, out: &mut Vec<(usize, usize)>) {
+        if self.unsorted {
+            self.ranges = joined(std::mem::take(&mut self.ranges));
+            self.unsorted = false;
+        }
+        overlapping_in(&self.ranges, from, to, out);
+    }
+}
+
+/// [`Card::sent`]: per send of changed ranges to the card's side, its
+/// number and its ranges (in order and joined, as [`DirtyNotes::take`]
+/// gives them), so that a merge looks for the ones it overlaps by a binary
+/// search in each send it must leave out, not by a walk over every range.
+#[derive(Default)]
+struct SentNotes(Vec<(u64, Vec<(usize, usize)>)>);
+
+impl SentNotes {
+    /// The ranges `ranges` went up with send `sent_as`.
+    fn note(&mut self, sent_as: u64, ranges: Vec<(usize, usize)>) {
+        if !ranges.is_empty() {
+            self.0.push((sent_as, ranges));
+        }
+    }
+
+    /// Every fetch still to be merged came after send `fetched`: the notes
+    /// of sends up to it are of no use any more.
+    fn drop_up_to(&mut self, fetched: u64) {
+        self.0.retain(|s| s.0 > fetched);
+    }
+
+    /// Onto `out`: the ranges of sends after `after` that overlap
+    /// `[from, to)`.
+    fn overlapping(&self, after: u64, from: usize, to: usize, out: &mut Vec<(usize, usize)>) {
+        for (sent_as, ranges) in &self.0 {
+            if *sent_as > after {
+                overlapping_in(ranges, from, to, out);
+            }
+        }
+    }
+}
+
+/// Onto `out`: the ranges of `ranges` (in order, none overlapping another)
+/// that overlap `[from, to)`.
+fn overlapping_in(ranges: &[(usize, usize)], from: usize, to: usize, out: &mut Vec<(usize, usize)>) {
+    let first = ranges.partition_point(|r| r.1 <= from);
+    out.extend(ranges[first..].iter().take_while(|r| r.0 < to).copied());
 }
 
 /// Per 64 KiB piece of a copy in the card's memory (cut as the compare
@@ -459,17 +558,17 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             .as_ref()
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = std::mem::take(&mut *dirty);
+                let ranges = dirty.take();
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.retain(|s| s.2 > fetched);
-                    sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+                    sent.drop_up_to(fetched);
+                    sent.note(sent_as, ranges.clone());
                 }
                 ranges
             })
             .unwrap_or_default();
         if !ranges.is_empty() {
-            out.push((shadow, joined(ranges)));
+            out.push((shadow, ranges));
         }
         true
     });
@@ -1236,6 +1335,152 @@ fn merge_race(
             copy.1,
             address + first.unwrap_or(0)
         ));
+    }
+}
+
+#[cfg(test)]
+mod notes_tests {
+    use super::{DirtyNotes, SentNotes, joined, outside};
+
+    /// Repeatable random numbers (xorshift) for the note sets.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            (x % n.max(1) as u64) as usize
+        }
+    }
+
+    /// The notes as they were before the index: `Card::dirty` a plain list
+    /// joined only with its last range, `Card::sent` a list of every range
+    /// with its send, and the merge's skip a walk over both.
+    #[derive(Default)]
+    struct Walked {
+        dirty: Vec<(usize, usize)>,
+        sent: Vec<(usize, usize, u64)>,
+    }
+
+    impl Walked {
+        /// As `Shadow::card_changed` did.
+        fn changed(&mut self, from: usize, to: usize) {
+            match self.dirty.last_mut() {
+                Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+                _ => self.dirty.push((from, to)),
+            }
+        }
+
+        /// As `card_dirty` did: what goes up.
+        fn send(&mut self, fetched: u64, sent_as: u64) -> Vec<(usize, usize)> {
+            let ranges = std::mem::take(&mut self.dirty);
+            self.sent.retain(|s| s.2 > fetched);
+            self.sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+            joined(ranges)
+        }
+
+        /// As `Shadow::card_merge_relay` did.
+        fn skip(&self, at: usize, n: usize, after: u64) -> Vec<(usize, usize)> {
+            self.dirty
+                .iter()
+                .copied()
+                .chain(self.sent.iter().filter(|s| s.2 > after).map(|s| (s.0, s.1)))
+                .filter(|&(a, b)| a < at + n && b > at)
+                .collect()
+        }
+    }
+
+    /// On random note sets shaped like the title's (runs of a few bytes a
+    /// few bytes apart, with now and then a range out of order or a whole
+    /// refresh over many pages), the indexed notes send up the same ranges
+    /// and leave the same bytes out of every merge as the walk did.
+    #[test]
+    fn indexed_notes_leave_out_the_same_bytes_as_the_walk() {
+        const SPAN: usize = 4 << 20;
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut looked = 0u64;
+        for _ in 0..60 {
+            let mut walked = Walked::default();
+            let (mut dirty, mut sent) = (DirtyNotes::default(), SentNotes::default());
+            let (mut sent_as, mut fetched, mut cursor) = (0u64, 0u64, 0usize);
+            for _ in 0..3000 {
+                let (from, to) = match rng.below(20) {
+                    // A dense page's runs: a few bytes, a few bytes on
+                    // (touching now and then).
+                    0..=11 => {
+                        let from = cursor + rng.below(16);
+                        (from, from + 1 + rng.below(6))
+                    }
+                    // Somewhere else, or back on a run already noted.
+                    12 | 13 => {
+                        let from = rng.below(SPAN);
+                        (from, from + 1 + rng.below(64))
+                    }
+                    // A refresh over many pages.
+                    14 => {
+                        let from = rng.below(SPAN);
+                        (from, from + 1 + rng.below(5 << 16))
+                    }
+                    15 => {
+                        sent_as += 1;
+                        let up = walked.send(fetched, sent_as);
+                        sent.drop_up_to(fetched);
+                        let ranges = dirty.take();
+                        sent.note(sent_as, ranges.clone());
+                        assert_eq!(ranges, up, "the same ranges go up");
+                        continue;
+                    }
+                    16 => {
+                        fetched = (fetched + rng.below(3) as u64).min(sent_as);
+                        continue;
+                    }
+                    _ => {
+                        let at = rng.below(SPAN);
+                        let n = 1 + rng.below(1 << 16);
+                        let after = rng.below(sent_as as usize + 1) as u64;
+                        let mut skip = Vec::new();
+                        dirty.overlapping(at, at + n, &mut skip);
+                        sent.overlapping(after, at, at + n, &mut skip);
+                        assert_eq!(outside(at, at + n, skip), outside(at, at + n, walked.skip(at, n, after)), "at {at:#x}+{n:#x} after {after}");
+                        looked += 1;
+                        continue;
+                    }
+                };
+                let to = to.min(SPAN);
+                if from >= to {
+                    continue;
+                }
+                cursor = to;
+                walked.changed(from, to);
+                dirty.add(from, to);
+            }
+        }
+        assert!(looked > 10_000);
+    }
+
+    /// Ranges noted in order stay in order and need no sorting; one noted
+    /// before the last, or joined back over the one before, is put in order
+    /// at the next look, as `joined` leaves ranges.
+    #[test]
+    fn dirty_notes_keep_order_and_join_as_before() {
+        let mut dirty = DirtyNotes::default();
+        dirty.add(0, 4);
+        dirty.add(4, 6);
+        dirty.add(10, 12);
+        assert_eq!(dirty.ranges, [(0, 6), (10, 12)]);
+        assert!(!dirty.unsorted);
+        dirty.add(7, 8);
+        assert!(dirty.unsorted);
+        dirty.add(5, 20);
+        let mut skip = Vec::new();
+        dirty.overlapping(0, 100, &mut skip);
+        assert_eq!(skip, [(0, 20)]);
+        assert!(!dirty.unsorted);
+        assert_eq!(dirty.take(), [(0, 20)]);
+        assert!(dirty.ranges.is_empty());
     }
 }
 
@@ -4329,11 +4574,7 @@ impl Shadow {
         if from >= to {
             return;
         }
-        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        match dirty.last_mut() {
-            Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
-            _ => dirty.push((from, to)),
-        }
+        card.dirty.lock().unwrap_or_else(|e| e.into_inner()).add(from, to);
     }
 
     /// A landing found piece `piece` of the copy (numbered as the compare
@@ -4549,15 +4790,15 @@ impl Shadow {
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
+        // Found in the notes by a binary search, not by a walk over all of
+        // them ([`DirtyNotes`], [`SentNotes`]).
         let skip: Vec<(usize, usize)> = {
-            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            dirty
-                .iter()
-                .copied()
-                .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
-                .filter(|&(a, b)| a < at + n && b > at)
-                .collect()
+            let mut skip = Vec::new();
+            dirty.overlapping(at, at + n, &mut skip);
+            sent.overlapping(fetched_after, at, at + n, &mut skip);
+            skip
         };
         title.clear();
         title.resize(n, 0);
@@ -5235,7 +5476,7 @@ mod window_tests {
 
 #[cfg(test)]
 mod card_merge_tests {
-    use super::{Both, Card, Dense, Shadow};
+    use super::{Both, Card, Dense, SentNotes, Shadow};
     use std::sync::Mutex;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     use windows::Win32::Graphics::Direct3D12::*;
@@ -5304,14 +5545,14 @@ mod card_merge_tests {
                 staging: staging.clone(),
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
-                sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
+                sent: Mutex::new(SentNotes(vec![(7, vec![(title_byte, title_byte + 1)])])),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
                 dense: Dense::default(),
             });
             // As `card_dirty` with the mark set by the old-way fetch.
             if let Some(card) = &shadow.card {
-                card.sent.lock().unwrap().retain(|s| s.2 > mark);
+                card.sent.lock().unwrap().drop_up_to(mark);
             }
             // Flight 6's slot: the card's bytes behind its lists, before send 7.
             let mut slot = content.clone();
@@ -5495,7 +5736,7 @@ mod card_merge_tests {
                 put_up,
             );
             assert!(written > 0);
-            let dirty = shadow.card.as_ref().map(|c| c.dirty.lock().unwrap().clone()).unwrap_or_default();
+            let dirty = shadow.card.as_ref().map(|c| c.dirty.lock().unwrap().ranges.clone()).unwrap_or_default();
             drop(shadow);
             (title, side, dirty)
         };
