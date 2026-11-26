@@ -969,6 +969,11 @@ impl Staging {
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        // `crate::census`: the texture takes what copies wrote back here.
+        if crate::census::tracking() {
+            let (at, size) = self.memory();
+            crate::census::asked(crate::census::texture_taker(at), crate::census::Taker::Texture, at, at.saturating_add(size));
+        }
         let started = std::time::Instant::now();
         let read = self.refresh_now();
         let preparing = &crate::host::PREPARING;

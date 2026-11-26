@@ -3364,6 +3364,7 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        crate::census::copy_gone(self.start, self.len);
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -3661,6 +3662,16 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    /// The copy as `crate::census` names it.
+    pub(crate) fn census(&self) -> crate::census::Which {
+        crate::census::Which {
+            id: self.id,
+            start: self.start,
+            len: self.len,
+            window: self.window,
+        }
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -3731,6 +3742,7 @@ impl Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
+        crate::census::copy_made(start, len);
         Shadow {
             buffer,
             data,
@@ -4735,6 +4747,17 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        // `crate::census`: the copy takes what other copies wrote back here.
+        if crate::census::tracking() {
+            use crate::census::Taker;
+            let kind = match (self.place.is_some(), self.window) {
+                (true, _) => Taker::InPlace,
+                (false, true) => Taker::Window,
+                (false, false) => Taker::Copy,
+            };
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            crate::census::asked(self.id, kind, address.max(start), address.saturating_add(len).min(end));
+        }
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -4918,6 +4941,9 @@ impl Shadow {
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
+        if self.card.is_some() {
+            crate::census::recopied(self.id, from, to);
+        }
         to - from
     }
 
