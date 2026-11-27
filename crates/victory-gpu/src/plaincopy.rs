@@ -97,9 +97,26 @@ pub(crate) fn on() -> bool {
 /// Copies made in place, their bytes, the copies that met a page that was
 /// not there (and went to the kernel's copy), and the copies not tried in
 /// place because their source faulted lately ([`RECENT`]) or they were
-/// under [`LEAST`] bytes, since the last line; and the fills of under
-/// [`LEAST`] bytes made in place ([`copy_short`]).
-static COUNT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// under [`LEAST`] bytes; the fills of under [`LEAST`] bytes made in place
+/// ([`copy_short`]); and the writes made in place ([`write`]), their bytes
+/// and those that fell back. Summed at the line ([`line`]).
+///
+/// VIcky (profile PF5b, D1): kept per thread ([`crate::perthread`]). They
+/// were nine adjacent shared atomics, added to twice per copy by the
+/// submitting thread, the relay, the pass over buffer views and the wide
+/// copy threads at once, each add a locked add on a line the others had
+/// just taken: 2.0 ms a frame of the submitting thread alone, in every
+/// build. The sums are the same, add for add.
+static COUNT: crate::perthread::Counters<9> = crate::perthread::Counters::new();
+const COPIES: usize = 0;
+const COPIED_BYTES: usize = 1;
+const GONE: usize = 2;
+const LATELY: usize = 3;
+const SMALL: usize = 4;
+const FILLS: usize = 5;
+const WRITES: usize = 6;
+const WRITTEN_BYTES: usize = 7;
+const WRITES_GONE: usize = 8;
 
 /// The fewest bytes copied in place. A read of a byte or a word is how the
 /// layer ASKS whether a page is there (a texture's first page, a record):
@@ -234,23 +251,22 @@ fn write_on() -> bool {
     *ON.get_or_init(|| on() && std::env::var_os("VICTORY_WRITE_PLAIN").is_none_or(|v| v != "0"))
 }
 
-/// Writes made in place, their bytes, and the writes that met an unmapped or
-/// read-only destination page (falling back to the kernel's write).
-static WRITE_COUNT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-
 /// With [`on`] (and `VICTORY_WRITE_PLAIN!=0`): writes host memory at `from`
 /// into title memory at `to` in place; false if disabled or a destination page
-/// is not writable (caller falls back to `NtWriteVirtualMemory`).
+/// is not writable (caller falls back to `NtWriteVirtualMemory`). Counted in
+/// [`COUNT`]: writes made in place, their bytes, and the writes that met an
+/// unmapped or read-only destination page (falling back to the kernel's
+/// write).
 pub(crate) fn write(to: *mut u8, from: *const u8, len: usize) -> bool {
     if !write_on() {
         return false;
     }
     let whole = guarded_write(to, from, len);
     if whole {
-        WRITE_COUNT[0].fetch_add(1, Relaxed);
-        WRITE_COUNT[1].fetch_add(len as u64, Relaxed);
+        COUNT.add(WRITES, 1);
+        COUNT.add(WRITTEN_BYTES, len as u64);
     } else {
-        WRITE_COUNT[2].fetch_add(1, Relaxed);
+        COUNT.add(WRITES_GONE, 1);
     }
     whole
 }
@@ -263,19 +279,19 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
         return false;
     }
     if len < LEAST {
-        COUNT[4].fetch_add(1, Relaxed);
+        COUNT.add(SMALL, 1);
         return false;
     }
     if faulted_lately(from as usize, len) {
-        COUNT[3].fetch_add(1, Relaxed);
+        COUNT.add(LATELY, 1);
         return false;
     }
     let whole = guarded(to, from, len);
     if whole {
-        COUNT[0].fetch_add(1, Relaxed);
-        COUNT[1].fetch_add(len as u64, Relaxed);
+        COUNT.add(COPIES, 1);
+        COUNT.add(COPIED_BYTES, len as u64);
     } else {
-        COUNT[2].fetch_add(1, Relaxed);
+        COUNT.add(GONE, 1);
         note_fault(from as usize, len);
     }
     whole
@@ -291,10 +307,10 @@ pub(crate) fn copy_run(to: *mut u8, from: *const u8, len: usize) -> bool {
     }
     let whole = guarded(to, from, len);
     if whole {
-        COUNT[0].fetch_add(1, Relaxed);
-        COUNT[1].fetch_add(len as u64, Relaxed);
+        COUNT.add(COPIES, 1);
+        COUNT.add(COPIED_BYTES, len as u64);
     } else {
-        COUNT[2].fetch_add(1, Relaxed);
+        COUNT.add(GONE, 1);
         note_fault(from as usize, len);
     }
     whole
@@ -318,14 +334,14 @@ pub(crate) fn copy_short(to: *mut u8, from: *const u8, len: usize) -> bool {
         return false;
     }
     if faulted_lately(from as usize, len) {
-        COUNT[3].fetch_add(1, Relaxed);
+        COUNT.add(LATELY, 1);
         return false;
     }
     let whole = guarded(to, from, len);
     if whole {
-        COUNT[5].fetch_add(1, Relaxed);
+        COUNT.add(FILLS, 1);
     } else {
-        COUNT[2].fetch_add(1, Relaxed);
+        COUNT.add(GONE, 1);
         note_fault(from as usize, len);
     }
     whole
@@ -401,9 +417,12 @@ pub(crate) fn line(frames: f64) {
     if !on() {
         return;
     }
+    // (Each count's total since the line before, as the shared counters'
+    // swaps to 0 gave.)
+    let taken = COUNT.take();
     let [copies, bytes, gone, lately, small, fills] =
-        [0, 1, 2, 3, 4, 5].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
-    let [writes, wbytes, wgone] = [0, 1, 2].map(|i| WRITE_COUNT[i].swap(0, Relaxed) as f64 / frames);
+        [COPIES, COPIED_BYTES, GONE, LATELY, SMALL, FILLS].map(|i| taken[i] as f64 / frames);
+    let [writes, wbytes, wgone] = [WRITES, WRITTEN_BYTES, WRITES_GONE].map(|i| taken[i] as f64 / frames);
     // (Said only with `VICTORY_FILLS_PLAIN`.)
     let fills = if fills_plain() || fills > 0.0 {
         format!("; fills of under {LEAST} bytes made in place (VICTORY_FILLS_PLAIN): {fills:.0}")
@@ -498,6 +517,32 @@ mod tests {
         assert!(to[..PAGE].iter().all(|&b| b == 0xAB));
         // SAFETY: the test's reservation.
         unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// The counts, kept per thread, reach the line once each whichever
+    /// thread added them, each in its own place: what the shared counters'
+    /// swaps to 0 gave. (No other test adds to them: they call `guarded`.)
+    #[test]
+    fn counts_of_every_thread_are_taken_once() {
+        let _ = COUNT.take();
+        std::thread::scope(|s| {
+            for t in 0..6u64 {
+                s.spawn(move || {
+                    for _ in 0..1_000 {
+                        COUNT.add(COPIES, 1);
+                        COUNT.add(COPIED_BYTES, 4096 + t);
+                        COUNT.add(WRITES_GONE, 1);
+                    }
+                });
+            }
+        });
+        let taken = COUNT.take();
+        let mut wanted = [0u64; 9];
+        wanted[COPIES] = 6_000;
+        wanted[COPIED_BYTES] = 6_000 * 4096 + 1_000 * (1 + 2 + 3 + 4 + 5);
+        wanted[WRITES_GONE] = 6_000;
+        assert_eq!(taken, wanted);
+        assert_eq!(COUNT.take(), [0; 9], "taken once");
     }
 
     /// A source that faulted is remembered by its 64 KiB blocks, and only

@@ -444,10 +444,126 @@ pub(crate) fn dense_whole() -> Option<u64> {
     })
 }
 
+/// VIcky (`VICTORY_DENSE_PAGE_FIRST=1|alt`, lever 3 of profile PF5b; off by
+/// default; needs `VICTORY_DENSE_PAGE_WHOLE=1`, and so the relay): see
+/// [`dense_first`]. `alt`: twenty seconds off, twenty on, in turn.
+static PAGE_FIRST: crate::alt::Alt = crate::alt::Alt::new(
+    "VICTORY_DENSE_PAGE_FIRST",
+    "a quiet page of a card copy that the title wrote under flights' shader writes goes up whole before its runs are counted",
+);
+
+/// Whether `VICTORY_DENSE_PAGE_FIRST` is set (`1` or `alt`) and can work:
+/// with [`dense_whole`], whose rules and counts it shares.
+pub(crate) fn dense_first_set() -> bool {
+    static SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
+        if !PAGE_FIRST.set() {
+            return false;
+        }
+        if dense_whole().is_none() {
+            tracing::warn!(
+                "VICTORY_DENSE_PAGE_FIRST needs VICTORY_DENSE_PAGE_WHOLE=1 (and the relay): off, the pages' runs go up as before"
+            );
+            return false;
+        }
+        true
+    })
+}
+
+/// VIcky: a page of a copy in the card's memory that the title wrote while
+/// flights that may write it are in the air goes up whole, before its runs
+/// are counted, whatever their number, if the card's compare has not found
+/// its piece written by shaders for this many frames ([`dense_whole`]'s,
+/// `VICTORY_DENSE_PAGE_WHOLE_FRAMES`, 64), as [`dense_whole`] does only for
+/// a page with more runs than are left (`VICTORY_DENSE_PAGE_FIRST=1|alt`,
+/// [`PAGE_FIRST`]; `None` while off, or in an `alt` phase off).
+///
+/// Profile PF5b (lever 3): under flights, about 400 such pages a frame gave
+/// 13,500 changed runs of about 14 bytes, each a note, a range and a copy
+/// of its own on the queue (`crate::host`'s `card_before`: "sent up in
+/// 13,768 ranges"), most of `card_before` (14.5 ms of the submitting
+/// thread) and of the look for them (`stale_under_flights`, 12.7 ms, the
+/// compare 4.9 of it); [`dense_whole`] took only the 95 pages over the
+/// runs left.
+///
+/// The page goes onto the list [`whole_pages_done`] puts up when nothing
+/// settles the flights, with the same rules: only a quiet piece, never a
+/// page holding shaders' bytes left on the card (`VICTORY_SKIP_WC_BACK`),
+/// queued behind the flights in the air and ahead of the next lists, noted
+/// as sent whole so that a landing that finds its piece written by those
+/// flights counts it ([`whole_overwritten`], "must stay about 0"); dropped
+/// if the flights are settled all the same. Where it is put in
+/// ([`Shadow::card_put_whole`]) its runs are counted against the CPU's
+/// side, on the title bytes read there: with fewer than
+/// [`dense_first_runs`] it goes up as its runs instead, as under the cap,
+/// and with none nothing goes up, as before.
+///
+/// What it gives up is what [`dense_whole`] gives up, on three to four
+/// times as many pages: a whole page takes the title's bytes everywhere in
+/// it, also where a flight still in the air has its shaders write a byte
+/// the title did not change, if that piece was quiet for 64 frames.
+pub(crate) fn dense_first() -> Option<u64> {
+    if !dense_first_set() || !PAGE_FIRST.on() {
+        return None;
+    }
+    dense_whole()
+}
+
+/// The fewest runs a page [`dense_first`] took goes up whole with
+/// (`VICTORY_DENSE_PAGE_FIRST_RUNS`, 2 by default, at least 1): with fewer
+/// it goes up as its runs. One run is one range either way, and fewer bytes
+/// and no shader write gone over as itself.
+fn dense_first_runs() -> usize {
+    static RUNS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RUNS.get_or_init(|| {
+        std::env::var("VICTORY_DENSE_PAGE_FIRST_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(2, |n| n.max(1))
+    })
+}
+
+/// [`dense_first`], since the last frame-rate line: pages sent up whole,
+/// their bytes and the changed runs they held; pages with fewer runs than
+/// [`dense_first_runs`] sent as their runs, and those runs; pages with
+/// nothing changed; pages found but not sent because the flights were
+/// settled all the same. Only the submitting thread adds to them.
+static FIRST: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+const FIRST_WHOLE: usize = 0;
+const FIRST_BYTES: usize = 1;
+const FIRST_RUNS: usize = 2;
+const FIRST_FEW: usize = 3;
+const FIRST_FEW_RUNS: usize = 4;
+const FIRST_NONE: usize = 5;
+const FIRST_DROPPED: usize = 6;
+
+/// [`dense_first`]'s clause of the line of title bytes put in under
+/// flights' shader writes (`crate::host`), per frame over `frames`; empty
+/// without the switch. A page sent whole is one range where its runs were
+/// as many: the copy regions saved are the runs less the pages.
+pub(crate) fn dense_first_said(frames: f64) -> String {
+    if !dense_first_set() {
+        return String::new();
+    }
+    let f = FIRST.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+    format!(
+        "; quiet pages sent up whole before their runs were counted (VICTORY_DENSE_PAGE_FIRST, {}): {:.1} pages ({:.2} MB) \
+         holding {:.0} changed runs, so {:.0} copy regions fewer; {:.1} pages with under {} runs sent as their {:.0} runs, \
+         {:.1} with nothing changed, {:.1} found but settled all the same",
+        PAGE_FIRST.said(),
+        f[FIRST_WHOLE],
+        f[FIRST_BYTES] / (1 << 20) as f64,
+        f[FIRST_RUNS],
+        f[FIRST_RUNS] - f[FIRST_WHOLE],
+        f[FIRST_FEW],
+        dense_first_runs(),
+        f[FIRST_FEW_RUNS],
+        f[FIRST_NONE],
+        f[FIRST_DROPPED],
+    )
+}
+
 /// A page [`Shadow::merge_under_writes`] found over the runs left whose
-/// piece the card's compare has not flagged lately ([`dense_whole`]): it
-/// goes up whole if nothing else settles the flights
-/// ([`whole_pages_done`]).
+/// piece the card's compare has not flagged lately ([`dense_whole`]), or
+/// any page whose piece is quiet ([`dense_first`]): it goes up whole if
+/// nothing else settles the flights ([`whole_pages_done`]).
 pub(crate) struct WholePage {
     /// Title memory `[lo, hi)`: the page's part in the declared range.
     lo: usize,
@@ -459,6 +575,8 @@ pub(crate) struct WholePage {
     /// The range holds all of the page that is in the copy: once up, the
     /// page is noted as taken at `now`.
     all: bool,
+    /// Taken by [`dense_first`], its runs not counted yet.
+    first: bool,
 }
 
 /// [`dense_whole`], since the last frame-rate line: pages sent up whole and
@@ -498,12 +616,16 @@ pub(crate) fn whole_pages_done(pages: Vec<(Arc<Shadow>, Vec<WholePage>)>, settle
         return;
     }
     if settled {
-        DENSE[DENSE_DROPPED].fetch_add(pages.iter().map(|p| p.1.len() as u64).sum(), Ordering::Relaxed);
+        let first: u64 = pages.iter().map(|p| p.1.iter().filter(|w| w.first).count() as u64).sum();
+        let all: u64 = pages.iter().map(|p| p.1.len() as u64).sum();
+        DENSE[DENSE_DROPPED].fetch_add(all - first, Ordering::Relaxed);
+        FIRST[FIRST_DROPPED].fetch_add(first, Ordering::Relaxed);
         return;
     }
     // The send that takes them: the next one (`Host::card_before`, later
     // in this submission, under the same submission lock).
     let order = crate::host::queue_order() + 1;
+    // (Pages over the runs left; those of [`dense_first`] are counted apart.)
     let sent: u64 = pages.into_iter().map(|(shadow, pages)| shadow.card_put_whole(pages, order)).sum();
     if sent > 0 {
         DENSE[DENSE_AVOIDED].fetch_add(1, Ordering::Relaxed);
@@ -3414,27 +3536,127 @@ fn under_runs(title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
-    let n = now.len().min(was.len());
     let mut runs = Vec::new();
-    let mut i = 0;
-    while i < n {
-        // Equal bytes, eight at a time while they last.
-        while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
-            i += 8;
-        }
-        while i < n && now[i] == was[i] {
-            i += 1;
-        }
-        if i >= n {
-            break;
-        }
-        let first = i;
-        while i < n && now[i] != was[i] {
-            i += 1;
-        }
-        runs.push((first, i - first));
-    }
+    each_changed_run(now, was, |at, n| runs.push((at, n)));
     runs
+}
+
+/// Calls `f(offset, bytes)` for each run of [`changed_runs`], in order.
+///
+/// VIcky (profile PF5b, D2): 64 bytes at a time. The block's bytes are
+/// compared as wide words ([`differing`]: on x86_64, four 16-byte compares),
+/// which gives a mask with a bit per byte that differs, and the runs are the
+/// mask's edges, found with `trailing_zeros`; a run open at a block's end
+/// goes on into the next. The bytes after the last whole block are
+/// compared in a block of their own padded with equal bytes. The loop
+/// before compared equal stretches eight bytes at a time but each run, and
+/// the bytes around it, one by one: `changed_runs` was 4.9 ms a frame of
+/// the submitting thread in PF5b (about 400 pages of 64 KiB looked at,
+/// 13,500 runs of 14 bytes put in, and the dense pages' runs counted).
+/// Word-at-a-time scans that start each load where the last
+/// `trailing_zeros` pointed were slower than the byte loop on short runs:
+/// every load waited for the one before; here the loads of a page do not.
+/// Same runs (`changed_runs_match_the_byte_scan_*`); timed in
+/// `changed_runs_bench`.
+#[inline]
+fn each_changed_run(now: &[u8], was: &[u8], mut f: impl FnMut(usize, usize)) {
+    let n = now.len().min(was.len());
+    let (now, was) = (&now[..n], &was[..n]);
+    // A run open at the end of the block before: where it started.
+    let mut open: Option<usize> = None;
+    let mut i = 0;
+    while let (Some(a), Some(b)) = (now[i..].first_chunk::<64>(), was[i..].first_chunk::<64>()) {
+        let mask = differing(a, b);
+        if mask != 0 || open.is_some() {
+            run_edges(i, mask, &mut open, &mut f);
+        }
+        i += 64;
+    }
+    if i < n {
+        let (mut a, mut b) = ([0u8; 64], [0u8; 64]);
+        a[..n - i].copy_from_slice(&now[i..]);
+        b[..n - i].copy_from_slice(&was[i..]);
+        run_edges(i, differing(&a, &b), &mut open, &mut f);
+    }
+    // A run to the very end (of a length a multiple of 64).
+    if let Some(start) = open {
+        f(start, n - start);
+    }
+}
+
+/// [`each_changed_run`] in the block at offset `at` whose byte `k` differs
+/// where bit `k` of `mask` is set; `open`: where a run open at the block's
+/// start started, and after, where one open at its end did.
+#[inline(always)]
+fn run_edges(at: usize, mask: u64, open: &mut Option<usize>, f: &mut impl FnMut(usize, usize)) {
+    // The bits below `from` are done (always under 64).
+    let mut from = 0u32;
+    loop {
+        if let Some(start) = *open {
+            let equal = !mask & (u64::MAX << from);
+            if equal == 0 {
+                return;
+            }
+            let end = equal.trailing_zeros();
+            f(start, at + end as usize - start);
+            *open = None;
+            from = end;
+        }
+        let unequal = mask & (u64::MAX << from);
+        if unequal == 0 {
+            return;
+        }
+        let start = unequal.trailing_zeros();
+        *open = Some(at + start as usize);
+        from = start;
+    }
+}
+
+/// Bit `k` set where byte `k` of `a` and `b` differ: four 16-byte compares
+/// (SSE2, which every x86_64 processor has).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn differing(a: &[u8; 64], b: &[u8; 64]) -> u64 {
+    use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+    let mut mask = 0u64;
+    for k in 0..4 {
+        // SAFETY: the 16 bytes at 16 k (k < 4) of two 64-byte arrays, read
+        // unaligned; SSE2 is part of x86_64.
+        let equal = unsafe {
+            let x = _mm_loadu_si128(a.as_ptr().add(16 * k).cast());
+            let y = _mm_loadu_si128(b.as_ptr().add(16 * k).cast());
+            _mm_movemask_epi8(_mm_cmpeq_epi8(x, y)) as u32 as u64
+        };
+        mask |= (!equal & 0xffff) << (16 * k);
+    }
+    mask
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn differing(a: &[u8; 64], b: &[u8; 64]) -> u64 {
+    differing_by_words(a, b)
+}
+
+/// [`differing`] eight bytes at a time, in plain words (where there is no
+/// SSE2; the tests hold the two against each other).
+#[cfg(any(test, not(target_arch = "x86_64")))]
+#[inline(always)]
+fn differing_by_words(a: &[u8; 64], b: &[u8; 64]) -> u64 {
+    const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    const HIGH: u64 = !LOW7;
+    let mut mask = 0u64;
+    for (k, (x, y)) in a.as_chunks::<8>().0.iter().zip(b.as_chunks::<8>().0).enumerate() {
+        let x = u64::from_le_bytes(*x) ^ u64::from_le_bytes(*y);
+        // Per byte, the high bit set where the byte is not 0: its low seven
+        // bits plus 0x7f carry into it unless they are all 0 (never out of
+        // the byte: at most 0xfe), and its own high bit is or-ed in.
+        let unequal = (((x & LOW7) + LOW7) | x) & HIGH;
+        // Those eight bits gathered into the top byte, byte j's at bit j
+        // (each product's bit lands alone: no carries).
+        mask |= ((unequal >> 7).wrapping_mul(0x0102_0408_1020_4080) >> 56) << (8 * k);
+    }
+    mask
 }
 
 #[cfg(test)]
@@ -3551,6 +3773,258 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    /// The runs as a byte-by-byte scan finds them: the reference for
+    /// [`changed_runs`], which finds them eight bytes at a time.
+    fn runs_byte_by_byte(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+        let n = now.len().min(was.len());
+        let mut runs = Vec::new();
+        let mut i = 0;
+        while i < n {
+            if now[i] == was[i] {
+                i += 1;
+                continue;
+            }
+            let first = i;
+            while i < n && now[i] != was[i] {
+                i += 1;
+            }
+            runs.push((first, i - first));
+        }
+        runs
+    }
+
+    /// A little generator of the test's own (no crate for it).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+    }
+
+    /// The bytes a change xors in: the low bit, the high bit, all bits and
+    /// the others, so that the word's test for a byte of 0 meets each.
+    const FLIPS: [u8; 6] = [0x01, 0x80, 0xff, 0x7f, 0x40, 0xfe];
+
+    /// One run of every length at every place, in slices of every length
+    /// from 0 to 40 and of 63 to 65, 127 to 129, 192 and 200 bytes (one to
+    /// three blocks of 64, and a padded rest), with both sides at each of
+    /// the eight alignments in memory (`now` at `a`, `was` at another); and
+    /// two runs with every gap of 1 to 70 bytes between them, the first
+    /// starting at every place of a block: the same runs as the byte scan.
+    #[test]
+    fn changed_runs_match_the_byte_scan_at_every_alignment() {
+        let base: Vec<u8> = (0..256u32).map(|i| (i * 13 + 5) as u8).collect();
+        let lengths = (0..=40usize).chain([63, 64, 65, 127, 128, 129, 192, 200]);
+        for len in lengths {
+            for a in 0..8usize {
+                let b = (a * 5 + 3) % 8;
+                let mut was_buffer = vec![0u8; len + 16];
+                was_buffer[b..b + len].copy_from_slice(&base[..len]);
+                let was = &was_buffer[b..b + len];
+                let mut now_buffer = vec![0u8; len + 16];
+                // No change.
+                now_buffer[a..a + len].copy_from_slice(was);
+                assert!(changed_runs(&now_buffer[a..a + len], was).is_empty(), "{len} {a}");
+                // (The longest slices at two alignments: the runs' places
+                // in their blocks are what matters there.)
+                if len > 64 && a % 4 != 1 {
+                    continue;
+                }
+                for start in 0..len {
+                    for k in 1..=len - start {
+                        now_buffer[a..a + len].copy_from_slice(was);
+                        for (j, byte) in now_buffer[a + start..a + start + k].iter_mut().enumerate() {
+                            *byte ^= FLIPS[(start + j + k) % FLIPS.len()];
+                        }
+                        let now = &now_buffer[a..a + len];
+                        let runs = changed_runs(now, was);
+                        assert_eq!(runs, [(start, k)], "len {len}, alignment {a}/{b}, run {start}+{k}");
+                        assert_eq!(runs, runs_byte_by_byte(now, was));
+                    }
+                }
+            }
+        }
+        // Two runs, every gap.
+        let len = 200;
+        let was = &base[..len];
+        for first in 0..64 {
+            for k1 in [1, 3, 9] {
+                for gap in 1..=70 {
+                    for k2 in [1, 5, 64] {
+                        let second = first + k1 + gap;
+                        if second + k2 > len {
+                            continue;
+                        }
+                        let mut now = was.to_vec();
+                        for at in (first..first + k1).chain(second..second + k2) {
+                            now[at] ^= FLIPS[at % FLIPS.len()];
+                        }
+                        let runs = changed_runs(&now, was);
+                        assert_eq!(runs, [(first, k1), (second, k2)], "{first}+{k1}, gap {gap}, +{k2}");
+                        for g in [0, gap - 1, gap, gap + 1] {
+                            let joined = super::joined_over(runs.clone(), g);
+                            assert_eq!(joined.len(), if gap <= g { 1 } else { 2 }, "gap {gap} joined over {g}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The masks of a block's differing bytes: SSE2's (on x86_64) and the
+    /// plain words' agree, for every byte alone with every kind of change
+    /// and at random.
+    #[test]
+    fn block_masks_agree() {
+        let mut rng = Lcg(99);
+        let was: [u8; 64] = std::array::from_fn(|_| rng.next() as u8);
+        assert_eq!(super::differing(&was, &was), 0);
+        assert_eq!(super::differing_by_words(&was, &was), 0);
+        for at in 0..64 {
+            for flip in FLIPS {
+                let mut now = was;
+                now[at] ^= flip;
+                assert_eq!(super::differing(&now, &was), 1 << at, "{at} {flip:#x}");
+                assert_eq!(super::differing_by_words(&now, &was), 1 << at, "{at} {flip:#x}");
+            }
+        }
+        for _ in 0..20_000 {
+            let mut now = was;
+            let mut wanted = 0u64;
+            for (at, byte) in now.iter_mut().enumerate() {
+                if rng.next() % 3 == 0 {
+                    *byte ^= FLIPS[(rng.next() % FLIPS.len() as u64) as usize];
+                    wanted |= 1 << at;
+                }
+            }
+            assert_eq!(super::differing(&now, &was), wanted);
+            assert_eq!(super::differing_by_words(&now, &was), wanted);
+        }
+    }
+
+    /// Changes at random, from every fourth byte to one in 64, in slices of
+    /// every length from 0 to 200 at every pair of alignments, and whole
+    /// 64 KiB pages: the same runs as the byte scan.
+    #[test]
+    fn changed_runs_match_the_byte_scan_at_random() {
+        let mut rng = Lcg(0x5eed);
+        let base: Vec<u8> = (0..(64usize << 10) + 16).map(|_| rng.next() as u8).collect();
+        let check = |now: &[u8], was: &[u8], what: &str| {
+            let runs = changed_runs(now, was);
+            let wanted = runs_byte_by_byte(now, was);
+            assert_eq!(runs, wanted, "{what}");
+        };
+        for one_in in [2u64, 4, 16, 64] {
+            for len in 0..=200usize {
+                for a in 0..8usize {
+                    for b in 0..8usize {
+                        let was = &base[b..b + len];
+                        let mut now_buffer = vec![0u8; len + 8];
+                        now_buffer[a..a + len].copy_from_slice(was);
+                        for i in 0..len {
+                            if rng.next() % one_in == 0 {
+                                now_buffer[a + i] ^= FLIPS[(rng.next() % FLIPS.len() as u64) as usize];
+                            }
+                        }
+                        check(&now_buffer[a..a + len], was, &format!("1 in {one_in}, len {len}, alignment {a}/{b}"));
+                    }
+                }
+            }
+            // A whole page, both sides off the word's alignment.
+            let len = 64usize << 10;
+            let was = &base[3..3 + len];
+            let mut now_buffer = vec![0u8; len + 8];
+            now_buffer[5..5 + len].copy_from_slice(was);
+            for i in 0..len {
+                if rng.next() % one_in == 0 {
+                    now_buffer[5 + i] ^= FLIPS[(rng.next() % FLIPS.len() as u64) as usize];
+                }
+            }
+            check(&now_buffer[5..5 + len], was, &format!("1 in {one_in}, a whole page"));
+        }
+        // Sides of two lengths: only the common length is compared.
+        assert_eq!(changed_runs(&[1, 2, 3, 4, 5, 6, 7, 8, 9], &[1, 0, 3]), [(1, 1)]);
+        assert_eq!(changed_runs(&[1, 0, 3], &[1, 2, 3, 4, 5, 6, 7, 8, 9]), [(1, 1)]);
+        // All differ.
+        assert_eq!(changed_runs(&[0xffu8; 23], &[0u8; 23]), [(0, 23)]);
+    }
+
+    /// Micro-benchmark (`cargo test -p victory-gpu --release changed_runs_bench -- --ignored --nocapture`):
+    /// the byte scan of before (equal stretches eight bytes at a time, each
+    /// run byte by byte) against [`changed_runs`], on 64 KiB pages with runs
+    /// of 14 bytes about every 100 (PF5b's shape), of 1-3 bytes every 7 to
+    /// 11 (RT66d's dense table), and with no change; ns a page and MB/s.
+    #[test]
+    #[ignore = "a benchmark: run alone, with --nocapture"]
+    fn changed_runs_bench() {
+        fn before(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+            let n = now.len().min(was.len());
+            let mut runs = Vec::new();
+            let mut i = 0;
+            while i < n {
+                while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
+                    i += 8;
+                }
+                while i < n && now[i] == was[i] {
+                    i += 1;
+                }
+                if i >= n {
+                    break;
+                }
+                let first = i;
+                while i < n && now[i] != was[i] {
+                    i += 1;
+                }
+                runs.push((first, i - first));
+            }
+            runs
+        }
+        let mut rng = Lcg(7);
+        let len = 64usize << 10;
+        let was: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+        let shaped = |every: (u64, u64), run: (u64, u64), rng: &mut Lcg| {
+            let mut now = was.clone();
+            let mut i = (rng.next() % every.1) as usize;
+            while i < len {
+                let n = (run.0 + rng.next() % (run.1 - run.0 + 1)) as usize;
+                for b in &mut now[i..(i + n).min(len)] {
+                    *b ^= 0x5a;
+                }
+                i += n + (every.0 + rng.next() % (every.1 - every.0 + 1)) as usize;
+            }
+            now
+        };
+        let cases = [
+            ("runs of 14 bytes about every 100", shaped((60, 140), (10, 18), &mut rng)),
+            ("runs of 1-3 bytes every 7-11", shaped((4, 8), (1, 3), &mut rng)),
+            ("no change", was.clone()),
+        ];
+        for (what, now) in &cases {
+            assert_eq!(before(now, &was), changed_runs(now, &was));
+            let time = |f: &dyn Fn() -> usize| {
+                let rounds = 400;
+                let started = std::time::Instant::now();
+                let mut sink = 0;
+                for _ in 0..rounds {
+                    sink += f();
+                }
+                std::hint::black_box(sink);
+                started.elapsed().as_nanos() as f64 / rounds as f64
+            };
+            let old = time(&|| before(std::hint::black_box(now), &was).len());
+            let new = time(&|| changed_runs(std::hint::black_box(now), &was).len());
+            let runs = changed_runs(now, &was).len();
+            println!(
+                "changed_runs bench, 64 KiB page, {what} ({runs} runs): before {old:.0} ns ({:.0} MB/s), now {new:.0} ns ({:.0} MB/s, \
+                 {:.1}x)",
+                len as f64 / old * 1e3,
+                len as f64 / new * 1e3,
+                old / new
+            );
+        }
     }
 }
 
@@ -4740,13 +5214,28 @@ impl Shadow {
     /// its runs put into the CPU's side as under the cap and is noted to be
     /// patched on the card ([`PatchPage`]) instead of settling the flights
     /// (it takes one run of what is left).
+    ///
+    /// VIcky ([`dense_first`]): a page of a copy in the card's memory whose
+    /// piece is quiet goes onto `whole` first, its runs not counted (it
+    /// takes one run of what is left).
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize, whole: &mut Vec<WholePage>) -> bool {
-        self.merge_under_writes_as(address, len, runs_left, whole, dense_patch())
+        self.merge_under_writes_as(address, len, runs_left, whole, dense_patch(), dense_first())
     }
 
     /// [`Shadow::merge_under_writes`], with pages over the runs left patched
-    /// on the card if `patch`.
-    fn merge_under_writes_as(&self, address: usize, len: usize, runs_left: &mut usize, whole: &mut Vec<WholePage>, patch: bool) -> bool {
+    /// on the card if `patch`, and with `first` ([`dense_first`]'s frames)
+    /// pages whose piece is that quiet put on `whole` before their runs are
+    /// counted.
+    fn merge_under_writes_as(
+        &self,
+        address: usize,
+        len: usize,
+        runs_left: &mut usize,
+        whole: &mut Vec<WholePage>,
+        patch: bool,
+        first: Option<u64>,
+    ) -> bool {
+        let first = first.filter(|_| self.card.is_some());
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -4789,6 +5278,22 @@ impl Shadow {
                 if lo >= hi {
                     continue;
                 }
+                // VIcky (`VICTORY_DENSE_PAGE_FIRST`): a quiet page goes up
+                // whole, under the rules of the branch for a page over the
+                // runs left below; title memory is read, and the runs
+                // counted, where the caller puts it in (`card_put_whole`).
+                // Counted as looked at, so that the line's pages are the
+                // same with the switch and without.
+                if let Some(frames) = first
+                    && self.card_quiet(page, frames)
+                    && crate::census::stale_pages(self.id, lo, hi).is_empty()
+                {
+                    let all = (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e;
+                    whole.push(WholePage { lo, hi, page, now, all, first: true });
+                    *runs_left = runs_left.saturating_sub(1);
+                    MERGED[0].fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 let n = hi - lo;
                 let title = &mut title[..n];
                 // The lock of the copy's reference (the snapshot, or the
@@ -4824,7 +5329,7 @@ impl Shadow {
                             && crate::census::stale_pages(self.id, lo, hi).is_empty()
                         {
                             let all = (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e;
-                            whole.push(WholePage { lo, hi, page, now, all });
+                            whole.push(WholePage { lo, hi, page, now, all, first: false });
                             *runs_left = runs_left.saturating_sub(1);
                             continue;
                         }
@@ -5385,7 +5890,15 @@ impl Shadow {
     /// `order` it is noted as sent whole ([`Dense::whole`]), and taken at
     /// its asking if its range held all of it. A page that is not there is
     /// left as it is (stale, looked at again next time). Returns the pages
-    /// put in.
+    /// put in, of those over the runs left ([`dense_first`]'s are counted
+    /// in [`FIRST`]).
+    ///
+    /// A page of [`dense_first`] has its runs counted here first, against
+    /// the CPU's side as [`Shadow::merge_under_writes`] counts them: with
+    /// none nothing goes up and it is only taken; with fewer than
+    /// [`dense_first_runs`] they go up as runs, as under the cap; else it
+    /// goes up whole as above. Either way the CPU's side takes the runs
+    /// only (the bytes between are equal already).
     fn card_put_whole(&self, mut pages: Vec<WholePage>, order: u64) -> u64 {
         let Some(card) = &self.card else {
             return 0;
@@ -5410,10 +5923,39 @@ impl Shadow {
             // `hi` lie in the copy), which only the submitting thread
             // writes, and the relay's merges under the lock held here.
             let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-            held.copy_from_slice(title);
-            self.card_changed(at, at + n);
-            if let Some(whole) = card.dense.whole.get(p.page - start / PIECE) {
-                whole.store(order, Ordering::Relaxed);
+            if p.first {
+                let runs = under_runs(title, held);
+                for &(r, m) in &runs {
+                    held[r..r + m].copy_from_slice(&title[r..r + m]);
+                }
+                if runs.is_empty() {
+                    FIRST[FIRST_NONE].fetch_add(1, Ordering::Relaxed);
+                } else if runs.len() < dense_first_runs() {
+                    for &(r, m) in &runs {
+                        self.card_changed(at + r, at + r + m);
+                        MERGED[1].fetch_add(1, Ordering::Relaxed);
+                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    }
+                    FIRST[FIRST_FEW].fetch_add(1, Ordering::Relaxed);
+                    FIRST[FIRST_FEW_RUNS].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                } else {
+                    self.card_changed(at, at + n);
+                    if let Some(whole) = card.dense.whole.get(p.page - start / PIECE) {
+                        whole.store(order, Ordering::Relaxed);
+                    }
+                    FIRST[FIRST_WHOLE].fetch_add(1, Ordering::Relaxed);
+                    FIRST[FIRST_BYTES].fetch_add(n as u64, Ordering::Relaxed);
+                    FIRST[FIRST_RUNS].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                }
+            } else {
+                held.copy_from_slice(title);
+                self.card_changed(at, at + n);
+                if let Some(whole) = card.dense.whole.get(p.page - start / PIECE) {
+                    whole.store(order, Ordering::Relaxed);
+                }
+                DENSE[DENSE_PAGES].fetch_add(1, Ordering::Relaxed);
+                DENSE[DENSE_BYTES].fetch_add(n as u64, Ordering::Relaxed);
+                put += 1;
             }
             drop(before);
             if p.all {
@@ -5422,9 +5964,6 @@ impl Shadow {
                     *at = p.now;
                 }
             }
-            DENSE[DENSE_PAGES].fetch_add(1, Ordering::Relaxed);
-            DENSE[DENSE_BYTES].fetch_add(n as u64, Ordering::Relaxed);
-            put += 1;
         }
         put
     }
@@ -6867,6 +7406,7 @@ mod card_merge_tests {
             page,
             now: 77,
             all: true,
+            first: false,
         };
         let order = 9;
         assert_eq!(shadow.card_put_whole(vec![whole], order), 1);
@@ -6935,14 +7475,14 @@ mod card_merge_tests {
         let mut side = content.clone();
         let shadow = shadow_of(title, &mut side);
         let mut left = 512;
-        assert!(shadow.merge_under_writes_as(title as usize, LEN, &mut left, &mut Vec::new(), false));
+        assert!(shadow.merge_under_writes_as(title as usize, LEN, &mut left, &mut Vec::new(), false, None));
         drop(shadow);
         assert_eq!(side, content);
         // With it: no settle.
         let mut side = content.clone();
         let shadow = shadow_of(title, &mut side);
         let mut left = 512;
-        assert!(!shadow.merge_under_writes_as(title as usize, LEN, &mut left, &mut Vec::new(), true), "no settle");
+        assert!(!shadow.merge_under_writes_as(title as usize, LEN, &mut left, &mut Vec::new(), true, None), "no settle");
         assert_eq!(left, 512 - 1 - 3);
         let card = shadow.card.as_ref().unwrap();
         let (runs, span) = {
@@ -7002,6 +7542,101 @@ mod card_merge_tests {
         assert_eq!(memory(later), after[later], "written after the patch: merged");
         assert_eq!(memory(both), wanted[both]);
         drop(shadow);
+        // SAFETY: ours, no longer used.
+        unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// VIcky (`VICTORY_DENSE_PAGE_FIRST`), on a real copy in the card's
+    /// memory and write-watched title memory: three pages the title wrote
+    /// (a field of every 12-byte record rewritten; one byte; the same bytes
+    /// again). Without the switch, or with no piece quiet, the first page
+    /// is over the runs left and settles, nothing put in. With every piece
+    /// quiet, `merge_under_writes` asks for no settle and puts nothing in:
+    /// the three pages are left to go up, a run of what is left each. Put
+    /// in, the dense page goes up whole and is noted as sent whole, the
+    /// one-byte page goes up as its run, the unchanged one not at all; all
+    /// three are taken, and the CPU's side holds title memory.
+    #[test]
+    fn a_quiet_page_goes_up_whole_before_its_runs_are_counted() {
+        use super::{FIRST, FIRST_FEW, FIRST_FEW_RUNS, FIRST_NONE, FIRST_RUNS, FIRST_WHOLE};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const LEN: usize = 3 * PAGE;
+        let content: Vec<u8> = (0..LEN).map(|i| (i * 7 + 3) as u8).collect();
+        let shadow_of = |title: *mut u8, side: &mut Vec<u8>| {
+            let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title as u64, LEN as u64);
+            let pieces = || (0..5).map(|_| AtomicU64::new(0)).collect();
+            shadow.card = Some(Card {
+                staging: staging.clone(),
+                before: Mutex::new(None),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                // 0: no card bytes counted (`Drop` takes them off again).
+                size: 0,
+                dense: Dense {
+                    made: 0,
+                    flagged: pieces(),
+                    whole: pieces(),
+                },
+            });
+            *shadow.pending.lock().unwrap() = vec![(title as usize, title as usize + LEN)];
+            shadow
+        };
+        // Title memory, write-watched as the title's is (on a 64 KiB
+        // boundary, as every allocation).
+        // SAFETY: a plain allocation of our own.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!title.is_null());
+        let mut wanted = content.clone();
+        let dense: Vec<usize> = (4..PAGE).step_by(12).collect();
+        for &i in dense.iter().chain(&[PAGE + 500]) {
+            wanted[i] ^= 0x3c;
+        }
+        // SAFETY: inside the allocation, ours alone (all three pages written).
+        unsafe { std::ptr::copy_nonoverlapping(wanted.as_ptr(), title, LEN) };
+        // Without the switch, and with it but no piece quiet: settled.
+        for first in [None, Some(u64::MAX)] {
+            let mut side = content.clone();
+            let shadow = shadow_of(title, &mut side);
+            let (mut left, mut whole) = (512, Vec::new());
+            assert!(shadow.merge_under_writes_as(title as usize, LEN, &mut left, &mut whole, false, first), "{first:?}");
+            assert!(whole.is_empty());
+            drop(shadow);
+            assert_eq!(side, content);
+        }
+        // Every piece quiet: no settle, and nothing put in yet.
+        let mut side = content.clone();
+        let shadow = shadow_of(title, &mut side);
+        let (mut left, mut whole) = (512, Vec::new());
+        assert!(!shadow.merge_under_writes_as(title as usize, LEN, &mut left, &mut whole, false, Some(0)), "no settle");
+        assert_eq!(left, 512 - 3);
+        let at = title as usize;
+        let found: Vec<_> = whole.iter().map(|w| (w.lo - at, w.hi - at, w.page - at / PAGE, w.first, w.all)).collect();
+        assert_eq!(found, [(0, PAGE, 0, true, true), (PAGE, 2 * PAGE, 1, true, true), (2 * PAGE, 3 * PAGE, 2, true, true)]);
+        let card = shadow.card.as_ref().unwrap();
+        assert!(card.dirty.lock().unwrap().ranges.is_empty(), "nothing noted yet");
+        // SAFETY: inside `side`, which the shadow maps; nothing else
+        // touches it meanwhile.
+        let side_now = |at: usize| unsafe { *shadow.data.add(at) };
+        assert_eq!(side_now(4), content[4], "nothing put in yet");
+        // Put in with send 9.
+        let counted = || FIRST.each_ref().map(|n| n.load(Ordering::Relaxed));
+        let before = counted();
+        assert_eq!(shadow.card_put_whole(whole, 9), 0, "none of them over the runs left");
+        let after = counted();
+        let added = |i: usize| after[i] - before[i];
+        assert_eq!((added(FIRST_WHOLE), added(FIRST_RUNS)), (1, dense.len() as u64), "page 0 whole, holding its runs");
+        assert_eq!((added(FIRST_FEW), added(FIRST_FEW_RUNS), added(FIRST_NONE)), (1, 1, 1));
+        assert_eq!(card.dirty.lock().unwrap().ranges, [(0, PAGE), (PAGE + 500, PAGE + 501)], "page 0 whole, page 1 its run");
+        let sent: Vec<u64> = card.dense.whole.iter().take(3).map(|w| w.load(Ordering::Relaxed)).collect();
+        assert_eq!(sent, [9, 0, 0], "only page 0 noted as sent whole");
+        assert!(shadow.copied.lock().unwrap().iter().all(|&at| at > 0), "all three taken");
+        drop(shadow);
+        assert_eq!(side, wanted, "the CPU's side holds title memory");
         // SAFETY: ours, no longer used.
         unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
     }

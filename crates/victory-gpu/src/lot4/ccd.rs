@@ -351,10 +351,18 @@ fn named_threads() -> Vec<(u32, Option<String>)> {
 /// Places every thread there is a side for (`on`), or gives each placed
 /// one its CPU sets back.
 fn apply(on: bool) {
+    // VIcky (profile PF5b, D8): the walk over the system's threads comes
+    // before the lock, so a recording thread registering meanwhile
+    // ([`register`]) does not wait for it.
+    let named: Vec<(u32, Side)> = if on {
+        named_threads().into_iter().filter_map(|(id, name)| Some((id, side_of_name(name.as_deref()?)?))).collect()
+    } else {
+        Vec::new()
+    };
     let mut t = THREADS.lock().unwrap_or_else(|e| e.into_inner());
     let (mut placed, mut pinned_away) = (0, 0);
     if on {
-        let mut targets: Vec<(u32, Side)> = named_threads().into_iter().filter_map(|(id, name)| Some((id, side_of_name(name.as_deref()?)?))).collect();
+        let mut targets = named;
         for &id in &t.registered {
             if !targets.iter().any(|x| x.0 == id) {
                 targets.push((id, Side::Locks));
@@ -377,6 +385,45 @@ fn apply(on: bool) {
         }
     }
     (t.placed, t.pinned_away) = (placed, pinned_away);
+}
+
+/// Whether a placement runs beside ([`beside`]).
+static BESIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// VIcky (profile PF5b, D8): `then` after [`apply`] (`on`), on a thread of
+/// its own, not on the title's render thread inside the present that calls
+/// [`frame_ended`]. The walk over the system's threads (`named_threads`, a
+/// snapshot of every thread of every process, a handle and a description
+/// per thread of ours) took 0.35 ms a frame there on average in PF5b, that
+/// is some 50 ms in one frame every twenty seconds. The same placement,
+/// done a few milliseconds later, while the frame goes on. If the one
+/// before is still running (it never should be, twenty seconds apart),
+/// this one is done where it is asked, as before. The thread is unnamed,
+/// so it is not placed itself.
+fn beside(on: bool, then: impl FnOnce() + Send + 'static) {
+    if BESIDE.swap(true, Relaxed) {
+        apply(on);
+        then();
+        return;
+    }
+    let work = move || {
+        apply(on);
+        then();
+        BESIDE.store(false, Relaxed);
+    };
+    // (Shared with the spawn's error: run here if no thread can be made.)
+    let work = std::sync::Arc::new(Mutex::new(Some(work)));
+    let theirs = work.clone();
+    let spawned = std::thread::Builder::new().spawn(move || {
+        if let Some(work) = theirs.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            work();
+        }
+    });
+    if spawned.is_err()
+        && let Some(work) = work.lock().unwrap_or_else(|e| e.into_inner()).take()
+    {
+        work();
+    }
 }
 
 /// What the phase so far took: frames, and summed over them the frame,
@@ -412,16 +459,17 @@ pub(crate) fn frame_ended(us: f64, at_work_us: f64, record_ns: f64, longest_ns: 
             let first = p.placed_at.is_none();
             p.placed_at = Some(now);
             drop(p);
-            apply(true);
-            let t = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-            if first {
-                tracing::info!(
-                    "threads placed by CCD (VICTORY_CCD_PLACE=1): {} threads placed, {} of them pinned by the title to \
-                     processors of the other CCD only (their pinning wins)",
-                    t.placed,
-                    t.pinned_away
-                );
-            }
+            beside(true, move || {
+                let t = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+                if first {
+                    tracing::info!(
+                        "threads placed by CCD (VICTORY_CCD_PLACE=1): {} threads placed, {} of them pinned by the title to \
+                         processors of the other CCD only (their pinning wins)",
+                        t.placed,
+                        t.pinned_away
+                    );
+                }
+            });
         }
         return;
     }
@@ -443,31 +491,33 @@ pub(crate) fn frame_ended(us: f64, at_work_us: f64, record_ns: f64, longest_ns: 
     let made_wait = super::locks::made_wait_ns();
     p.made_wait = made_wait;
     drop(p);
-    apply(on);
-    let (placed, away) = {
-        let t = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-        (t.placed, t.pinned_away)
-    };
     let n = was.0.max(1) as f64;
     let made = if super::on() {
         format!("{:.2} ms waited for made a frame", made_wait.saturating_sub(was.2) as f64 / 1e6 / n)
     } else {
         "made's waits not counted (VICTORY_LOT4_PROBE=1 counts them)".into()
     };
-    tracing::info!(
-        "threads placed by CCD from now (VICTORY_CCD_PLACE=alt): {}; since the change before: {} frames, {:.1} ms a frame, \
-         the submit thread at work {:.1} ms, recording {:.1} ms on all threads, the longest recording thread {:.1} ms, {made}",
-        if on {
-            format!("ON, {placed} threads placed ({away} pinned by the title to the other CCD only)")
-        } else {
-            "off, every thread where the system puts it".into()
-        },
-        was.0,
-        was.1[0] / 1e3 / n,
-        was.1[1] / 1e3 / n,
-        was.1[2] / 1e3 / n,
-        was.1[3] / 1e3 / n,
-    );
+    // Said once the threads are placed (or given back), as before.
+    beside(on, move || {
+        let (placed, away) = {
+            let t = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+            (t.placed, t.pinned_away)
+        };
+        tracing::info!(
+            "threads placed by CCD from now (VICTORY_CCD_PLACE=alt): {}; since the change before: {} frames, {:.1} ms a frame, \
+             the submit thread at work {:.1} ms, recording {:.1} ms on all threads, the longest recording thread {:.1} ms, {made}",
+            if on {
+                format!("ON, {placed} threads placed ({away} pinned by the title to the other CCD only)")
+            } else {
+                "off, every thread where the system puts it".into()
+            },
+            was.0,
+            was.1[0] / 1e3 / n,
+            was.1[1] / 1e3 / n,
+            was.1[2] / 1e3 / n,
+            was.1[3] / 1e3 / n,
+        );
+    });
 }
 
 /// For P7's line: the switch and the CCDs.

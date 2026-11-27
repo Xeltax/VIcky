@@ -4302,7 +4302,7 @@ fn late_line(frames: f64) {
                     "; pages over the runs left sent up whole (VICTORY_DENSE_PAGE_WHOLE, their piece not flagged by the compare for {quiet} \
                      frames): {:.1} pages ({:.2} MB), settles avoided {:.2}, pages found but settled all the same {:.2}, pages left to \
                      settle as their piece was flagged lately {:.2}; whole pages a flight in the air then wrote (must be about 0) {:.2}, \
-                     {} since the start",
+                     {} since the start{}",
                     f(0),
                     f(1) / (1 << 20) as f64,
                     f(2),
@@ -4310,6 +4310,8 @@ fn late_line(frames: f64) {
                     f(4),
                     f(5),
                     d[6],
+                    // VIcky (`crate::shadow::dense_first`): only with the switch.
+                    crate::shadow::dense_first_said(frames),
                 )
             }
             None => String::new(),
