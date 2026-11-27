@@ -29,7 +29,10 @@ pub(crate) enum Lock {
     /// The table of views (`crate::descriptor`'s `VIEWS`): read, written.
     Views,
     ViewsWrite,
-    /// `crate::shadow`'s `BUFFERS`: the title buffers and their copies.
+    /// `crate::shadow`'s `BUFFERS`: the title buffers and their copies,
+    /// held alone (every lookup and every change before
+    /// `VICTORY_BUFFERS_STRIPES`; with it set, the lookups while it is off
+    /// and the rare readers that walk the whole table).
     Buffers,
     /// `HostHeap::placed`: the spans of placed texture views.
     Placed,
@@ -47,9 +50,20 @@ pub(crate) enum Lock {
     Guards,
     /// `Made::cache`: the made buffer views by record.
     Cache,
+    /// VIcky (`VICTORY_BUFFERS_STRIPES`, `crate::stripes`): `BUFFERS` read
+    /// on a stripe, and written (its whole lock and, with the switch set,
+    /// every stripe).
+    BuffersRead,
+    BuffersWrite,
+    /// `crate::shadow`'s `LOOSE`, the windows of title memory outside
+    /// buffers (each lookup `BUFFERS` does not answer): held alone, read on
+    /// a stripe, written (as `BUFFERS`).
+    Loose,
+    LooseRead,
+    LooseWrite,
 }
 
-const LOCKS: usize = 14;
+const LOCKS: usize = 19;
 const NAMES: [&str; LOCKS] = [
     "made (alone)",
     "made (shared, the pass's threads)",
@@ -65,6 +79,11 @@ const NAMES: [&str; LOCKS] = [
     "next (dynamic slots)",
     "guards",
     "the made views' cache",
+    "BUFFERS (read, striped)",
+    "BUFFERS (written)",
+    "windows (LOOSE)",
+    "windows (LOOSE, read, striped)",
+    "windows (LOOSE, written)",
 ];
 
 /// Per lock: taken, of them after a wait, nanoseconds waited, taken on
@@ -194,6 +213,48 @@ pub(crate) fn read<T>(lock: Lock, m: &RwLock<T>) -> RwLockReadGuard<'_, T> {
     }
 }
 
+/// Who reads the tables of host copies (`crate::stripes`): per table
+/// (`BUFFERS`, the windows), the reads by the title's threads, the heap
+/// sync (and the parallel mirror's crew), the pass over buffer views (and
+/// its threads), the submitting thread, and our other threads.
+const ROLES: usize = 5;
+const ROLE_NAMES: [&str; ROLES] =
+    ["the title's threads", "the heap sync", "the pass over buffer views", "the submitting thread", "other threads of ours"];
+static READ_BY: Counters<{ 2 * ROLES }> = Counters::new();
+
+thread_local! {
+    /// This thread's role for [`read_by`], plus one (0: not looked at yet).
+    static ROLE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// The role of a thread named `name` ([`ROLE_NAMES`]).
+fn role_of(name: Option<&str>) -> usize {
+    match name {
+        Some(n) if n.starts_with("victory-heap-sync") || n.starts_with("victory-mirror-") => 1,
+        Some(n) if n.starts_with("victory-heap-pass") => 2,
+        Some(n) if n.starts_with("victory-submit") => 3,
+        Some(n) if n.starts_with("victory") => 4,
+        _ => 0,
+    }
+}
+
+/// A read of the table counted as `alone` (`Lock::Buffers` or
+/// `Lock::Loose`), whatever the lock it takes, by this thread's role.
+#[inline]
+pub(crate) fn read_by(alone: Lock) {
+    if !super::on() {
+        return;
+    }
+    let table = usize::from(alone == Lock::Loose);
+    let role = ROLE.with(|r| {
+        if r.get() == 0 {
+            r.set(role_of(std::thread::current().name()) as u8 + 1);
+        }
+        usize::from(r.get() - 1)
+    });
+    READ_BY.add(table * ROLES + role, 1);
+}
+
 /// Nanoseconds waited for `made` (alone, shared, its pieces) since the
 /// start, for [`super::ccd`]'s phase lines.
 pub(crate) fn made_wait_ns() -> u64 {
@@ -250,6 +311,18 @@ mod tests {
         let rw = RwLock::new(5u32);
         *write(Lock::Made, &rw) += 1;
         assert_eq!(*read(Lock::Made, &rw), 6);
+    }
+
+    /// The readers of the tables of copies are told apart by thread name.
+    #[test]
+    fn readers_by_thread_name() {
+        assert_eq!(role_of(Some("victory-heap-sync")), 1);
+        assert_eq!(role_of(Some("victory-mirror-3")), 1);
+        assert_eq!(role_of(Some("victory-heap-pass-2")), 2);
+        assert_eq!(role_of(Some("victory-submit")), 3);
+        assert_eq!(role_of(Some("victory-relay")), 4);
+        assert_eq!(role_of(Some("worker")), 0);
+        assert_eq!(role_of(None), 0);
     }
 
     /// What a counted lock site costs with the probes off (tests run

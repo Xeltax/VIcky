@@ -1,6 +1,7 @@
 //! VIcky: opt-in switches with an `alt` mode, for the ports of lot 4
 //! (`VICTORY_SPANS_QUICK`, `VICTORY_SYNC_FINE`, `VICTORY_CARD_AWAKE`,
 //! `VICTORY_HELPER_PRIORITY`, `VICTORY_WIDE_THREADS`, `VICTORY_JOIN_COPIES`;
+//! the lock levers `VICTORY_BUFFERS_STRIPES` and `VICTORY_MADE_TURNS`;
 //! `VICTORY_TEXTURE_BACK_ASYNC` uses texback's own, of the same form).
 //!
 //! Unset or `0`: off (the default, as before). `1`: on. `alt`: twenty
@@ -55,7 +56,11 @@ impl Alt {
             1 => true,
             _ => {
                 let on = (self.epoch.get_or_init(Instant::now).elapsed().as_secs() / 20) % 2 == 1;
-                if self.last.swap(u8::from(on), Relaxed) != u8::from(on) {
+                // Looked at before it is swapped: switches asked on every
+                // lookup (`VICTORY_BUFFERS_STRIPES`, `VICTORY_MADE_TURNS`)
+                // would otherwise write this line from every thread, every
+                // time, which is the very sharing they take away.
+                if self.last.load(Relaxed) != u8::from(on) && self.last.swap(u8::from(on), Relaxed) != u8::from(on) {
                     tracing::info!("{} from now ({}=alt): {}", self.what, self.name, if on { "ON" } else { "off, as usual" });
                 }
                 on
