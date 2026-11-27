@@ -1062,6 +1062,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         let us = started.elapsed().as_micros() as u64;
         crate::framelog::add(crate::framelog::T::ExecuteUs, us);
         crate::framelog::here(crate::framelog::H::ExecuteUs, us);
+        crate::framelog::handed_over(started);
     }
 }
 
@@ -1335,6 +1336,8 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(windows)]
     let presenting = std::time::Instant::now();
+    #[cfg(windows)]
+    crate::framelog::present_called();
     let hr = present_now(this, planes, plane_parameters);
     // VIcky: the next signal may begin the next frame (`crate::fence::sent`).
     crate::fence::sent::presented();

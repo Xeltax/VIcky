@@ -4892,10 +4892,52 @@ impl Shadow {
         self.update_free(from, to)
     }
 
+    /// Diagnostics (`VICTORY_REFRESH_FRONT_CHECK=1`, `crate::host::front`):
+    /// [`Shadow::update`] of `[address, address + len)`, and of the range's
+    /// first `most` bytes inside the buffer, how many were compared and how
+    /// many the update changed in the copy.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn update_compared(&self, address: usize, len: usize, most: usize) -> (usize, usize) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        if self.place.is_some() || from >= to {
+            self.update(address, len);
+            return (0, 0);
+        }
+        let n = (to - from).min(most);
+        // SAFETY: `[from, from + n)` lies inside the buffer, so inside the
+        // copy's mapping (read as `refresh_check` reads it).
+        let held = || unsafe { std::slice::from_raw_parts(self.data.add(from - start).cast_const(), n) };
+        let before = held().to_vec();
+        self.update(address, len);
+        let after = held();
+        let mut differed = 0;
+        for (a, b) in before.chunks(4096).zip(after.chunks(4096)) {
+            if a != b {
+                differed += a.iter().zip(b).filter(|(x, y)| x != y).count();
+            }
+        }
+        (n, differed)
+    }
+
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+            // The light refresh (`VICTORY_LIGHT_REFRESH`, after fxceless
+            // 94ed363c): nothing of the range was written that the copy
+            // does not hold, and the journal says so with nothing asked.
+            if crate::watch::light() && self.nothing_new(from, to) {
+                self.refresh_check(from, to);
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::LightNothingNew, 1);
+                    add(C::Checked, (to - from) as u64);
+                    add(C::Unchanged, (to - from) as u64);
+                }
+                return 0;
+            }
             // Checked already under the asking that stands, and the
             // journal alone answers for the range: nothing can be newer.
             let ahead = if stamp_on() { crate::watch::ahead_now(from, to) } else { None };
@@ -4907,9 +4949,22 @@ impl Shadow {
                     return 0;
                 }
             }
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            #[cfg(feature = "diagnostics")]
+            let asking = std::time::Instant::now();
+            let answer = crate::watch::writes(from, to, true);
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::WritesAsked, 1);
+                add(C::WritesNs, asking.elapsed().as_nanos() as u64);
+            }
+            if let Some((now, written)) = answer {
                 self.watched.store(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                let copying = std::time::Instant::now();
                 let copied = self.copy_stale(from, to, now, &written);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::CopyStaleNs, copying.elapsed().as_nanos() as u64);
                 if ahead == Some(now) {
                     *self.stamp.lock().unwrap_or_else(|e| e.into_inner()) = (now, from, to);
                 }
@@ -4932,6 +4987,19 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
+    }
+
+    /// Whether [`Shadow::update_free`] of `[from, to)` would copy nothing,
+    /// known without asking the kernel or the guards
+    /// (`crate::watch::nothing_new`): the memory is watched, every page of
+    /// the range was taken, and none was noted written after it was.
+    /// `false` if the refresh would have to ask.
+    fn nothing_new(&self, from: usize, to: usize) -> bool {
+        if self.watched.load(Ordering::Relaxed) != 1 {
+            return false;
+        }
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        crate::watch::nothing_new(from, to, self.start as usize / PAGE, &copied)
     }
 
     /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a

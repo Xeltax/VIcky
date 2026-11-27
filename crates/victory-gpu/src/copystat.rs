@@ -201,6 +201,55 @@ pub(crate) enum C {
     SparseReads,
     SparseReadsFailed,
     SparseQueries,
+    /// VIcky (`crate::host::front`): a submission's parts (its steps
+    /// between two that write title memory, `Step::Copy` and `Step::Run`),
+    /// the distinct (copy, part) pairs its refreshes name, of them those
+    /// whose copy is view memory the guards hold (as the submission's one
+    /// asking found it), and those refreshed again after their shaders'
+    /// first write in the part.
+    FrontParts,
+    FrontPairs,
+    FrontPairsViews,
+    FrontPairsLate,
+    /// Host copies brought up to date (`Shadow::update` from the
+    /// submission's batch), and their microseconds: all of them, of them
+    /// the ones before a step that gives a copy to shaders
+    /// (`Batch::flush_one`), and those ahead of a part's steps
+    /// (`VICTORY_REFRESH_FRONT=1`); and the front's copies left alone as up
+    /// to date in the submission already.
+    Updates,
+    UpdateUs,
+    UpdatesOne,
+    UpdateOneUs,
+    UpdatesFront,
+    UpdateFrontUs,
+    FrontKept,
+    /// `watch::writes` asked by those updates (once per stretch between the
+    /// ranges shaders are writing) and their nanoseconds; of all its
+    /// askings (textures' too), the ones the journal answered under an
+    /// asking ahead, and the nanoseconds of collecting the journal's pages
+    /// for the answers.
+    WritesAsked,
+    WritesNs,
+    WritesJournal,
+    WritesCollectNs,
+    /// Of the submission's copies time: copying the pages found written
+    /// (`Shadow::copy_stale`, nanoseconds), the fills of upload memory, the
+    /// title's buffer copies, and the kernel askings ahead of a group of
+    /// updates (microseconds).
+    CopyStaleNs,
+    FillUs,
+    CopyStepUs,
+    AskAheadUs,
+    /// The light refresh (`VICTORY_LIGHT_REFRESH`, `crate::watch::light`):
+    /// askings of view memory answered by the bits of their blocks, askings
+    /// that went to the guards, holes known by their bits found filled with
+    /// nobody telling, and updates of host copies that found nothing new
+    /// with nothing asked.
+    LightBits,
+    LightGuards,
+    LightFilled,
+    LightNothingNew,
 }
 const COUNTERS: usize = 128;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -885,7 +934,7 @@ fn log_memory() {
     let views = crate::descriptor::views_kept();
     let own: Vec<u64> = OWN.iter().map(|o| o.load(Relaxed)).collect();
     tracing::info!(
-        "memory, what holds it: {} host lists alive; their scratch memory: {} chunks {:.0} MB, of          them {} chunks {:.0} MB spare ({} taken from the spare ones so far); their other upload          buffers: {} alive {:.0} MB; windows outside buffers (grid {} KiB): {:.0} MB of their          pages ever copied, {} shown by descriptor slots {:.0} MB, {} held by lists or the pass          over the heap {:.0} MB, {} asked for without a length {:.0} MB; buffer views of the heap          whose slot showed another copy than the one brought up to date: {}; distinct views          kept: {} ({} free) {:.0} MB; our own allocations: {:.0} MB in {} blocks (under 4 KiB          {:.0} MB in {}, to 64 KiB {:.0} MB in {}, to 1 MiB {:.0} MB in {}, larger {:.0} MB in {})",
+        "memory, what holds it: {} host lists alive; their scratch memory: {} chunks {:.0} MB, of          them {} chunks {:.0} MB spare ({} taken from the spare ones so far); their other upload          buffers: {} alive {:.0} MB; windows outside buffers (grid {} KiB): {:.0} MB of their          pages ever copied, {} shown by descriptor slots {:.0} MB, {} held by lists or the pass          over the heap {:.0} MB, {} asked for without a length {:.0} MB; buffer views of the heap          whose slot showed another copy than the one brought up to date (VICTORY_HEAP_PASS_SHOWN=1): {}; distinct views          kept: {} ({} free) {:.0} MB; our own allocations: {:.0} MB in {} blocks (under 4 KiB          {:.0} MB in {}, to 64 KiB {:.0} MB in {}, to 1 MiB {:.0} MB in {}, larger {:.0} MB in {})",
         alive[0],
         alive[1],
         mb(alive[2]),
@@ -1055,6 +1104,7 @@ pub(crate) fn recorded(started: std::time::Instant) {
     crate::framelog::add(crate::framelog::T::RecordCalls, 1);
     crate::framelog::add(crate::framelog::T::RecordNs, ns);
     crate::framelog::here(crate::framelog::H::RecordNs, ns);
+    crate::framelog::recorded_here(ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
@@ -1146,6 +1196,69 @@ fn page_faults() -> u64 {
     u64::from(c.PageFaultCount)
 }
 
+/// The copies line's words beside the write-watch askings: the distinct
+/// (copy, part) pairs the submissions' refreshes name (`crate::host::front`),
+/// the bound a refresh per copy and part would bring the updates to.
+fn pairs_clause(c: &[f64]) -> String {
+    format!(
+        " ({:.0} copies by part over {:.0} parts of submissions: {:.0} of them view memory the guards hold, \
+         {:.0} refreshed again after their shaders' first write in the part)",
+        c[C::FrontPairs as usize],
+        c[C::FrontParts as usize],
+        c[C::FrontPairsViews as usize],
+        c[C::FrontPairsLate as usize],
+    )
+}
+
+/// The copies line's split of the submissions' copies time: fills, title
+/// buffer copies, askings ahead, and the updates of host copies by where
+/// they were done, with what is inside them.
+fn split_clause(c: &[f64]) -> String {
+    let ms = |v: f64| v / 1e3;
+    let front = if crate::host::front::on() {
+        format!(
+            ", {:.0} ahead of a part's steps {:.2} ms ({:.0} more left alone as up to date){}",
+            c[C::UpdatesFront as usize],
+            ms(c[C::UpdateFrontUs as usize]),
+            c[C::FrontKept as usize],
+            crate::host::front::check_clause(),
+        )
+    } else {
+        String::new()
+    };
+    let light = if crate::watch::light_kept() {
+        format!(
+            "; light refresh (VICTORY_LIGHT_REFRESH): {:.0} updates found nothing new with nothing asked, \
+             {:.0} askings of view memory answered by the bits of their blocks, {:.0} went to the guards, \
+             {:.2} holes found filled with nobody telling",
+            c[C::LightNothingNew as usize],
+            c[C::LightBits as usize],
+            c[C::LightGuards as usize],
+            c[C::LightFilled as usize],
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "copies split: fills {:.2} ms, title copies {:.2} ms, askings ahead {:.2} ms, {:.0} updates of host copies \
+         {:.2} ms ({:.0} before a shader write {:.2} ms{front}; inside them {:.0} askings of the journal or the guards \
+         {:.2} ms, pages found written copied {:.2} ms); of all askings (textures' too) {:.0} answered by the journal, \
+         collecting its pages {:.2} ms{light}",
+        ms(c[C::FillUs as usize]),
+        ms(c[C::CopyStepUs as usize]),
+        ms(c[C::AskAheadUs as usize]),
+        c[C::Updates as usize],
+        ms(c[C::UpdateUs as usize]),
+        c[C::UpdatesOne as usize],
+        ms(c[C::UpdateOneUs as usize]),
+        c[C::WritesAsked as usize],
+        c[C::WritesNs as usize] / 1e6,
+        c[C::CopyStaleNs as usize] / 1e6,
+        c[C::WritesJournal as usize],
+        c[C::WritesCollectNs as usize] / 1e6,
+    )
+}
+
 /// Logs the counters per frame, and the ranges that took most bytes. The
 /// counters run from line to line, so they are divided by the frames
 /// presented since the last line, not by `frames` (the frames of the last
@@ -1166,9 +1279,9 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
-         {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
+         {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms{}, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
-         changed, {:.1} MB hashed, {:.1} MB of them changed",
+         changed, {:.1} MB hashed, {:.1} MB of them changed; {}",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -1185,6 +1298,7 @@ pub(crate) fn log(frames: f64) {
         faults as f64 / frames,
         c[C::Watches as usize],
         ms(c[C::WatchUs as usize]),
+        pairs_clause(&c),
         mb(c[C::Checked as usize]),
         mb(c[C::Unchanged as usize]),
         c[C::Fallbacks as usize],
@@ -1192,6 +1306,7 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+        split_clause(&c),
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \

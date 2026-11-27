@@ -12,8 +12,14 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod beside;
+#[cfg(all(windows, any(test, feature = "diagnostics")))]
+pub(crate) mod burst;
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+mod kept;
+#[cfg(windows)]
+pub(crate) mod mirror_try;
 #[cfg(windows)]
 mod slot_map;
 
@@ -156,9 +162,13 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
 }
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
-/// is in a shader-visible heap.
+/// is in a shader-visible heap. `copied`: the title copied it there
+/// ([`copy_simple`]); VIcky's `VICTORY_MIRROR_TRY` may then leave it to the
+/// next heap sync ([`mirror_try`], `host::HostHeap::mirror_copy`). Else a
+/// view made by a call ([`record`]): with `VICTORY_MIRROR_TRY=2` the same
+/// (`host::HostHeap::mirror_created`).
 #[cfg(windows)]
-fn mirror(handle: u64) {
+fn mirror(handle: u64, copied: bool) {
     let Some((heap, index)) = shader_slot(handle) else {
         return;
     };
@@ -168,7 +178,13 @@ fn mirror(handle: u64) {
         Some(host) => {
             drop(pending);
             if let Some(host) = host {
-                host.mirror(index, handle, false);
+                if copied {
+                    host.mirror_copy(index, handle);
+                } else if mirror_try::created() {
+                    host.mirror_created(index, handle);
+                } else {
+                    host.mirror(index, handle, false);
+                }
             }
         }
     }
@@ -223,6 +239,13 @@ fn sync_held(asked: Option<&dyn Fn()>, started: std::time::Instant) {
     let mut counts = [0u64; 3];
     let mut page_bytes: Vec<u8> = Vec::new();
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    // VIcky (`VICTORY_MIRROR_TRY`): the slots copied while the heap's lock
+    // was held, ahead of the walk (with `asked`, once the pages are asked
+    // for, below).
+    let mut drained = 0;
+    if asked.is_none() {
+        drained += drain_deferred(&heaps);
+    }
     // With `asked`: each heap's changed pages, walked once all are asked for.
     let mut later: Vec<(&host::HostHeap, Vec<(usize, usize)>, (u64, u64), u32)> = Vec::new();
     for &(start, end, at) in heaps.iter() {
@@ -251,6 +274,7 @@ fn sync_held(asked: Option<&dyn Fn()>, started: std::time::Instant) {
     }
     if let Some(asked) = asked {
         asked();
+        drained += drain_deferred(&heaps);
     }
     for (host, ranges, at, mirrored_count) in later {
         let done = walk_heap(host, &ranges, at, mirrored_count, &mut page_bytes);
@@ -260,9 +284,32 @@ fn sync_held(asked: Option<&dyn Fn()>, started: std::time::Instant) {
     }
     drop(heaps);
     let [pages, looked, mirrored] = counts;
-    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
+    let us = started.elapsed().as_micros() as u64;
+    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, us]) {
         count.fetch_add(n, Relaxed);
     }
+    // VIcky: for the line by place in the burst.
+    #[cfg(feature = "diagnostics")]
+    burst::synced(us, mirrored + drained);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = drained;
+}
+
+/// VIcky (`VICTORY_MIRROR_TRY`, [`mirror_try`]): for every heap, the
+/// copied slots its mirror left to the sync, made now
+/// (`host::HostHeap::drain_deferred`). Whatever the mode: a heap with
+/// nothing left costs a load. Returns how many were made.
+#[cfg(windows)]
+fn drain_deferred(heaps: &[(u64, u64, usize)]) -> u64 {
+    let mut made = 0;
+    for &(_, _, at) in heaps {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(Some(host)) = heap.host.get() {
+            made += host.drain_deferred(true) as u64;
+        }
+    }
+    made
 }
 
 /// [`sync_heaps`]' walk over one heap's changed `ranges` (title slot `i`
@@ -453,20 +500,27 @@ pub(crate) fn sync_line(frames: f64) {
     fast_line(frames);
     // (Taken with the others, whether the line is said or not.)
     let beside = beside::part(frames);
-    if pages == 0 {
-        return;
+    // (VIcky, `VICTORY_MIRROR_TRY`: said with the switch on even when no
+    // heap page changed.)
+    let tried = mirror_try::part(frames);
+    if pages > 0 || !tried.is_empty() {
+        tracing::info!(
+            "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
+             {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms{}{}{}",
+            pages as f64 / frames,
+            looked as f64 / frames,
+            mirrored as f64 / frames,
+            host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
+            micros as f64 / 1000.0 / frames,
+            wide_part(frames),
+            beside,
+            tried,
+        );
     }
-    tracing::info!(
-        "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
-         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms{}{}",
-        pages as f64 / frames,
-        looked as f64 / frames,
-        mirrored as f64 / frames,
-        host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
-        micros as f64 / 1000.0 / frames,
-        wide_part(frames),
-        beside,
-    );
+    // VIcky (diagnostics): the sync and its join by the submission's place
+    // in the burst, next to it.
+    #[cfg(feature = "diagnostics")]
+    burst::line(frames);
 }
 
 /// The sync line's part for `VICTORY_HEAP_SYNC_THREADS` (empty without it).
@@ -1104,7 +1158,7 @@ fn record(handle: u64, view: View) {
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     #[cfg(windows)]
-    mirror(handle);
+    mirror(handle, false);
 }
 
 /// The title released `resource`: the views naming it go stale.
@@ -1293,7 +1347,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
         #[cfg(windows)]
         for i in 0..u64::from(count) {
-            mirror(dst + i * step);
+            mirror(dst + i * step, true);
         }
     }
 }
@@ -1655,6 +1709,87 @@ mod tests {
             let _ = started.join();
             assert!(host.made(5));
         });
+    }
+
+    /// VIcky (`VICTORY_MIRROR_TRY=1`): a descriptor copied while the host
+    /// heap's lock is held is left to the next sync, which makes it ahead
+    /// of its walk (in a heap that is not placed, which it does not walk);
+    /// one copied with the lock free is made at the call. A pass's drain
+    /// makes what was left since.
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_that_finds_the_lock_held_is_made_by_the_next_drain() {
+        let one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let none = Placement { address: 0, size: 0 };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            mirror_try::TEST_MODE.set(Some(mirror_try::Mode::Try));
+            // Two samplers' records, side by side.
+            let mut elsewhere = [0u64; 4];
+            let source = elsewhere.as_mut_ptr() as u64;
+            let sampler = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+            create_sampler(std::ptr::null(), &sampler, source);
+            create_sampler(std::ptr::null(), &sampler, source + 16);
+            let at = |i: u64| heap(h).start + i * 16;
+            host.with_made_held(|| copy_simple(std::ptr::null(), 2, at(5), source, SAMPLERS));
+            assert!(!host.made(5) && !host.made(6), "made while the lock was held");
+            copy_simple(std::ptr::null(), 1, at(9), source, SAMPLERS);
+            assert!(host.made(9), "the lock free: made at the call");
+            sync_held(None, std::time::Instant::now());
+            assert!(host.made(5) && host.made(6), "not made by the sync");
+            host.with_made_held(|| copy_simple(std::ptr::null(), 1, at(7), source, SAMPLERS));
+            assert!(!host.made(7));
+            host.drain_deferred(false);
+            assert!(host.made(7), "not made by a pass's drain");
+            mirror_try::TEST_MODE.set(None);
+        }
+        drop(one);
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+    }
+
+    /// VIcky (`VICTORY_MIRROR_TRY=2`): a view made by a call while the host
+    /// heap's lock is held is left to the next drain, as a copy is; one
+    /// made with the lock free is made at the call.
+    #[cfg(windows)]
+    #[test]
+    fn with_2_a_view_made_while_the_lock_is_held_is_made_by_the_next_drain() {
+        let one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let none = Placement { address: 0, size: 0 };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            mirror_try::TEST_MODE.set(Some(mirror_try::Mode::Try));
+            mirror_try::TEST_CREATED.set(Some(true));
+            let sampler = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+            let at = |i: u64| heap(h).start + i * 16;
+            host.with_made_held(|| create_sampler(std::ptr::null(), &sampler, at(3)));
+            assert!(!host.made(3), "made while the lock was held");
+            create_sampler(std::ptr::null(), &sampler, at(4));
+            assert!(host.made(4), "the lock free: made at the call");
+            sync_held(None, std::time::Instant::now());
+            assert!(host.made(3), "not made by the sync");
+            host.with_made_held(|| create_sampler(std::ptr::null(), &sampler, at(8)));
+            assert!(!host.made(8));
+            host.drain_deferred(false);
+            assert!(host.made(8), "not made by a pass's drain");
+            mirror_try::TEST_CREATED.set(None);
+            mirror_try::TEST_MODE.set(None);
+        }
+        drop(one);
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
     }
 
     #[test]

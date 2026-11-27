@@ -527,6 +527,12 @@ fn names_say_what_waits_and_whose_code_it_is() {
     assert_eq!(Role::of_name("victory-pipelines-3"), Some(Role::Pipelines));
     assert_eq!(Role::of_name("victory-wide-0"), Some(Role::Wide));
     assert_eq!(Role::of_name("victory-window"), None);
+    assert_eq!(Role::of_name("victory-relay"), Some(Role::Relay));
+    assert_eq!(Role::of_name("victory-heap-pass"), Some(Role::HeapPass));
+    assert_eq!(Role::of_name("victory-heap-pass-2"), Some(Role::HeapPass));
+    assert_eq!(Role::of_name("victory-heap-sync"), Some(Role::HeapSync));
+    assert_eq!(Role::of_name("victory-heap"), Some(Role::HeapWorker));
+    assert_eq!(Role::of_name("victory-heap-sync-test"), None);
 }
 
 #[test]
