@@ -280,6 +280,88 @@ Not with levels on demand (the sync beside is off there).
 
 The sync's own ms should stay the same: each changed slot is still mirrored once. If many syncs are "not" taken for "a hand-over or a wait passed", the next refinement is the floor of fence waits: it is raised at the pass, as Belobug's, and could be raised to the fence's landing instead. Memory traffic beside the snapshots may eat some of the gain (the `SYNC_BURST` lesson).
 
+## Quiet pages up whole, and three every-build savings (2026-11-27, `fx-main-densefirst`; profile PF5b's lever 3 and D1, D2, D8)
+
+Profile PF5b (prologue, RTX 4080, RT on) put the submitting thread at about 137 ms of a 147 ms frame. This branch takes on the part of it that is the title's small writes under flights' shader writes, and three costs every build pays. `VICTORY_DENSE_PAGE_FIRST` is opt-in and not measured in the game yet; the rest is always on and changes no result.
+
+### `VICTORY_DENSE_PAGE_FIRST=1|alt` (opt-in; needs `VICTORY_DENSE_PAGE_WHOLE=1`)
+
+**The finding.** While flights that may write a card copy are in the air, the title's changed bytes in that copy go up as runs (`Shadow::merge_under_writes`). PF5b's line: about 400 pages looked at a frame, 13,000-15,600 changed runs of about 14 bytes. Each run is a note, a range and a `CopyBufferRegion` of its own ("sent up in 13,768 ranges"). That is most of `card_before` (14.5 ms) and of the look for them (`stale_under_flights`, 12.7 ms; the compare 4.9 of it). `VICTORY_DENSE_PAGE_WHOLE` already sends a page up whole, but only one with more runs than are left (88.6 pages a frame in PF5b, 5.5 MB).
+
+**What it does.** A page whose 64 KiB piece the card's compare has not flagged for `VICTORY_DENSE_PAGE_WHOLE_FRAMES` (64) goes onto the whole-page list at once, before its title bytes are read and its runs counted (`shadow.rs`, `merge_under_writes_as`). It takes one run of what is left (`VICTORY_MERGE_RUNS`), so the pages that are not quiet keep the rest.
+- The same rules as `DENSE_PAGE_WHOLE`: only a quiet piece; never a page holding shaders' bytes left on the card (`VICTORY_SKIP_WC_BACK`); put in only if nothing settles the flights (`whole_pages_done`, else dropped and refreshed as any page); queued behind the flights in the air and ahead of the next lists; noted as sent whole, so a landing that finds its piece written by those flights counts it.
+- Where the page is put in (`card_put_whole`), its runs are counted against the CPU's side on the title bytes read there:
+  - none: nothing goes up, and the page is only taken, as before;
+  - fewer than `VICTORY_DENSE_PAGE_FIRST_RUNS` (2 by default): it goes up as its runs, as under the cap (one run is one range either way, with fewer bytes and no shader write gone over);
+  - else it goes up whole.
+- The CPU's side takes the runs only; the bytes between them are equal already.
+- `alt`: twenty seconds off, twenty on, each change said as `... (VICTORY_DENSE_PAGE_FIRST=alt): ON` / `: off, as usual`, for `xcl-notes\alt-fps.sh`. Off phases are exactly the code before.
+- Without `VICTORY_DENSE_PAGE_WHOLE=1` (and so the relay) it warns and stays off.
+
+**Grep.**
+- At start, with `=1`: `a quiet page of a card copy that the title wrote under flights' shader writes goes up whole before its runs are counted (VICTORY_DENSE_PAGE_FIRST=1)`.
+- On the line `title bytes put in under flights' shader writes per frame`, after the `VICTORY_DENSE_PAGE_WHOLE` clause: `quiet pages sent up whole before their runs were counted (VICTORY_DENSE_PAGE_FIRST, on|alt, ON|alt, off): N pages (X MB) holding N changed runs, so N copy regions fewer; N pages with under 2 runs sent as their N runs, N with nothing changed, N found but settled all the same`.
+- "Pages looked at" on the same line counts these pages too, so it reads the same in both phases.
+
+**What must move** (ON against off phases):
+1. "changed runs" on that line, from 13,000-15,600 toward 1-3 thousand, and the frame line's "sent up in N ranges" by about the "copy regions fewer";
+2. `card_before` and `stale_under_flights` in a profile; "at work" on the frame line;
+3. the card's send-and-hash lists' time.
+
+Expected bytes up: about 300 more pages of up to 64 KiB, some 15-20 MB a frame more over PCIe (83 MB today).
+
+**The risk: low-medium.** It is `DENSE_PAGE_WHOLE`'s assumption on three to four times as many pages. A whole page takes the title's bytes everywhere in it, also where a flight still in the air has its shaders write a byte the title did not change, if that piece was quiet for 64 frames. The counter `whole pages a flight in the air then wrote (must be about 0)` on the same line covers these pages too; it read 0.00 a frame and 2 since the start in PF5b. If it climbs, raise `VICTORY_DENSE_PAGE_WHOLE_FRAMES` or `VICTORY_DENSE_PAGE_FIRST_RUNS`. A shader write the lists do not declare is not compared, and a whole page goes over it unseen, as with `DENSE_PAGE_WHOLE`.
+
+### Always on, no behaviour change
+
+- **`changed_runs` 64 bytes at a time (D2).** The compare of title memory against a copy (`shadow.rs`: the merges under flights' shader writes, and the refresh of pages holding bytes left on the card) walked each run, and the bytes around it, byte by byte. Now each block of 64 bytes is compared as four 16-byte words (SSE2; plain 8-byte words where there is none), giving a mask with a bit per byte that differs, and the runs are the mask's edges (`trailing_zeros`). A run open at a block's end goes on into the next; the rest after the last whole block is compared in a block padded with equal bytes.
+  - A plain 8-byte word scan was tried first, starting each load where the last `trailing_zeros` pointed. It was 0.5-0.9x the byte loop: on short runs every load waited for the one before. Here the loads of a page do not depend on each other.
+  - Same runs, byte for byte (tests below). Micro-benchmark (Ryzen 9 9900X; the code of both, extracted into a standalone `rustc -O` program, best of 5-7 rounds), ns per 64 KiB page:
+
+| Page | before | now | |
+|---|---|---|---|
+| runs of 10-18 bytes, 60-140 apart (PF5b's shape, 567 runs) | 3,745-3,875 | 1,974-2,242 | 1.7-2.0x |
+| runs of 1-3 bytes, 4-8 apart (RT66d's dense table, 8,165 runs) | 18,138-24,521 | 10,628-12,267 | 1.7-2.0x |
+| runs of 10-18 bytes, 1,000-3,000 apart (32-33 runs) | 2,409-2,598 | 1,095-1,439 | 1.8-2.2x |
+| no change | 1,498-1,506 | 895-996 | 1.5-1.7x |
+| PF5b's shape, both sides out of the caches (128 MiB walked page by page) | 14,004-14,016 (4.7 GB/s) | 5,427-5,469 (12.0 GB/s) | 2.6x |
+
+  The cold row is the one that matches PF5b: the pages looked at are nearly whole 64 KiB pages (PF5b's 88.6 whole pages a frame were 5.54 MB), so the compare reads some 23 MB a frame, not the profile note's 1.5 MB, and 4.9 ms for that is 4.7 GB/s, the "before" figure. So the compare should fall from about 4.9 to about 1.9 ms a frame. In the repo: `cargo test -p victory-gpu --profile diag --lib changed_runs_bench -- --ignored --nocapture` (hot rows only).
+- **`plaincopy`'s counters per thread (D1).** The copies-in-place counters (`VICTORY_COPY_PLAIN`: copies, bytes, pages not there, left to the kernel, fills; and the writes back) were nine adjacent shared atomics. They were written twice per copy by the submitting thread, the relay, the pass over buffer views and the wide copy threads at once: `atomic_add` in `plaincopy::copy` was 2.0 ms a frame of the submitting thread. They now use lot 4's per-thread blocks (`crate::perthread::Counters`) and are summed at the line. The totals are the same, add for add, and the line's text is unchanged. Micro-benchmark (same program; `perthread.rs` itself; two adds per copy, wall time per copy):
+
+| threads copying at once | shared atomics | per thread | |
+|---|---|---|---|
+| 1 | 7.25-7.32 ns | 1.08-1.48 ns | 4.9-6.8x |
+| 2 | 19.2-20.1 ns | 1.18-1.24 ns | 16x |
+| 4 | 40.8-41.4 ns | 1.21-1.33 ns | 31-34x |
+| 6 | 64.3-65.7 ns | 1.39-1.42 ns | 45-47x |
+| 8 | 98.5-103.7 ns | 1.56-1.62 ns | 61-67x |
+
+- **The CCD placement's thread walk off the present (D8).** With `VICTORY_CCD_PLACE=1` (in the recommended set; the switch works in diagnostics builds only, the ones our fps runs use), every twenty seconds `lot4::ccd::apply` took a snapshot of every thread of every process, then a handle and a description per thread of ours. It did this on the title's render thread inside the present: 0.35 ms a frame on average in PF5b, so some 50 ms in one frame every twenty seconds.
+  - Now it runs on a short-lived unnamed thread of its own; the `=1` first line and the `=alt` phase lines are said there, once the threads are placed, with the same text.
+  - The walk also comes before the lock of the registered threads, so a recording thread registering meanwhile does not wait for it.
+  - The same placement, a few ms later. If a placement is still running when the next is due (twenty seconds on, never expected), the new one runs where it is asked, as before.
+
+### Left as they were
+
+- **D6, the heap sync spinning on its mutexes** (`descriptor/host.rs`, `note_buffer_into`; `Mutex::lock` 8.2 ms own). Not local: it is the descriptor code another branch is changing now (`fx-main-syncneed`), and lever 1 takes the sync's time off the critical path.
+- **D7, two clock reads per refresh in `Batch::update`** (`host.rs`, 0.25 ms). They feed the frame line's "copies" time in every build; removing them changes the line.
+- **`plaincopy::faulted_lately` reads the clock per copy** (0.15 ms). Reading it once a submission would change when the faulted blocks are forgotten.
+- **D3** (the 13,500 small copies) is what `VICTORY_DENSE_PAGE_FIRST` is for. **D4** (`made`) and **D5** (whole windows snapshotted) are levers 2 and 5, not waste to cut in place.
+- **The diagnostics-only costs** (the frame lines printed inside the present, the world captures' compression, `cardmeter`, `copystat::range`, the clock reads around steps, the counting allocator): about 6-8 ms on the serial path of our measuring builds, the same in both phases of an `=alt` run. None was trivial to move.
+
+### Tests
+
+`cargo test -p victory-gpu --lib` (debug):
+- `shadow::merge_tests::changed_runs_match_the_byte_scan_at_every_alignment`: one run of every length at every place, in slices of 0-40, 63-65, 127-129, 192 and 200 bytes, both sides at all eight alignments in memory (two of them for the longer slices); then two runs with every gap of 1-70 bytes, the first starting at every place of a block, joined over gaps as `VICTORY_MERGE_GAP` joins them. All against a byte-by-byte scan.
+- `shadow::merge_tests::changed_runs_match_the_byte_scan_at_random`: changes from every second byte to one in 64, slices of every length 0-200 at every pair of the eight alignments, and whole 64 KiB pages.
+- `shadow::merge_tests::block_masks_agree`: the SSE2 mask and the plain words' agree for every byte alone with each kind of change (low bit, high bit, all bits, ...) and on 20,000 random blocks.
+- The existing `changed_runs_are_exactly_the_bytes_that_differ` and every test that goes through `changed_runs` (relay merges, patches, fence-sent rules).
+- `shadow::card_merge_tests::a_quiet_page_goes_up_whole_before_its_runs_are_counted` (on a real card copy and write-watched title memory; three pages: a dense table, one byte, the same bytes again). Without the switch, and with it but no piece quiet, the dense page settles and nothing is put in. With every piece quiet: no settle, no runs counted, three pages left to go up. Put in: the dense page goes up whole and is noted as sent whole, the one-byte page as its run, the unchanged page not at all; all three are taken, and the CPU's side holds title memory.
+- `plaincopy::tests::counts_of_every_thread_are_taken_once`: six threads' adds reach the taken totals once each, each in its own place.
+
+The suites, each by its own exit code: victory-gpu 463 passed, 0 failed, 20 ignored (`warp_budget_saturates_without_wraparound_and_preserves_draw_fields` passed in this run); victory-shader 256, victory-hle 115, victory-loader 30, victory-formats 27, none failed; `cargo xtask policy` ok; the diag exe builds (`cargo build --locked --profile diag -p victory --features diagnostics`).
+
 ## Water and boats: textures shaders write are copied back (on by default, `VICTORY_TEXTURE_BACK`)
 
 - **What.** A list whose shaders write (through unordered access) a texture of one of four kinds copies it into a read-back buffer when it closes; once the list has run, the texels are tiled into the texture's title memory in the console's layout. The kinds (width x height, DXGI format): 256x256 R32_FLOAT (41, the ocean's height map), 256x256 R32G32_FLOAT (16, its displacement map), and the min/max planes 64x64 R32G32_FLOAT (16) and 128x128 R16G16_UINT (36).
