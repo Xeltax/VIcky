@@ -271,12 +271,21 @@ impl HostHeap {
     pub(crate) fn mirror_due_lean(&self, due: &[(u32, u64)], records: &[[u32; 3]], check: bool) {
         let mut chunk = Chunk::new(self, true);
         let mirrored = self.mirrored();
+        // VIcky (`VICTORY_MADE_TURNS`): asked once a call.
+        let turns = super::turns_now();
         for (slots, words) in due.chunks(MIRROR_CHUNK).zip(records.chunks(MIRROR_CHUNK)) {
             RETIRE_LATER.set(Some(Vec::new()));
             {
-                let made = held_alone(&self.made);
+                let mut made = held_alone(&self.made);
                 self.note_title_start(slots);
                 for (&(index, handle), &record) in slots.iter().zip(words) {
+                    // VIcky (`VICTORY_MADE_TURNS`): a thread waits for
+                    // `made`: the chunk ends here and goes on once that
+                    // thread had it.
+                    if self.turn_wanted(turns) {
+                        chunk.end(self, &made);
+                        made = self.turn_over(made);
+                    }
                     if index >= mirrored {
                         // (Counted and said there, as before.)
                         let _ = self.record_at(index, handle, false);

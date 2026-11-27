@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
+use crate::lot4::locks::Lock;
+use crate::stripes::{Reading, Striped, Writing};
 use crate::watch::PAGE;
 
 pub(crate) mod cardlist;
@@ -3720,7 +3722,7 @@ static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[cfg(feature = "diagnostics")]
 pub(crate) fn windows() -> [u64; 3] {
     let asked: u64 = {
-        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read(false);
         loose
             .values()
             .map(|s| {
@@ -3744,7 +3746,7 @@ pub(crate) fn windows() -> [u64; 3] {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read(false);
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
@@ -3784,8 +3786,9 @@ pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
-        // under the same lock, so none is handed out in between.
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        // under the same lock (or a stripe of it, which this one waits
+        // for), so none is handed out in between.
+        let mut map = LOOSE.write(stripes_set());
         if map.is_empty() {
             return;
         }
@@ -3822,7 +3825,7 @@ pub(crate) fn let_go_idle() {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
     let (windows, window_bytes) = {
-        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read(false);
         // Each copy once: a window may stand under several keys.
         let mut seen = std::collections::HashSet::new();
         let bytes: u64 = loose
@@ -5743,14 +5746,69 @@ impl Shadow {
 
 struct Entry {
     end: u64,
-    shadow: Option<Arc<Shadow>>,
+    /// The copy, once made: set under [`MAKING`] (with the table read),
+    /// taken out only with the table written ([`in_place_let_go`]).
+    shadow: std::sync::OnceLock<Arc<Shadow>>,
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+/// VIcky (`VICTORY_BUFFERS_STRIPES`, [`crate::stripes`]): read on stripes
+/// with the switch on, else alone as the plain mutex was.
+static BUFFERS: Striped<BTreeMap<(u64, usize), Entry>> =
+    Striped::new(BTreeMap::new(), [Lock::Buffers, Lock::BuffersRead, Lock::BuffersWrite]);
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    crate::lot4::locks::mutex(crate::lot4::locks::Lock::Buffers, &BUFFERS)
+/// The copies made on first use ([`lookup`], [`copy_ahead_of`]): one at a
+/// time, with the table read. Before the switch, the table's one lock held
+/// them (and every lookup with them); with it set, they also keep
+/// [`constants_fresh`]'s look at the other buffers' copies whole.
+static MAKING: Mutex<()> = Mutex::new(());
+
+/// VIcky (roadmap A1): `VICTORY_BUFFERS_STRIPES=1|alt` (off by default).
+/// The lookups of host copies (the title buffers', then the windows')
+/// read their table on a stripe of their thread's ([`crate::stripes`])
+/// instead of taking its one lock alone; the table's changes (a buffer
+/// made or released, a window made or let go) take every stripe. Same
+/// tables, same walks, same answers; only the locks differ. `alt`: twenty
+/// seconds alone, twenty on stripes, in turn.
+pub(crate) static BUFFERS_STRIPES: crate::alt::Alt =
+    crate::alt::Alt::new("VICTORY_BUFFERS_STRIPES", "the tables of host copies are read on striped locks");
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: whether this thread reads on stripes, whatever the switch.
+    pub(crate) static TEST_STRIPES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a lookup reads its table on a stripe now.
+#[inline]
+fn striped() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_STRIPES.get() {
+        return on;
+    }
+    BUFFERS_STRIPES.on()
+}
+
+/// Whether a reader may hold a stripe at all: then a change takes them
+/// all. (Tests: always, as their threads choose their way themselves.)
+#[inline]
+fn stripes_set() -> bool {
+    cfg!(test) || BUFFERS_STRIPES.set()
+}
+
+/// The title buffers' table, read by a lookup.
+fn buffers_read() -> Reading<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.read(striped())
+}
+
+/// The title buffers' table, read alone (the rare walks over all of it).
+fn buffers_alone() -> Reading<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.read(false)
+}
+
+/// The title buffers' table, written.
+fn buffers_written() -> Writing<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.write(stripes_set())
 }
 
 /// VIcky (`VICTORY_LOT4_PROBE`, P1): every live host copy, of title buffers
@@ -5758,18 +5816,18 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 /// memory, whether it is a window.
 pub(crate) fn lot4_copies() -> Vec<(u64, u64, bool, bool)> {
     let mut out: Vec<(u64, u64, bool, bool)> =
-        buffers().values().filter_map(|e| e.shadow.as_ref()).map(|s| (s.start, s.len, s.card.is_some(), false)).collect();
-    out.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().map(|s| (s.start, s.len, s.card.is_some(), true)));
+        buffers_alone().values().filter_map(|e| e.shadow.get()).map(|s| (s.start, s.len, s.card.is_some(), false)).collect();
+    out.extend(LOOSE.read(false).values().map(|s| (s.start, s.len, s.card.is_some(), true)));
     out
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    buffers_written().insert(
         (start, resource),
         Entry {
             end: start + len,
-            shadow: None,
+            shadow: std::sync::OnceLock::new(),
         },
     );
     crate::copy_ahead::declared(resource, start);
@@ -5779,30 +5837,29 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 /// `start` if the title has not let it go and no ask made the copy yet.
 /// Returns its length and whether a copy was made.
 pub(crate) fn copy_ahead_of(resource: usize, start: u64) -> Option<(u64, bool)> {
-    let mut map = buffers();
+    let map = buffers_read();
     let key = (start, resource);
     let entry = map.get(&key)?;
     let len = entry.end - start;
-    if entry.shadow.is_some() {
+    if entry.shadow.get().is_some() {
         return Some((len, false));
     }
     // In place in the constants heap as at a first use
     // (`VICTORY_INPLACE_CONSTANTS`).
-    let fresh = constants_fresh(&map, key);
-    make_copy(map.get_mut(&key)?, key, fresh)?;
-    Some((len, true))
+    let (_, made) = made_in(&map, key, entry)?;
+    Some((len, made))
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    buffers_written().remove(&(start, resource));
 }
 
 /// The title buffer holding `address`, as (start, length), without making
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
+    buffers_alone()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -5818,7 +5875,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = LOOSE.write(stripes_set());
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
@@ -5828,9 +5885,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
-        let mut map = buffers();
+        let mut map = buffers_written();
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
-            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
+            if entry.end > at && entry.shadow.get().is_some_and(|s| s.place.is_some()) {
                 gone.extend(entry.shadow.take());
             }
         }
@@ -5846,8 +5903,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
-    let mut spans: Vec<(u64, u64, bool)> = buffers().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut spans: Vec<(u64, u64, bool)> =
+        buffers_alone().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
+    let loose = LOOSE.read(false);
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
 }
@@ -5886,23 +5944,31 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
+    let map = buffers_read();
+    let found = map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end);
+    let Some((&key, entry)) = found else {
         drop(map);
         return loose(address, end, len <= 1, any);
     };
-    let fresh = constants_fresh(&map, key);
-    let entry = map.get_mut(&key)?;
-    if entry.shadow.is_none() {
-        make_copy(entry, key, fresh)?;
+    if let Some(shadow) = entry.shadow.get() {
+        return Some(shadow.clone());
     }
-    entry.shadow.clone()
+    made_in(&map, key, entry).map(|(shadow, _)| shadow)
+}
+
+/// The copy of the title buffer `key` (`entry` in `map`, which is read),
+/// made now if no other thread made it meanwhile: under [`MAKING`], as
+/// under the table's one lock before. Also whether this call made it.
+fn made_in(map: &BTreeMap<(u64, usize), Entry>, key: (u64, usize), entry: &Entry) -> Option<(Arc<Shadow>, bool)> {
+    let _making = MAKING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(shadow) = entry.shadow.get() {
+        return Some((shadow.clone(), false));
+    }
+    let fresh = constants_fresh(map, key);
+    let shadow = make_copy(entry.end - key.0, key, fresh)?;
+    // (Set: only the holder of `MAKING` sets one, and none had.)
+    let _ = entry.shadow.set(shadow.clone());
+    Some((shadow, true))
 }
 
 /// With `VICTORY_INPLACE_CONSTANTS`, for the title buffer `key` if it has
@@ -5911,26 +5977,24 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 /// `crate::inplace::place_constants`).
 fn constants_fresh(map: &BTreeMap<(u64, usize), Entry>, key: (u64, usize)) -> bool {
     crate::inplace::constants_on()
-        && map.get(&key).is_some_and(|entry| entry.shadow.is_none())
+        && map.get(&key).is_some_and(|entry| entry.shadow.get().is_none())
         && {
             let (at, to) = crate::inplace::pages_of_range(key.0, map.get(&key).map_or(0, |entry| entry.end - key.0));
-            let copied = |entry: &Entry| entry.shadow.as_ref().is_some_and(|s| !s.in_place());
+            let copied = |entry: &Entry| entry.shadow.get().is_some_and(|s| !s.in_place());
             !map.range((at, 0)..(to, 0)).any(|(_, entry)| copied(entry))
                 && !map.range(..(at, 0)).rev().take(256).any(|(_, entry)| entry.end > at && copied(entry))
         }
 }
 
-/// Makes the host copy of the title buffer `key` (`entry`, which has none
-/// yet) and puts it in the entry: on first use ([`lookup`]) or, with
+/// Makes the host copy of the title buffer `key` (`len` bytes; its entry
+/// has none yet), for its entry: on first use ([`lookup`]) or, with
 /// [`crate::copy_ahead`], when the title declares the buffer. `fresh`:
 /// [`constants_fresh`].
-fn make_copy(entry: &mut Entry, key: (u64, usize), fresh: bool) -> Option<()> {
-    let len = entry.end - key.0;
+fn make_copy(len: u64, key: (u64, usize), fresh: bool) -> Option<Arc<Shadow>> {
     // The title's constants heap, and what lies inside it, in place
     // whatever its size (`crate::inplace::constants_on`).
     if let Some(placed) = crate::inplace::place_constants(key.0, len, fresh) {
-        entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-        return Some(());
+        return Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
     }
     // Rounded up so that views ending in the buffer's last 256 bytes fit.
     // Shaders write some buffers (unordered access), so not upload memory.
@@ -5941,8 +6005,7 @@ fn make_copy(entry: &mut Entry, key: (u64, usize), fresh: bool) -> Option<()> {
     // are read too often to stay in the PC's.
     let big = cards() && size >= card_limits().0;
     if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-        entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-        return Some(());
+        return Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
     }
     let (buffer, data) = host()?.shared_buffer(size)?;
     crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
@@ -6005,8 +6068,7 @@ fn make_copy(entry: &mut Entry, key: (u64, usize), fresh: bool) -> Option<()> {
     if shadow.card.is_some() {
         cardlist::carded(&shadow);
     }
-    entry.shadow = Some(shadow);
-    Some(())
+    Some(shadow)
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -6111,7 +6173,7 @@ fn fine() -> bool {
 /// which is copied once for each.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_cover() -> u64 {
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read(false);
     cover(loose.keys().copied())
 }
 
@@ -6141,24 +6203,27 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
         .min()
 }
 
-/// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+/// Copies of title memory outside buffers, by (start, length). VIcky
+/// (`VICTORY_BUFFERS_STRIPES`): read on stripes as [`BUFFERS`].
+static LOOSE: Striped<BTreeMap<(u64, u64), Arc<Shadow>>> =
+    Striped::new(BTreeMap::new(), [Lock::Loose, Lock::LooseRead, Lock::LooseWrite]);
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
-    let (start, len) = if unsized_ask && tails() {
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if any && fine() && !unsized_ask {
-        // The windows that begin in the ask's cell at or below the ask (one
-        // that begins in a cell below and reaches this far is passed over:
-        // the ask then makes its own).
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
-    } else {
-        named
+    let choose = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| {
+        if unsized_ask && tails() {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
+        } else if any && fine() && !unsized_ask {
+            // The windows that begin in the ask's cell at or below the ask
+            // (one that begins in a cell below and reaches this far is
+            // passed over: the ask then makes its own).
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            holder(there, address, end).unwrap_or(named)
+        } else {
+            named
+        }
     };
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
@@ -6169,6 +6234,18 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
+    // VIcky (`VICTORY_BUFFERS_STRIPES`): found with the table read; one to
+    // make is made with it written, the window chosen again (read on a
+    // stripe, another thread may have made it meanwhile; read alone, the
+    // whole lock was kept, as the one lock was before).
+    let map = LOOSE.read(striped());
+    let (start, len) = choose(&map);
+    if let Some(shadow) = map.get(&(start, len)) {
+        note(shadow);
+        return Some(shadow.clone());
+    }
+    let mut map = map.upgrade(stripes_set());
+    let (start, len) = choose(&map);
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
         return Some(shadow.clone());
@@ -6971,14 +7048,13 @@ mod card_merge_tests {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = buffers_alone()
         .values()
-        .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
+        .filter_map(|e| e.shadow.get().map(|s| (s.gpu, s.start, s.len)))
         .collect();
     all.extend(
         LOOSE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .read(false)
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
     );
@@ -6998,4 +7074,225 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// VIcky (`VICTORY_BUFFERS_STRIPES`, roadmap A1): the tables of host copies
+/// read on stripes give what they give read alone, the copies made on first
+/// use are made once, and lookups on stripes and alone, changes of the
+/// tables and the rare walks over them run together without a deadlock.
+#[cfg(test)]
+mod stripes_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// `f` with this thread reading on stripes (`striped`) or alone.
+    fn reading<R>(striped: bool, f: impl FnOnce() -> R) -> R {
+        let was = TEST_STRIPES.replace(Some(striped));
+        let out = f();
+        TEST_STRIPES.set(was);
+        out
+    }
+
+    /// Asks over a table of nested and side by side buffers, and memory
+    /// outside them (windows): read alone and on stripes, the same copy,
+    /// whichever way made it first.
+    #[test]
+    fn lookups_on_stripes_give_what_they_give_alone() {
+        if host().is_none() {
+            return;
+        }
+        let base = 0x5c_0000_0000u64;
+        // (resource, start, bytes): side by side, nested, overlapping.
+        let buffers: Vec<(usize, u64, u64)> = vec![
+            (0x7e57_a101, base, 0x10_0000),
+            (0x7e57_a102, base + 0x1_0000, 0x1_0000),
+            (0x7e57_a103, base + 0x1_8000, 0x4000),
+            (0x7e57_a104, base + 0x10_0000, 0x2_0000),
+            (0x7e57_a105, base + 0x11_0000, 0x4_0000),
+            (0x7e57_a106, base + 0x40_0000, 0x1000),
+        ];
+        for &(resource, start, len) in &buffers {
+            register(resource, start, len);
+        }
+        let asks: Vec<(u64, u64)> = vec![
+            (base, 0x10),
+            (base + 0x1_0000, 1),
+            (base + 0x1_8100, 0x100),
+            (base + 0x1_c000, 0x8000),
+            (base + 0x10_8000, 0x1000),
+            (base + 0x12_0000, 0x1_0000),
+            (base + 0x14_f000, 0x2000),
+            (base + 0x40_0800, 0x100),
+            // Outside every buffer: windows.
+            (base + 0x80_0000, 0x100),
+            (base + 0x80_0000, 1),
+            (base + 0x123_4560, 0x40),
+        ];
+        let id = |s: Option<Arc<Shadow>>| s.map(|s| (s.id(), s.start, s.len));
+        for (n, &(address, len)) in asks.iter().enumerate() {
+            // Made first on stripes for half the asks, alone for the others.
+            let first = n % 2 == 0;
+            let made = reading(first, || id(find(address, len)));
+            assert!(made.is_some(), "ask {n}: a copy");
+            for striped in [false, true, !first] {
+                assert_eq!(reading(striped, || id(find(address, len))), made, "ask {n}, striped {striped}");
+                assert_eq!(reading(striped, || id(find_any(address, len))), made, "ask {n}, any, striped {striped}");
+            }
+        }
+        // The innermost buffer: the walk is the same on stripes.
+        let inner = reading(true, || find(base + 0x1_8100, 0x100)).unwrap();
+        assert_eq!((inner.start, inner.len), (base + 0x1_8000, 0x4000));
+        // Copies made ahead: made once, whichever way.
+        register(0x7e57_a107, base + 0x50_0000, 0x1000);
+        assert_eq!(reading(true, || copy_ahead_of(0x7e57_a107, base + 0x50_0000)), Some((0x1000, true)));
+        assert_eq!(reading(false, || copy_ahead_of(0x7e57_a107, base + 0x50_0000)), Some((0x1000, false)));
+        assert_eq!(reading(true, || find(base + 0x50_0000, 0x10)).map(|s| s.start), Some(base + 0x50_0000));
+        for &(resource, start, _) in &buffers {
+            unregister(resource, start);
+        }
+        unregister(0x7e57_a107, base + 0x50_0000);
+        // Gone from the table: the ask now takes a window.
+        let after = reading(true, || find(base + 0x1_0000, 1)).unwrap();
+        assert!(after.window);
+    }
+
+    /// A buffer asked for at once by twelve threads, on stripes and alone,
+    /// before it has a copy: one copy is made, and every thread gets it.
+    #[test]
+    fn a_copy_asked_for_by_twelve_threads_at_once_is_made_once() {
+        if host().is_none() {
+            return;
+        }
+        let base = 0x5d_0000_0000u64;
+        const BUFFERS: u64 = 16;
+        for b in 0..BUFFERS {
+            register(0x7e57_b100 + b as usize, base + b * 0x10_0000, 0x1_0000);
+        }
+        let start = Arc::new(std::sync::Barrier::new(12));
+        let threads: Vec<_> = (0..12u64)
+            .map(|t| {
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    TEST_STRIPES.set(Some(t % 4 != 0));
+                    start.wait();
+                    (0..BUFFERS)
+                        .map(|i| {
+                            let b = (i + t) % BUFFERS;
+                            (b, find(base + b * 0x10_0000 + 0x100, 0x100).map(|s| s.id()))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut ids: Vec<Option<u64>> = vec![None; BUFFERS as usize];
+        for t in threads {
+            for (b, id) in t.join().unwrap() {
+                let id = id.expect("a copy");
+                match ids[b as usize] {
+                    None => ids[b as usize] = Some(id),
+                    Some(first) => assert_eq!(first, id, "buffer {b}: one copy for every thread"),
+                }
+            }
+        }
+        for b in 0..BUFFERS {
+            unregister(0x7e57_b100 + b as usize, base + b * 0x10_0000);
+        }
+    }
+
+    /// Twelve threads for a while: eight look buffers and windows up (half
+    /// on stripes, half alone, changing ways as they go) and must get the
+    /// copies found at the start; two register, look up and release
+    /// buffers of their own; one walks the tables whole; one writes both
+    /// tables. No deadlock (the test ends), and every answer right.
+    #[test]
+    fn twelve_threads_look_up_change_and_walk_together() {
+        if host().is_none() {
+            return;
+        }
+        let base = 0x5e_0000_0000u64;
+        const STABLE: u64 = 64;
+        for b in 0..STABLE {
+            register(0x7e57_c000 + b as usize, base + b * 0x2_0000, 0x1_8000);
+        }
+        // The copies found at the start (held here, so no idle window goes).
+        let asks: Vec<(u64, u64)> = (0..STABLE)
+            .map(|b| (base + b * 0x2_0000 + 0x100, 0x100))
+            .chain((0..8).map(|w| (base + 0x100_0000 + w * WINDOW + 0x40, 0x40)))
+            .collect();
+        let held: Arc<Vec<Arc<Shadow>>> = Arc::new(asks.iter().map(|&(a, l)| find(a, l).expect("a copy")).collect());
+        let asks = Arc::new(asks);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut threads = Vec::new();
+        for t in 0..8u64 {
+            let (held, asks, stop) = (held.clone(), asks.clone(), stop.clone());
+            threads.push(std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    TEST_STRIPES.set(Some((n / 512 + t) % 2 == 0));
+                    let i = ((n * 7 + t * 13) % asks.len() as u64) as usize;
+                    let (address, len) = asks[i];
+                    let got = if n % 3 == 0 { find_any(address, len) } else { find(address, len) };
+                    assert!(got.is_some_and(|g| Arc::ptr_eq(&g, &held[i])), "thread {t}, ask {i}");
+                    n += 1;
+                }
+                n
+            }));
+        }
+        for c in 0..2u64 {
+            let stop = stop.clone();
+            threads.push(std::thread::spawn(move || {
+                let mut n = 0u64;
+                let at = base + 0x400_0000 + c * 0x100_0000;
+                while !stop.load(Ordering::Relaxed) {
+                    TEST_STRIPES.set(Some(n % 2 == 0));
+                    let resource = 0x7e57_c800 + (c as usize) * 0x100 + (n % 4) as usize;
+                    let start = at + (n % 4) * 0x4_0000;
+                    register(resource, start, 0x2_0000);
+                    let got = find(start + 0x10, 0x10).expect("a copy");
+                    assert_eq!((got.start, got.len), (start, 0x2_0000), "churn {c}: its own buffer");
+                    unregister(resource, start);
+                    n += 1;
+                }
+                n
+            }));
+        }
+        {
+            let stop = stop.clone();
+            threads.push(std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    assert!(lot4_copies().iter().any(|c| c.0 == base));
+                    assert!(spans().iter().any(|s| s.0 == base));
+                    n += 1;
+                }
+                n
+            }));
+        }
+        {
+            let stop = stop.clone();
+            threads.push(std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    // Both tables written (nothing of ours is in place there).
+                    assert_eq!(in_place_let_go(base + 0x700_0000, 0x10_0000), 0);
+                    std::thread::yield_now();
+                    n += 1;
+                }
+                n
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        stop.store(true, Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        for (t, thread) in threads.into_iter().enumerate() {
+            while !thread.is_finished() {
+                assert!(std::time::Instant::now() < deadline, "thread {t} still running: a deadlock");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(thread.join().unwrap() > 0, "thread {t} did some work");
+        }
+        for b in 0..STABLE {
+            unregister(0x7e57_c000 + b as usize, base + b * 0x2_0000);
+        }
+    }
 }
