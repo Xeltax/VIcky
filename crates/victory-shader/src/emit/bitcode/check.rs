@@ -279,6 +279,7 @@ impl Run<'_> {
             Cast::FpToSi => (float(from, x) as i64 as u64) & mask(tb),
             Cast::UiToFp => to_float((x & mask(fb)) as f64),
             Cast::SiToFp => to_float(signed(fb, x & mask(fb)) as f64),
+            Cast::FpExt => to_float(float(from, x)),
         }
     }
 

@@ -122,7 +122,8 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use per_program::{
     MASK_COPIES_RETRY_ON, MaskCopies, deep_skips_allowed, for_program, mask_copies, mask_copies_retried, shader_opt_allowed,
-    dropped_stores, site_pairs_allowed, wave64_program, wave64_retried, with_mask_copies,
+    dropped_stores, site_pairs_allowed, wave64_program, wave64_retried, wave_pairs_allowed, wave_pairs_settings,
+    with_mask_copies,
 };
 pub(crate) use per_program::{current as program_hash, mask_copies_here, site_pairs_here, store_dropped_here};
 #[cfg(test)]
@@ -437,6 +438,24 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    // A program `VICTORY_WAVE_PAIRS_ONLY` names, a console wave64 compute one on a host of
+    // 32-lane waves: the paired form first ([`paired`]), else the forms below as for any.
+    if per_program::wave_pairs_here()
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_max_wave() == 32
+    {
+        let hash = per_program::current();
+        let hash = hash.as_deref().unwrap_or("?");
+        match paired(c, native, p) {
+            Ok((shader, Some(32))) => {
+                eprintln!("WAVE64-PAIRS-ONLY #{hash} translated in the paired form (VICTORY_WAVE_PAIRS_ONLY)");
+                return Ok(shader);
+            }
+            Ok((_, wave)) => eprintln!("WAVE64-PAIRS-ONLY #{hash} paired form needs wave {wave:?}; the other forms"),
+            Err(e) => eprintln!("WAVE64-PAIRS-ONLY #{hash} paired form refused: {e}; the other forms"),
+        }
+    }
     let first = emit_once(c, native, p, st, io, res);
     match &first {
         Err(ShaderError::Unsupported { what, .. })
@@ -729,6 +748,71 @@ fn widen(
         }
         wide.extend(more);
     }
+}
+
+/// `p` (a console wave64 compute program on a host of 32-lane waves) in the paired form
+/// (`lower::with_paired_lanes`; fork pull request #1397, ByFxbian, after fork pull request
+/// #854 by PiloteCode and darkworldhm's `840243e2`): one host wave of 32 threads per console
+/// wave, each thread two of its lanes, with every per-lane branch taken by the whole wave
+/// ([`structure::structure_wide`]), so that every thread runs every block the wave runs and
+/// the group's barriers meet. Refused where that cannot hold: spilled `DispatchX` programs
+/// (not validated), groups that are not whole console waves, a first block with
+/// predecessors, LDS past the host's 32 KiB, LDS operations it does not lower, GDS, and
+/// several waves of a group that would have to meet after a divergent exit.
+fn paired(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let unsupported = |what| ShaderError::Unsupported { offset: 0, what };
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return Err(unsupported("paired lanes outside compute"));
+    };
+    if crate::spill::is_spilled(native) {
+        return Err(unsupported("paired Wave64 for spilled DispatchX programs is not validated"));
+    }
+    let threads = cs.threads.iter().product::<u32>();
+    if threads == 0 || threads > 1024 || threads % 64 != 0 {
+        return Err(unsupported("paired lanes in a thread group that does not fill its console waves"));
+    }
+    if p.blocks.first().is_some_and(|b| !b.preds.is_empty()) {
+        return Err(unsupported("paired Wave64 requires a single-entry wave prologue"));
+    }
+    let lds = cs.lds_bytes();
+    if lds + 4 * u32::from(threads > 64) > 32 * 1024 {
+        return Err(unsupported("paired Wave64 exceeds the compute group shared-memory limit"));
+    }
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    let accesses_lds = insts().any(lower::accesses_lds);
+    if accesses_lds
+        && (lds == 0 || insts().filter(|i| lower::accesses_lds(i)).any(|i| !lower::supports_paired_lds(i.name())))
+    {
+        return Err(unsupported("an LDS operation not supported by paired Wave64"));
+    }
+    let waits = accesses_lds || insts().any(|i| i.name() == "s_barrier");
+    // Independently progressing waves cannot rendezvous after a divergent exit.
+    if (threads > 64 && p.blocks.len() > 1 && waits) || (group_sync() == 0 && (threads > 64 || waits)) {
+        return Err(unsupported("paired Wave64 would require an unavailable group rendezvous"));
+    }
+    // every per-lane branch the wave's; again while that leaves another branch per lane
+    let mut wide = std::collections::HashSet::new();
+    let st = loop {
+        let st = structure::structure_wide(p, &wide)?;
+        let lanes: Vec<usize> = (0..st.exits.len())
+            .filter(|b| !wide.contains(b))
+            .filter(|&b| {
+                matches!(st.exits[b], structure::LaneExit::Branch { when, .. }
+                    if !st.bools.support(when).iter().all(|a| matches!(a, structure::Atom::Uniform(_))))
+            })
+            .collect();
+        if lanes.is_empty() {
+            break st;
+        }
+        wide.extend(lanes);
+    };
+    let io = io::raise(p, native)?;
+    let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+    lower::with_paired_lanes(|| emit_program(c, native, p, &st, &io, &res))
 }
 
 /// The translated program, and the wave size it requires of the host.

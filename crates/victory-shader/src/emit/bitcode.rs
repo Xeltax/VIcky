@@ -110,6 +110,9 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
+    /// 32- to 64-bit float: a plain double operation, unlike the integer conversions to
+    /// doubles (which need the double extensions flag).
+    FpExt = 8,
     Bitcast = 11,
 }
 
