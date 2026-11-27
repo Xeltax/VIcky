@@ -191,6 +191,8 @@ pub(crate) fn at_present() {
         // Flights land in order: the last one that copies back, and every
         // one before it.
         super::relay_wait(super::WHY_SYNC, |line| line.backs == 0);
+        // (`VICTORY_TEXTURE_BACK_ASYNC`: and their writer.)
+        crate::texback::drain();
     } else {
         super::settle_now(super::WHY_SYNC);
     }

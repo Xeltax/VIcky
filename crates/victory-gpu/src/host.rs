@@ -5961,7 +5961,7 @@ impl Host {
             match item {
                 Late::Run(flight) => {
                     last = flight.number;
-                    texture_back::read_backs(flight.order.iter().map(|&i| flight.lists[i].host()));
+                    texture_back::read_backs(flight.order.iter().map(|&i| flight.lists[i].host()), true);
                     if let Some(card) = flight.card {
                         self.card_done(card);
                     }
@@ -6314,6 +6314,9 @@ impl Host {
             // comes here, so each still sees title memory, fences and
             // bottom-of-pipe values as after a settle.
             relay_wait(why, |line| line.line.is_empty() && !line.settling);
+            // (`VICTORY_TEXTURE_BACK_ASYNC`: and the copy-backs the landing
+            // thread handed to their writer.)
+            crate::texback::drain();
             return;
         }
         let was_working = working(true);
@@ -6414,7 +6417,7 @@ impl Host {
                 match item {
                     Late::Run(flight) => {
                         last = flight.number;
-                        texture_back::read_backs(flight.order.iter().map(|&i| flight.lists[i].host()));
+                        texture_back::read_backs(flight.order.iter().map(|&i| flight.lists[i].host()), false);
                         if let Some(card) = flight.card {
                             self.card_done(card);
                         }
@@ -6811,7 +6814,7 @@ impl Host {
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.
-            texture_back::read_backs(std::iter::once(*list));
+            texture_back::read_backs(std::iter::once(*list), false);
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }

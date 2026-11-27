@@ -16,8 +16,10 @@ use std::sync::atomic::Ordering::Relaxed;
 /// first. With `VICTORY_TEXTURE_BACK_LEAN` a copy that a later one of the
 /// same memory among `lists` supersedes is left out: what tells the title
 /// that the card is done (the flight's bottom-of-pipe writes, the signals
-/// behind it) comes after all of them.
-pub(super) fn read_backs<'a>(lists: impl Iterator<Item = &'a HostList> + Clone) {
+/// behind it) comes after all of them. `relay`: on the thread that lands
+/// flights, whose copy-backs `VICTORY_TEXTURE_BACK_ASYNC` hands to a
+/// writer of their own (`crate::texback::drain`).
+pub(super) fn read_backs<'a>(lists: impl Iterator<Item = &'a HostList> + Clone, relay: bool) {
     let superseded = if crate::texback::lean() { superseded(lists.clone()) } else { Vec::new() };
     for (l, list) in lists.enumerate() {
         for (b, back) in list.deferred().texture_backs.iter().enumerate() {
@@ -25,7 +27,7 @@ pub(super) fn read_backs<'a>(lists: impl Iterator<Item = &'a HostList> + Clone) 
                 STATS[SUPERSEDED].fetch_add(1, Relaxed);
                 continue;
             }
-            crate::texback::land(back);
+            crate::texback::land(back, relay);
         }
         super::read_backs(list);
     }
@@ -86,9 +88,12 @@ pub(super) fn reading(runs: &[&HostList]) -> Option<std::time::Instant> {
     (crate::texback::holding() && reads(runs)).then(std::time::Instant::now)
 }
 
-/// The wait [`reading`] found is over: counted for the copy-back.
+/// The wait [`reading`] found is over: counted for the copy-back. With
+/// `VICTORY_TEXTURE_BACK_ASYNC` the writer is waited for too: the
+/// submission reads what the copy-backs wrote.
 pub(super) fn waited(began: Option<std::time::Instant>) {
     if let Some(began) = began {
+        crate::texback::drain();
         STATS[SETTLES].fetch_add(1, Relaxed);
         STATS[WAITED_US].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     }
