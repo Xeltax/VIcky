@@ -6491,6 +6491,8 @@ impl Host {
         // stand in their lists' steps, before anything below reads those
         // steps or sends the lists (`crate::draw::heap_pass`).
         if crate::draw::heap_pass::beside() {
+            // (VIcky, PF5b's meter: this submission's place in the burst.)
+            crate::draw::heap_pass::submission_begins();
             for list in runs {
                 list.join_heap_passes();
             }
@@ -6678,14 +6680,17 @@ impl Host {
         // VIcky: the heap sync started beside the refreshes ends before
         // anything reads the host heaps (the lists, when they run), and the
         // slots it left waiting for a texture made since are made now. The
-        // wait is the sync's, on its line, not the preparing's.
+        // wait is the sync's, on its line, not the preparing's. VIcky
+        // (`VICTORY_HEAP_SYNC_NEED`, `crate::descriptor::at_submit::need`):
+        // not waited for when a sync that has ended covers these lists.
         let mut joined = std::time::Duration::ZERO;
+        let mut _covered = false;
         if let Some(beside) = beside {
-            joined = beside.join();
+            (joined, _covered) = beside.join();
             crate::descriptor::make_waiting();
         }
         #[cfg(feature = "diagnostics")]
-        crate::descriptor::burst::submitted(crate::descriptor::beside::on(), joined);
+        crate::descriptor::burst::submitted(crate::descriptor::beside::on(), joined, _covered);
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.

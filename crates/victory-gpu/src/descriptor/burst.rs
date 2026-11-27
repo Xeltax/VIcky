@@ -20,6 +20,12 @@
 //! thread, and all of its time counts as waited. One line per frame-rate
 //! line, next to the sync's ([`line`]), per frame.
 //!
+//! VIcky (`VICTORY_HEAP_SYNC_NEED`, `super::at_submit::need`): with that
+//! switch, each place also says how many of its joins a sync that had
+//! ended covered, and the ms those waited all the same (`count`, the off
+//! phases of `alt`; 0 for those skipped): whether the 3rd submission's wait
+//! (PF5b: 13.6 ms) is coverable.
+//!
 //! A submission's place is one more than that of the submission before, and
 //! 1st after the present's own (`crate::host`'s present marks it,
 //! [`present_own`]) or, if a present passed without one, after that present
@@ -35,25 +41,27 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 const PLACES: usize = 17;
 
 /// By place, and the present's own last: submissions, the sync's
-/// microseconds, slots mirrored, and microseconds waited at the join.
+/// microseconds, slots mirrored, microseconds waited at the join, and VIcky
+/// (`VICTORY_HEAP_SYNC_NEED`) joins covered and microseconds those waited.
 struct State {
     /// The place of the next submission, from 0.
     place: usize,
     /// Presents so far at the submission before.
     frame: u64,
-    rows: [[u64; 4]; PLACES + 1],
+    rows: [[u64; 6]; PLACES + 1],
 }
 
 impl State {
     const fn new() -> State {
-        State { place: 0, frame: 0, rows: [[0; 4]; PLACES + 1] }
+        State { place: 0, frame: 0, rows: [[0; 6]; PLACES + 1] }
     }
 
     /// A submission ended, `frame` presents so far: the present's own
     /// (`own`) or the next in its burst, its sync having taken `us`
     /// microseconds and mirrored `slots`, and the submitting thread having
-    /// waited `waited` microseconds at its join.
-    fn note(&mut self, own: bool, frame: u64, [us, slots, waited]: [u64; 3]) {
+    /// waited `waited` microseconds at its join, which a sync that had ended
+    /// covered (`covered` 1) or not (0).
+    fn note(&mut self, own: bool, frame: u64, [us, slots, waited, covered]: [u64; 4]) {
         let row = if own {
             self.place = 0;
             self.frame = frame;
@@ -67,15 +75,16 @@ impl State {
             self.place += 1;
             row
         };
-        for (total, n) in self.rows[row].iter_mut().zip([1, us, slots, waited]) {
+        for (total, n) in self.rows[row].iter_mut().zip([1, us, slots, waited, covered, covered * waited]) {
             *total += n;
         }
     }
 
     /// The line per frame over `frames`, the counts taken; `None` if no
-    /// submission was noted since.
-    fn take(&mut self, frames: f64) -> Option<String> {
-        let rows = std::mem::replace(&mut self.rows, [[0; 4]; PLACES + 1]);
+    /// submission was noted since. `covered`: the covered joins said by
+    /// place (`VICTORY_HEAP_SYNC_NEED`).
+    fn take(&mut self, frames: f64, covered: bool) -> Option<String> {
+        let rows = std::mem::replace(&mut self.rows, [[0; 6]; PLACES + 1]);
         if rows.iter().all(|row| row[0] == 0) {
             return None;
         }
@@ -85,9 +94,14 @@ impl State {
             .iter()
             .enumerate()
             .filter(|(_, row)| row[0] > 0)
-            .map(|(i, &[_, us, slots, waited])| {
+            .map(|(i, &[_, us, slots, waited, joins, joins_waited])| {
+                let covered = if covered {
+                    format!(" ({:.2} joins covered, {:.2} ms of it)", per(joins), per(joins_waited) / 1000.0)
+                } else {
+                    String::new()
+                };
                 format!(
-                    "{} {:.2} ms / {:.0} slots / {:.2} ms waited",
+                    "{} {:.2} ms / {:.0} slots / {:.2} ms waited{covered}",
                     place_name(i),
                     per(us) / 1000.0,
                     per(slots),
@@ -150,15 +164,18 @@ pub(crate) fn synced(us: u64, slots: u64) {
 }
 
 /// A submission's sync is over: joined after the submitting thread waited
-/// `joined` for it (`beside`), or done on that thread.
+/// `joined` for it (`beside`), or done on that thread. VIcky
+/// (`VICTORY_HEAP_SYNC_NEED`): `covered`, a sync that had ended covered the
+/// lists at the join (with that switch, a sync left running counts its time
+/// and slots with the submission whose join comes after its end).
 #[cfg(feature = "diagnostics")]
-pub(crate) fn submitted(beside: bool, joined: std::time::Duration) {
+pub(crate) fn submitted(beside: bool, joined: std::time::Duration, covered: bool) {
     let (us, slots) = (LAST[0].swap(0, Relaxed), LAST[1].swap(0, Relaxed));
     let waited = if beside { joined.as_micros() as u64 } else { us };
     STATE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .note(OWN.get(), crate::queue::presented(), [us, slots, waited]);
+        .note(OWN.get(), crate::queue::presented(), [us, slots, waited, u64::from(covered)]);
 }
 
 /// While the guard lives, this thread's submissions are the present's own
@@ -184,7 +201,8 @@ impl Drop for Own {
 /// `frames`; none if no submission was noted since the last.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn line(frames: f64) {
-    let text = STATE.lock().unwrap_or_else(|e| e.into_inner()).take(frames);
+    let covered = super::at_submit::need::set();
+    let text = STATE.lock().unwrap_or_else(|e| e.into_inner()).take(frames, covered);
     if let Some(text) = text {
         tracing::info!("{text}");
     }
@@ -199,18 +217,18 @@ mod tests {
     #[test]
     fn submissions_are_counted_by_their_place_since_the_present() {
         let mut s = State::new();
-        s.note(false, 1, [100, 10, 50]);
-        s.note(false, 1, [200, 20, 0]);
-        s.note(true, 2, [7, 1, 7]);
-        s.note(false, 2, [300, 30, 60]);
-        assert_eq!(s.rows[0], [2, 400, 40, 110]);
-        assert_eq!(s.rows[1], [1, 200, 20, 0]);
-        assert_eq!(s.rows[PLACES], [1, 7, 1, 7]);
+        s.note(false, 1, [100, 10, 50, 0]);
+        s.note(false, 1, [200, 20, 0, 1]);
+        s.note(true, 2, [7, 1, 7, 0]);
+        s.note(false, 2, [300, 30, 60, 1]);
+        assert_eq!(s.rows[0], [2, 400, 40, 110, 1, 60]);
+        assert_eq!(s.rows[1], [1, 200, 20, 0, 1, 0]);
+        assert_eq!(s.rows[PLACES], [1, 7, 1, 7, 0, 0]);
         // A present without one of its own: 1st again.
-        s.note(false, 3, [1, 1, 1]);
+        s.note(false, 3, [1, 1, 1, 0]);
         assert_eq!(s.rows[0][0], 3);
         for _ in 0..30 {
-            s.note(false, 3, [0, 0, 0]);
+            s.note(false, 3, [0, 0, 0, 0]);
         }
         assert_eq!(s.rows[PLACES - 1][0], 30 - (PLACES as u64 - 2));
         assert_eq!(s.rows.iter().map(|row| row[0]).sum::<u64>(), 35);
@@ -221,15 +239,22 @@ mod tests {
     #[test]
     fn the_line_is_per_frame_and_taken() {
         let mut s = State::new();
-        assert!(s.take(1.0).is_none());
-        s.note(false, 1, [4000, 100, 2000]);
-        s.note(false, 1, [1000, 10, 0]);
-        s.note(true, 2, [500, 2, 500]);
-        let text = s.take(2.0).expect("a line");
+        assert!(s.take(1.0, false).is_none());
+        s.note(false, 1, [4000, 100, 2000, 0]);
+        s.note(false, 1, [1000, 10, 0, 0]);
+        s.note(true, 2, [500, 2, 500, 0]);
+        let text = s.take(2.0, false).expect("a line");
         assert!(text.starts_with("heap sync by place in the burst: 1st 2.00 ms / 50 slots / 1.00 ms waited; 2nd 0.50 ms"), "{text}");
         assert!(text.contains("the present's own 0.25 ms / 1 slots / 0.25 ms waited"), "{text}");
         assert!(!text.contains("3rd"), "{text}");
-        assert!(s.take(2.0).is_none());
+        assert!(!text.contains("covered"), "{text}");
+        assert!(s.take(2.0, false).is_none());
+        // VIcky (`VICTORY_HEAP_SYNC_NEED`): covered joins by place.
+        s.note(false, 3, [4000, 100, 2000, 0]);
+        s.note(false, 3, [3000, 10, 6000, 1]);
+        let text = s.take(2.0, true).expect("a line");
+        assert!(text.contains("1st 2.00 ms / 50 slots / 1.00 ms waited (0.00 joins covered, 0.00 ms of it); 2nd"), "{text}");
+        assert!(text.contains("2nd 1.50 ms / 5 slots / 3.00 ms waited (0.50 joins covered, 3.00 ms of it)"), "{text}");
     }
 
     #[test]

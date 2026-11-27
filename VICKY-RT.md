@@ -280,6 +280,175 @@ Not with levels on demand (the sync beside is off there).
 
 The sync's own ms should stay the same: each changed slot is still mirrored once. If many syncs are "not" taken for "a hand-over or a wait passed", the next refinement is the floor of fence waits: it is raised at the pass, as Belobug's, and could be raised to the fence's landing instead. Memory traffic beside the snapshots may eat some of the gain (the `SYNC_BURST` lesson).
 
+## The frame's two walls: `VICTORY_HEAP_SYNC_NEED` and `VICTORY_MADE_PASS_FIRST` (PF5b levers 1 and 2, 2026-11-27, `fx-main-syncneed`; opt-in, not measured yet)
+
+Profile PF5b (prologue cell, RT on, RTX 4080; `xcl-notes\fable-2026-11-27-pf5b.md`) finds two walls of about equal height:
+- **the submitting thread (S):** 137 ms in `Host::submit`, of which **31-33 ms is the join of the heap sync** beside it;
+- **the pass over buffer views (P,** `victory-heap-pass`, `VICTORY_HEAP_PASS_BESIDE=1`): 102-108 ms from its start to its end, of which **52-55 ms is waiting for `made`** (the heap's slot state). Every list of the next burst that asked for the heap's buffers waits for it at its submission.
+
+In three runs of four, frame = pass + 41 to 43 ms, so the model is T = max(S + 5, P + 42); today S + 5 is about 147 and P + 42 about 150. Cutting one wall runs into the other (L5a: S was short and the submitting thread waited 14.9 ms a frame for the pass). So the two levers are built to be judged together, and each switch is independent (either can be `alt` with the other at `1`).
+
+### `VICTORY_HEAP_SYNC_NEED=count|1|alt|check` (lever 1): join only the sync a submission needs
+
+The title hands a frame's lists over in a burst (6.4 ms, 17 submit calls), then records the next frame while the submitting thread works through the burst. By place in the burst the syncs mirror 226, 562, 31,700, 17,250, 12,600, 24,560 and 4,200 slots. From the 3rd sync on, those slots were written after the burst: they are the next frame's. This frame's lists do not read them, yet each submission waits for its sync to end (13.6 + 5.7 + 7.9 + 3.9 ms by place).
+
+**The rule.** A submission's lists need a sync that asked for the heaps' pages after their stamps. These are `VICTORY_HEAP_SYNC_AT_SUBMIT`'s stamps (that section above):
+- the title's hand-over of each list;
+- raised by the waits its queue passed;
+- for a list of ours, the title's latest call.
+
+A sync that has **ended** and asked after that stamp mirrored every record written before it:
+- the syncs follow one another on one lane;
+- each takes every heap page written since the one before took them (the journal keeps a page found by any asker for the heap's next take);
+- a sync ends only once it has mirrored them and drained what `VICTORY_MIRROR_TRY` left to it.
+
+The covered stamp (`at_submit::need::State::covered`) is the highest asking stamp of a sync that has ended. It is raised on the sync's thread at the sync's end, after a fence of its own, so that the sync's writes for the card (slots, heap map entries, strides) are out before a submission relies on it. A sync that panicked raises nothing. A submission that settled flights before its sync's place always joins whole, as with `AT_SUBMIT`.
+
+**What it does** (`crates/victory-gpu/src/descriptor/at_submit/need.rs`; its doc comment holds the argument). Used only with `VICTORY_HEAP_SYNC_BESIDE=1`. With `VICTORY_HEAP_SYNC_AT_SUBMIT` set too, this one is used, no sync is started ahead, and a warning says so.
+
+At the join (where `Host::submit` waits today), if an ended sync covers the lists, the sync is not waited for but **left running**. Otherwise it is joined as before. `make_waiting` after the join place stays.
+
+At the next submission's sync place, the sync left running is met by four rules:
+1. If none is left, or the one left has ended, a sync of its own starts, as without the switch.
+2. If it still runs and an ended sync covers the lists, it is left running and **no sync is started**; the join then waits for nothing. Starting one would mean waiting at once for the running one to end (one lane, one sync at a time), the very wait this lever removes. Its work folds into the next sync.
+3. If it still runs and asked after the lists' stamps, it is this submission's sync, joined for what is left of it (or left running again if covered by then).
+4. Otherwise the submission waits for its end, then starts its own.
+
+**Order rules** (`descriptor/beside.rs`):
+- **The sweep never meets a sync.** Before a sweep the one left running ends first.
+- **The journal (fxceless #410).** A sync left running asked at its own submission's start, before that submission's asking, and asks nothing after. A new sync still starts only at a sync place, before its submission's asking.
+- **The submission counted as started.** A sync left running spans later submissions' starts. A host resource a slot lets go of then waits for the submissions started at that moment (`host::retire`), and a heap map pool slot given back waits for them too: later, never earlier.
+- **What the card may meet.** As at every later submission of a burst today, a sync may mirror the next frame's slots while this frame's lists are on the card. New: also between a submission's refreshes and its `ExecuteCommandLists`. Such a record was written after the lists that read its slot were handed over, a race the title does not run on the console.
+
+**Modes:**
+- **`count` (step 0):** no change of behaviour; every join waits. Counts the joins an ended sync covered and the ms they still waited: what `1` can save at most. Go on if it says 15 ms a frame or more.
+- **`1`:** covered joins are skipped.
+- **`alt`:** twenty seconds as before, twenty with the skips (`(VICTORY_HEAP_SYNC_NEED=alt): ON` / `: off, as usual`, for `xcl-notes\alt-fps.sh`). The off phases count covered joins as `count` does. A sync left running at the change is met by rule 4.
+- **`check`:** as `1`, and each skip is first checked against the heaps' pages, apart from the stamps' argument (`at_submit/ledger.rs`):
+  - at each stamp a list may carry (hand-over, wait passed, present), the heap pages a sync's take would give now are noted: the kernel's dirty bits read without clearing them, and the journal's pages the heap has not taken (`watch::Tracked::pending`);
+  - each heap take of each sync is noted with the sync's asking stamp;
+  - at a join to be skipped (and at a start that would take rule 2), every page noted at the lists' stamp must have been taken, after the note, by a sync that has ended;
+  - a page taken only by a sync still running, or by none, is a **violation**: it is counted, the first 16 are logged (`VICTORY_HEAP_SYNC_NEED=check: a heap page written before the lists' stamp was ...`), and **that join waits whole**, so no list runs with such a page;
+  - notes and takes are ordered by one lock taken around both;
+  - heaps of view memory (not watched by the kernel) are counted and left unchecked;
+  - costs one kernel look per heap at every hand-over, on the title's threads. A diagnostic, not for fps.
+
+**Grep** (start: `(VICTORY_HEAP_SYNC_NEED=1)`, or the `count`/`check` info lines). On the heap sync line (`descriptor records the title copied`), after the `VICTORY_HEAP_SYNC_BESIDE` part:
+
+`(VICTORY_HEAP_SYNC_NEED <mode>: per frame N joins, N covered by a sync that had ended, N skipped, N joined whole for the check; X ms waited at covered joins all the same (what skipping them saves: count, off phases, checks failed) and X ms at the others; N submissions started no sync (the one left running was covered), N took the one left running, N found it ended, N waited X ms for its end, N sweeps waited X ms for it; the submitting thread at the join: ON X ms a frame (+Y before) over N frames, off X ms a frame (+Y before) over N frames)`
+
+With `check`, after it:
+
+`(VICTORY_HEAP_SYNC_NEED check, since the last line over N frames: N skips checked over N heap pages written before their lists' stamp, N violations (N pages taken only by a sync still running, N taken by none; those joins waited whole), N skips without a note for their stamp, N heaps of view memory not checked)`
+
+Diagnostics builds: the `heap sync by place in the burst` line adds per place `(N joins covered, X ms of it)`. This answers whether the 3rd submission's 13.6 ms is coverable: it is only if the 2nd sync asked after the burst's last hand-over. With skips on, a sync left running counts its own ms and slots with the submission whose join comes after its end.
+
+**What must move:**
+- "ms at the join" 31 to 3-14;
+- the 4th to 8th places' `ms waited` to 0;
+- "at work" on the frame line by the same.
+
+**And "the submitting thread waited N ms for them" on the pass line will rise:** that is the other wall showing, the reason for lever 2 in the same build. Judge fps only with lever 2 on in both phases.
+
+### `VICTORY_MADE_PASS_FIRST=1|alt` (lever 2): the pass goes first on `made`
+
+The pass waits 52-55 ms of its 102-108 for `made`: "120 of 1,168 chunks waited", 0.46 ms a wait, about ten of the sync's chunks. The sync lets `made` go between its chunks and takes it back before the sleeping pass wakes. `VICTORY_MADE_TURNS` does not help the pass: by design, the chunk makers do not say when they wait for each other.
+
+With the switch on (`crates/victory-gpu/src/descriptor/host/made_first.rs`):
+- **(a) The pass spins.** When a chunk of the pass (made alone, on its one thread) finds `made` held (`HostHeap::made_counted`), the pass says it waits: a count of its own beside `Turns::waiting`. It then tries again for up to 200 us before it sleeps in the lock, and a spinning thread catches the gap between two of the sync's chunks.
+- **(b) The sync hands over.** The heap sync's chunk loops (`HostHeap::mirror_due`, and `mirror_due_lean` with `VICTORY_HEAP_SYNC_LEAN`) look at that count before each slot, where they look for `VICTORY_MADE_TURNS`' waiters (the pass first). When the pass waits, the chunk ends there (its keeps and marks made) and `made` goes. The sync waits up to 100 us for the pass to have taken it, then takes it back after the pass's chunk, spinning for it up to 200 us before it sleeps. It then makes at least 64 slots (a chunk's worth) before it hands `made` over again. So the two take turns chunk for chunk, and the pass waits at most about one of the sync's chunks.
+- Why the last two rules: in the bench below, with the hand-over at every slot and the sync asleep in the lock to take it back, the pass (which there never pauses) took `made` again before the sync woke, and the sync fell from 2.37 M to 0.14 M slots a second.
+- `VICTORY_MADE_PASS_FIRST_HAND=0` leaves (b) out (the pass only spins), for telling the two steps apart.
+
+The pass's own loops never look at the count and the sync never raises it, so the two cannot hand `made` back and forth. Not changed:
+- the one-slot takers (the title's views and copies, the draws);
+- the pass's threads holding `made` together (`VICTORY_HEAP_PASS_THREADS`);
+- `VICTORY_PARALLEL_MIRROR`'s rounds, which hand nothing over.
+
+No result changes, only who waits. When both switches are `alt`, this one follows lever 1's phases, so both change at once (`alt::Alt::following`). With lever 1 at `1`, it has phases of its own.
+
+**Alone, lever 2 is expected to lose**, as `MADE_TURNS` did (-0.11 fps): it slows the sync, which now waits for the pass's holds (~38 ms), and without lever 1 every sync is joined.
+
+**Grep** (start: `(VICTORY_MADE_PASS_FIRST=1)`, or the `=alt` lines). A line next to the pass's:
+
+`the pass over buffer views goes first on the heap's slot state (VICTORY_MADE_PASS_FIRST <mode>, the sync's chunks hand it over: yes|no): the pass's wait for the lock of the heap's slot state: ON X ms a pass over N passes, off X ms a pass over N passes; from its start to its end: ON X ms, off X ms; the submitting thread waited for the pass: ON X ms a frame over N frames, off ...; at the heap sync's join: ON ..., off ...; the heap sync's own: ON ..., off ...; per frame N waits of the pass said, N caught by its spin (X ms spun), N hand-overs by the sync's chunks (X ms of the sync's from each hand-over to its having the lock back)`
+
+Every figure there is by this switch's own phase. The pass's parts line (`the pass over buffer views, where its time goes`) still gives `ms waiting for the lock of the heap's slot state` and `ms from its start to its end` for the whole window.
+
+**What must move:**
+- the pass's wait for the lock 55 to under 10 ms;
+- from its start to its end 102 to 55-65 ms;
+- "the submitting thread waited N ms for them" to 0.
+
+Watch the sync's own ms (it now waits for the pass's holds) and the join.
+
+### The pass's chain: the "+42 ms" (always on with `VICTORY_HEAP_PASS_BESIDE=1`)
+
+The 42 ms of T = P + 42 was inferred from four runs, not measured. The pass beside's line (`the pass over buffer views beside (VICTORY_HEAP_PASS_BESIDE=1) per frame: ...`) now ends with:
+
+`; the pass's chain (PF5b's +42 ms): X ms from the present's return to the pass's call; the first submission that asked for a pass came X ms after its end (N of N found it running and waited X ms), at place X in the burst (1 = the first after the present)`
+
+It measures, per pass:
+- the title's recording from the present to the list that runs the pass;
+- the slack between the pass's end and the first submission that waits for it (or how late the pass was);
+- where in the burst that submission stands.
+
+With it, the pass chain can be read in one run, and "start the pass earlier" can be judged. Cost: a clock read at the call, at the pass's end, at the present and at each list's wait, and one small lock a submission.
+
+### `=alt` runs to make (nothing was run for this branch)
+
+1. **Step 0:** `VICTORY_HEAP_SYNC_NEED=count`. Read the line's "ms waited at covered joins all the same" (15 ms a frame or more: go on) and the by-place covered ms.
+2. **Lever 1:** `VICTORY_HEAP_SYNC_NEED=alt VICTORY_MADE_PASS_FIRST=1`. Expect the ON join down by the covered ms, and the pass wait on the pass line up.
+3. **Lever 2:** `VICTORY_HEAP_SYNC_NEED=1 VICTORY_MADE_PASS_FIRST=alt`. Expect the pass's lock wait and its start-to-end down.
+4. **Both against the plain set:** `VICTORY_HEAP_SYNC_NEED=alt VICTORY_MADE_PASS_FIRST=alt` (the same phases).
+5. **Once, for safety:** `VICTORY_HEAP_SYNC_NEED=check` (with `VICTORY_MADE_PASS_FIRST=1`). Expect 0 violations and few skips without a note.
+
+Predicted together (the note's model, not a measurement): S + 5 from 147 to 119-130 and P + 42 from 150 to 100-110, so a frame of about 120-130 ms, +0.9 to +1.5 fps.
+
+### Tests
+
+Unit tests, `cargo test -p victory-gpu --lib -- descriptor::at_submit pass_first alt::tests`; those marked "on a device" need the host device.
+
+Lever 1, `at_submit::need::tests` (the needed-slot rule):
+- `covered_only_by_an_ended_sync_that_asked_after_the_hand_over`: not by a sync still running, not after a later hand-over, not when settled, a list of ours needs the title's latest call;
+- `the_covered_stamp_follows_the_sync_s_end_and_not_a_panic`;
+- `a_join_is_skipped_only_when_covered_and_on`: needed, `count`/off phases, settled, skipped, the sweep's wait, rule 1;
+- `a_submission_s_start_meets_the_sync_left_running_by_the_rules`: rules 2, 3 and 4, and off phases always rule 4;
+- `a_failed_check_makes_the_join_wait_whole`: a page noted at the stamp that no ended sync took makes the join wait whole, and keeps rule 2 from being taken at the start (checked once a submission);
+- `no_submission_goes_on_with_a_slot_written_before_its_hand_over_unmirrored`: a model of title and host slots over 40 random bursts, with slow syncs, mixed ON/off submissions and next-frame writes. Past every join, skipped or not, each slot a list reads and the title wrote before its hand-over shows that record; joins are skipped;
+- `a_skipped_join_leaves_its_lists_slots_mirrored_on_a_real_heap` (on a device): a placed, write-watched sampler heap and the real heap sync. A burst's 2nd join is skipped with its slot shown, the sync left running mirrors the next frame's slot by the sweep, and a later hand-over after a new record is not covered (its join waits and shows the new record).
+
+Lever 1, `at_submit::ledger::tests` (the check):
+- `a_page_noted_at_the_stamp_must_be_taken_after_by_an_ended_sync`: takes before the note do not count, nor syncs still running, nor takes not ours; no note means unchecked; takes let go mean unchecked;
+- `a_written_page_is_noted_and_cleared_by_a_take`: on a real write-watched range, a written page is pending, peeking does not take it, and a take gives it and clears it;
+- `ranges_become_their_pages`, `the_line_part_counts_the_checks`.
+
+Lever 2, `descriptor::host::fast_tests` (on a device):
+- `the_pass_first_leaves_every_slot_as_without_it`: the sync's chunks and the pass's chunks on two threads at once, 24 rounds, the pass first with both steps. Every slot's record and held resource is as the same rounds one after the other with the switch off leave it; the pass said it waited and the sync handed `made` over.
+- Micro-benchmark `bench_pass_first` (`cargo test -p victory-gpu --profile diag --lib descriptor::host::fast_tests::bench_pass_first -- --ignored --nocapture`): one thread makes 8,192 slots in the sync's chunks over and over, another (counted as the pass's) 2,048 slots of its own in the pass's chunks of 64, with no pause between its chunks; 2 s each, two runs each way (Ryzen 9 9900X, another agent building beside):
+
+| | the pass: chunks in 2 s, wait for `made` a chunk, share of its time | the sync |
+|---|---|---|
+| off | 13,440-14,080; 109-116 us; 77-78 % | 2.30 M slots/s |
+| spin (a) | 18,656-19,712; 69-75 us; 68-70 % | 2.06-2.12 M slots/s |
+| spin + hand-over (a + b) | 46,144-46,336; 12.3-12.4 us; 28-29 % | 0.98 M slots/s |
+
+  With (b) the two take turns: the pass waits about a tenth as long and makes 3.4 times the chunks, and the sync gets a bit under half of `made`, the most it can when the pass never pauses. In the game the pass works outside the lock between its chunks (its copies and ranges), so the sync should lose less: the note expects it to wait for the pass's ~38 ms of holds.
+- `made_first::tests::the_line_says_each_phase`.
+
+Also `alt::tests::a_follower_takes_its_leader_s_phases_when_both_alternate`, and `burst`'s tests with the covered columns.
+
+### Risks
+
+- **Lever 1, a title that rewrites a slot its handed-over lists still read.** That would break: the record could be mirrored between the refreshes and `ExecuteCommandLists`, where today it is mirrored at the next submission, possibly while the lists are on the card. On the console that is a race the title cannot run. `check` would not see it either (the write comes after the stamp).
+- **Lever 1, fewer syncs (rule 2).** When one is still running, a submission starts none, so the next sync asks up to one submission later than today. Records copied as bytes then reach the pass over buffer views' marks later, so a slot may be made by the next pass instead. That lateness already exists today (the syncs race with the pass's call), but its window grows. `alt` runs show it as more slots on the next pass, if anything.
+- **Lever 1, what the check does not cover.** It checks pages taken, not each slot's making. Slots left waiting for a texture's host copy (`make_waiting`, still run at the join place), slots left to the draws through tables, and `VICTORY_MIRROR_TRY`'s deferred slots (drained by every sync after its asking) are as before, so the check does not look at them.
+- **Lever 1, the burst line's sync ms by place** shift with skips: a sync left running is counted with a later submission.
+- **Lever 2, the sync slows.** It waits for the pass's holds: up to 100 us a hand-over plus the pass's chunk (~35 us), at most once every 64 of its slots, and it spins up to 200 us to take `made` back. While both want `made` the sync gets about half (the bench). Without lever 1 every sync is joined, so the join grows. Use it with lever 1.
+- **Lever 2, the spins** burn up to 200 us of a core per wait: the pass's (120 waits a frame in PF5b, so at most ~24 ms a frame of a core) and the sync's, once per hand-over.
+- **Lever 2, other waiters.** The title's one-slot takers may wait a little longer while the pass, preferred, holds `made` chunk after chunk. `VICTORY_MADE_TURNS` still lets them in between the pass's slots.
+- **Neither is measured yet.** The unit tests show the order and the mechanism, not the frame.
+
 ## Water and boats: textures shaders write are copied back (on by default, `VICTORY_TEXTURE_BACK`)
 
 - **What.** A list whose shaders write (through unordered access) a texture of one of four kinds copies it into a read-back buffer when it closes; once the list has run, the texels are tiled into the texture's title memory in the console's layout. The kinds (width x height, DXGI format): 256x256 R32_FLOAT (41, the ocean's height map), 256x256 R32G32_FLOAT (16, its displacement map), and the min/max planes 64x64 R32G32_FLOAT (16) and 128x128 R16G16_UINT (36).

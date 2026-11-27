@@ -754,6 +754,51 @@ impl Tracked {
         }
         ranges
     }
+
+    /// VIcky (`VICTORY_HEAP_SYNC_NEED=check`,
+    /// `crate::descriptor::at_submit::ledger`): the pages (numbers of
+    /// [`PAGE`]s) of `[from, to)`, cut to the tracked range, that
+    /// [`Tracked::take`] would give now, without asking for them: the
+    /// kernel's dirty bits read without clearing them, and the journal's
+    /// pages this range has not taken. Changes nothing. `None` if the
+    /// kernel does not watch the range (view memory).
+    pub(crate) fn pending(&self, from: usize, to: usize) -> Option<Vec<usize>> {
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        if from >= to {
+            return Some(Vec::new());
+        }
+        let (first, last) = (from / PAGE, to.div_ceil(PAGE));
+        // The journal's lock: no asking clears a dirty bit between the
+        // kernel's answer and the journal's.
+        let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut count = (last - first) * PAGE / KERNEL_PAGE;
+        let mut found = vec![0usize; count];
+        let mut granularity = 0;
+        // SAFETY: the answer buffer holds `count` entries; no flag: the
+        // dirty bits are read, not cleared.
+        let failed = unsafe {
+            GetWriteWatch(0, (first * PAGE) as *const _, (last - first) * PAGE, found.as_mut_ptr().cast(), &mut count, &mut granularity)
+        } != 0;
+        if failed {
+            return None;
+        }
+        let mut pages: Vec<usize> = found[..count].iter().map(|&at| at / PAGE).collect();
+        {
+            let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+            pages.extend(
+                j.written
+                    .range(first, last)
+                    .filter(|&(page, write)| seen.get(&page).is_none_or(|&last| last < write))
+                    .map(|(page, _)| page),
+            );
+        }
+        drop(j);
+        pages.retain(|&page| (first..last).contains(&page));
+        pages.sort_unstable();
+        pages.dedup();
+        Some(pages)
+    }
 }
 
 /// Guarded blocks of view memory.

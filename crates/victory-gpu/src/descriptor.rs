@@ -275,7 +275,9 @@ fn sync_held(asked: Option<&dyn Fn()>, started: std::time::Instant) {
         // a heap map the title slots past the identity window have: pool
         // slots, `host::HostHeap::mirrored`.)
         let mirrored_count = heap.desc.count.min(host.mirrored());
-        let ranges = written.take(start as usize, end as usize);
+        // (VIcky, `VICTORY_HEAP_SYNC_NEED=check`: the take noted as this
+        // sync's, `at_submit::ledger`.)
+        let ranges = at_submit::ledger::took(|| written.take(start as usize, end as usize));
         if asked.is_some() {
             later.push((host, ranges, (start, step), mirrored_count));
             continue;
@@ -304,6 +306,8 @@ fn sync_held(asked: Option<&dyn Fn()>, started: std::time::Instant) {
     host::note_kind::synced(us, mirrored + drained);
     host::sync_lean::synced(us, mirrored + drained);
     host::par_mirror::synced(us, mirrored + drained);
+    // VIcky (`VICTORY_MADE_PASS_FIRST`): the sync's own time by its phase.
+    host::made_first::synced(us);
     // VIcky: for the line by place in the burst.
     #[cfg(feature = "diagnostics")]
     burst::synced(us, mirrored + drained);
