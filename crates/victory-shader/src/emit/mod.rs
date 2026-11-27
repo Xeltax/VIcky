@@ -881,17 +881,28 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
-        native,
-        p,
-        st,
-        io,
-        res,
-        inputs,
-        outputs,
-        prims,
-        mesh_stride,
-    })?;
+    // Both runtime and offline translation reach this emitter. Its switch
+    // is included in the shader cache fingerprint by build.rs.
+    let composite_grade_edge = grade_edge_enabled(
+        pixel,
+        &c.digest,
+        c.part(FourCC::DXIL).map(|part| part.data.len()),
+        std::env::var_os("VICTORY_COMPOSITE_GRADE_EDGE").as_deref(),
+    );
+    let l = lower::lower_with_grade_edge(
+        &lower::Parts {
+            native,
+            p,
+            st,
+            io,
+            res,
+            inputs,
+            outputs,
+            prims,
+            mesh_stride,
+        },
+        composite_grade_edge,
+    )?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
@@ -916,6 +927,27 @@ fn emit_program(
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
+}
+
+/// Digest of the one pixel shader (the Composite grade) whose first
+/// grading lookup `VICTORY_COMPOSITE_GRADE_EDGE=1` clamps to the LUT's edge
+/// texels (port of Cuebert 818c5a9).
+const GRADE_EDGE_DIGEST: [u8; 16] = [
+    0x34, 0x8a, 0x8c, 0x9e, 0xd1, 0x59, 0xf7, 0x1e, 0x98, 0x1d, 0x91, 0x8e, 0x65, 0x49, 0xfc, 0x6a,
+];
+
+/// Whether the opt-in grade-edge clamp applies: a pixel shader with that
+/// digest and a 4808-byte DXIL part, with the switch set to exactly `1`.
+fn grade_edge_enabled(
+    pixel: bool,
+    digest: &[u8; 16],
+    dxil_len: Option<usize>,
+    switch: Option<&std::ffi::OsStr>,
+) -> bool {
+    pixel
+        && *digest == GRADE_EDGE_DIGEST
+        && dxil_len == Some(4808)
+        && switch.is_some_and(|value| value == "1")
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -1060,6 +1092,22 @@ mod tests {
         ] {
             assert!(!has(name), "{name}");
         }
+    }
+
+    #[test]
+    fn the_grade_edge_clamp_needs_the_switch_the_shader_and_a_pixel_stage() {
+        use super::{GRADE_EDGE_DIGEST as D, grade_edge_enabled as on};
+        use std::ffi::OsStr;
+        let one = Some(OsStr::new("1"));
+        assert!(on(true, &D, Some(4808), one));
+        assert!(!on(true, &D, Some(4808), None), "opt-in");
+        for other in ["0", "", "true", "11"] {
+            assert!(!on(true, &D, Some(4808), Some(OsStr::new(other))));
+        }
+        assert!(!on(false, &D, Some(4808), one), "pixel stage only");
+        assert!(!on(true, &[0; 16], Some(4808), one), "another shader");
+        assert!(!on(true, &D, Some(4807), one), "another build of it");
+        assert!(!on(true, &D, None, one));
     }
 
     #[test]
