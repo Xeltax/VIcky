@@ -227,7 +227,13 @@ pub(crate) fn sync_heaps_told(asked: Option<&dyn Fn()>) {
     }
     let started = std::time::Instant::now();
     let one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
+    // VIcky: the phases of the `alt` switches of the heap sync's slots.
+    host::note_kind::tick();
+    #[cfg(feature = "diagnostics")]
+    host::note_kind::syncing(true);
     sync_held(asked, started);
+    #[cfg(feature = "diagnostics")]
+    host::note_kind::syncing(false);
     drop(one);
 }
 
@@ -288,6 +294,7 @@ fn sync_held(asked: Option<&dyn Fn()>, started: std::time::Instant) {
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, us]) {
         count.fetch_add(n, Relaxed);
     }
+    host::note_kind::synced(us, mirrored + drained);
     // VIcky: for the line by place in the burst.
     #[cfg(feature = "diagnostics")]
     burst::synced(us, mirrored + drained);
@@ -503,10 +510,12 @@ pub(crate) fn sync_line(frames: f64) {
     // (VIcky, `VICTORY_MIRROR_TRY`: said with the switch on even when no
     // heap page changed.)
     let tried = mirror_try::part(frames);
+    // (VIcky: the sync's slots by kind, and the switches of its notes.)
+    let kinds = host::note_kind::part(frames);
     if pages > 0 || !tried.is_empty() {
         tracing::info!(
             "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
-             {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms{}{}{}",
+             {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms{}{}{}{}",
             pages as f64 / frames,
             looked as f64 / frames,
             mirrored as f64 / frames,
@@ -515,6 +524,7 @@ pub(crate) fn sync_line(frames: f64) {
             wide_part(frames),
             beside,
             tried,
+            kinds,
         );
     }
     // VIcky (diagnostics): the sync and its join by the submission's place
