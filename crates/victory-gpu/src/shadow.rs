@@ -25,6 +25,7 @@ use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
 pub(crate) mod cardlist;
+pub(crate) mod snapside;
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
@@ -2772,6 +2773,10 @@ type Job = Box<dyn FnOnce() + Send>;
 struct Workers {
     jobs: Mutex<std::collections::VecDeque<Job>>,
     more: std::sync::Condvar,
+    /// VIcky ([`snapside`]): work no caller of [`wide`] waits for, taken by
+    /// the kept threads only when `jobs` is empty (locked inside `jobs`'
+    /// lock, never around it).
+    later: Mutex<std::collections::VecDeque<Job>>,
 }
 
 fn workers() -> &'static Workers {
@@ -2780,6 +2785,7 @@ fn workers() -> &'static Workers {
     let workers = WORKERS.get_or_init(|| Workers {
         jobs: Mutex::new(std::collections::VecDeque::new()),
         more: std::sync::Condvar::new(),
+        later: Mutex::new(std::collections::VecDeque::new()),
     });
     STARTED.call_once(|| {
         let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
@@ -2791,6 +2797,9 @@ fn workers() -> &'static Workers {
                         let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
                             if let Some(job) = jobs.pop_front() {
+                                break job;
+                            }
+                            if let Some(job) = workers.later.lock().unwrap_or_else(|e| e.into_inner()).pop_front() {
                                 break job;
                             }
                             jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());

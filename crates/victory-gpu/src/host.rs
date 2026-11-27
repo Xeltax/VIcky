@@ -6502,14 +6502,10 @@ impl Host {
         crate::watch::ask_once_end();
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
-        // lists have not gone to the card.
-        {
-            #[cfg(feature = "diagnostics")]
-            let snapshots = std::time::Instant::now();
-            crate::shadow::take_snapshots();
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
-        }
+        // lists have not gone to the card. VIcky (`VICTORY_SNAPSHOT_BESIDE`,
+        // `crate::shadow::snapside`): on the wide threads until just before
+        // the lists go, below.
+        let snapping = crate::shadow::snapside::take();
         // VIcky: the heap sync started beside the refreshes ends before
         // anything reads the host heaps (the lists, when they run), and the
         // slots it left waiting for a texture made since are made now. The
@@ -6534,6 +6530,7 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        crate::shadow::snapside::done(snapping);
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
