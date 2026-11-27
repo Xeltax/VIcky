@@ -4,8 +4,103 @@
 //! when the list closes; their texels land in title memory once the list has
 //! run (`read_backs`). After fxceless/victory-fork #999 (`f5c03f3b0f`) and
 //! #1376 (`86d446b74f`); a module of its own to keep `host.rs` small.
+//! Also: the landing of a flight's read-backs, and the copy-backs' share of
+//! the waits of submissions sent ahead (`crate::texback::STATS`).
 
 use super::HostList;
+use crate::texback::{STATS, SETTLES, SUPERSEDED, WAITED_US, WENT_AHEAD};
+use std::sync::atomic::Ordering::Relaxed;
+
+/// After lists have run, in order (the lists of one flight, or one list):
+/// their read-backs ([`super::read_backs`]), each list's texture copy-backs
+/// first. With `VICTORY_TEXTURE_BACK_LEAN` a copy that a later one of the
+/// same memory among `lists` supersedes is left out: what tells the title
+/// that the card is done (the flight's bottom-of-pipe writes, the signals
+/// behind it) comes after all of them.
+pub(super) fn read_backs<'a>(lists: impl Iterator<Item = &'a HostList> + Clone) {
+    let superseded = if crate::texback::lean() { superseded(lists.clone()) } else { Vec::new() };
+    for (l, list) in lists.enumerate() {
+        for (b, back) in list.deferred().texture_backs.iter().enumerate() {
+            if superseded.contains(&(l, b)) {
+                STATS[SUPERSEDED].fetch_add(1, Relaxed);
+                continue;
+            }
+            crate::texback::land(back);
+        }
+        super::read_backs(list);
+    }
+}
+
+/// The copies (list, copy) among `lists` that a later copy of the same
+/// memory supersedes ([`superseded_of`]).
+fn superseded<'a>(lists: impl Iterator<Item = &'a HostList>) -> Vec<(usize, usize)> {
+    let copies: Vec<CopyBack> = lists
+        .enumerate()
+        .flat_map(|(l, list)| {
+            let deferred = list.deferred();
+            deferred.texture_backs.iter().enumerate().map(|(b, back)| ((l, b), back.range(), back.fresh())).collect::<Vec<_>>()
+        })
+        .collect();
+    superseded_of(&copies)
+}
+
+/// A copy back, in landing order: (list, copy), the title memory it writes
+/// (address, end), and whether its allocation is still the one it was
+/// recorded for.
+type CopyBack = ((usize, usize), (usize, usize), bool);
+
+/// The copies a later copy of exactly the same memory supersedes, one whose
+/// allocation is still the one it was recorded for (a stale one lands
+/// nothing: the copy before it still does).
+fn superseded_of(copies: &[CopyBack]) -> Vec<(usize, usize)> {
+    let mut later = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for &(at, range, fresh) in copies.iter().rev() {
+        if later.contains(&range) {
+            out.push(at);
+        } else if fresh {
+            later.insert(range);
+        }
+    }
+    out
+}
+
+/// Whether preparing `runs` reads memory texture copy-backs in the air
+/// write.
+fn reads(runs: &[&HostList]) -> bool {
+    let ranges = {
+        let line = super::line();
+        if line.texture_written.is_empty() {
+            return false;
+        }
+        line.texture_written.clone()
+    };
+    super::blocked_by(&ranges, runs, false).is_some()
+}
+
+/// A submission sent ahead waits for flights before it is prepared
+/// ([`super::late_blocked`]): if it reads memory their texture copy-backs
+/// write (and that memory holds it back: not with
+/// `VICTORY_TEXTURE_BACK_AHEAD`), when its wait began, for [`waited`].
+pub(super) fn reading(runs: &[&HostList]) -> Option<std::time::Instant> {
+    (crate::texback::holding() && reads(runs)).then(std::time::Instant::now)
+}
+
+/// The wait [`reading`] found is over: counted for the copy-back.
+pub(super) fn waited(began: Option<std::time::Instant>) {
+    if let Some(began) = began {
+        STATS[SETTLES].fetch_add(1, Relaxed);
+        STATS[WAITED_US].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+    }
+}
+
+/// With `VICTORY_TEXTURE_BACK_AHEAD`: a submission sent ahead without a
+/// wait that reads memory texture copy-backs in the air write.
+pub(super) fn went_ahead(runs: &[&HostList]) {
+    if !crate::texback::holding() && reads(runs) {
+        STATS[WENT_AHEAD].fetch_add(1, Relaxed);
+    }
+}
 
 impl HostList {
     /// A draw or dispatch being prepared writes title texture `resource`
@@ -83,5 +178,24 @@ impl HostList {
     #[cfg(test)]
     pub(crate) fn texture_back_count(&self) -> usize {
         self.deferred().texture_backs.len()
+    }
+}
+
+#[cfg(test)]
+mod lean_tests {
+    use super::superseded_of;
+
+    /// Only an earlier copy of the very same memory is left out, and only
+    /// for a later copy that still lands.
+    #[test]
+    fn a_later_fresh_copy_of_the_same_memory_supersedes() {
+        let (a, b, c) = ((0x1000, 0x2000), (0x2000, 0x3000), (0x1000, 0x1800));
+        let copies = [((0, 0), a, true), ((0, 1), b, true), ((1, 0), a, true), ((1, 1), c, true), ((2, 0), b, false)];
+        let mut out = superseded_of(&copies);
+        out.sort_unstable();
+        // `a` of list 0 by list 1's; `b` of list 0 stays (list 2's is stale);
+        // `c` overlaps `a` but is not the same memory.
+        assert_eq!(out, [(0, 0)]);
+        assert!(superseded_of(&copies[..1]).is_empty());
     }
 }

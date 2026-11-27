@@ -2773,8 +2773,12 @@ enum Late {
 struct Line {
     line: Vec<Late>,
     /// The title memory the flights' shaders and texture readbacks may write
-    /// (address, end), in order and joined.
+    /// (address, end), in order and joined (the readbacks' unless
+    /// `VICTORY_TEXTURE_BACK_AHEAD`).
     written: Vec<(usize, usize)>,
+    /// The title memory the flights' texture readbacks write, the same way
+    /// (`texture_back::reading`).
+    texture_written: Vec<(usize, usize)>,
     /// Host lists in the flights.
     lists: usize,
     /// The value signalled on the host's fence behind the last flight.
@@ -2801,6 +2805,7 @@ unsafe impl Send for Line {}
 static LINE: Mutex<Line> = Mutex::new(Line {
     line: Vec::new(),
     written: Vec::new(),
+    texture_written: Vec::new(),
     lists: 0,
     target: 0,
     settling: false,
@@ -4411,18 +4416,14 @@ pub(crate) fn walls_trace() -> bool {
 }
 
 /// After `list` has run: the texels its read-backs copied into host
-/// buffers of ours go to the title's memory (`HostList::defer_read_back`).
+/// buffers of ours go to the title's memory (`HostList::defer_read_back`),
+/// after its texture copy-backs (`texture_back::read_backs`).
 ///
 /// A submission that is waited for did this itself. One sent ahead
 /// ([`late`]) did not, at any stage: the flights' lists were settled
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
-    // Textures shaders wrote that the title reads on the CPU
-    // ([`crate::texback`]).
-    for back in &list.deferred().texture_backs {
-        crate::texback::land(back);
-    }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -5868,9 +5869,7 @@ impl Host {
             match item {
                 Late::Run(flight) => {
                     last = flight.number;
-                    for &i in &flight.order {
-                        read_backs(flight.lists[i].host());
-                    }
+                    texture_back::read_backs(flight.order.iter().map(|&i| flight.lists[i].host()));
                     if let Some(card) = flight.card {
                         self.card_done(card);
                     }
@@ -5892,6 +5891,7 @@ impl Host {
             let Line {
                 line: items,
                 written,
+                texture_written,
                 lists,
                 settling,
                 poke,
@@ -5903,16 +5903,21 @@ impl Host {
             in_hand.clear();
             // What is still in the air, from the flights that are.
             written.clear();
+            texture_written.clear();
             *lists = 0;
-            let mut ranges = Vec::new();
+            let (mut ranges, mut textures) = (Vec::new(), Vec::new());
             for item in items.iter() {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
-                    ranges.extend(flight.texture_back_ranges.iter().copied());
+                    textures.extend(flight.texture_back_ranges.iter().copied());
                 }
             }
+            if crate::texback::holding() {
+                ranges.extend(textures.iter().copied());
+            }
             join_ranges(written, ranges);
+            join_ranges(texture_written, textures);
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
@@ -6121,14 +6126,16 @@ impl Host {
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, texture_written, lists: flying, target, .. } = &mut *line;
+            let hold = crate::texback::holding();
             join_ranges(
                 written,
                 sent.back
                     .iter()
                     .flat_map(|(_, ranges)| ranges.iter().copied())
-                    .chain(sent.texture_back_ranges.iter().copied()),
+                    .chain(sent.texture_back_ranges.iter().copied().filter(|_| hold)),
             );
+            join_ranges(texture_written, sent.texture_back_ranges.iter().copied());
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -6172,14 +6179,16 @@ impl Host {
         let number = sent.number;
         {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, texture_written, lists: flying, target, .. } = &mut *line;
+            let hold = crate::texback::holding();
             join_ranges(
                 written,
                 sent.back
                     .iter()
                     .flat_map(|(_, ranges)| ranges.iter().copied())
-                    .chain(sent.texture_back_ranges.iter().copied()),
+                    .chain(sent.texture_back_ranges.iter().copied().filter(|_| hold)),
             );
+            join_ranges(texture_written, sent.texture_back_ranges.iter().copied());
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -6237,6 +6246,7 @@ impl Host {
                 }
                 line.settling = true;
                 line.written.clear();
+                line.texture_written.clear();
                 line.lists = 0;
                 std::mem::take(&mut line.line)
             };
@@ -6322,9 +6332,7 @@ impl Host {
                 match item {
                     Late::Run(flight) => {
                         last = flight.number;
-                        for &i in &flight.order {
-                            read_backs(flight.lists[i].host());
-                        }
+                        texture_back::read_backs(flight.order.iter().map(|&i| flight.lists[i].host()));
                         if let Some(card) = flight.card {
                             self.card_done(card);
                         }
@@ -6384,6 +6392,7 @@ impl Host {
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(mut why) = late_blocked(runs) {
+            let reading = texture_back::reading(runs);
             loop {
                 // VIcky (`VICTORY_FILL_LATCH_PIECE=1`): a wait for a fill
                 // of a latched piece is timed (`fill_ahead`).
@@ -6410,6 +6419,9 @@ impl Host {
                     None => break,
                 }
             }
+            texture_back::waited(reading);
+        } else {
+            texture_back::went_ahead(runs);
         }
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted. VIcky
@@ -6717,7 +6729,7 @@ impl Host {
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.
-            read_backs(list);
+            texture_back::read_backs(std::iter::once(*list));
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
@@ -9530,12 +9542,13 @@ impl Meter {
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB; {reaper}), {draws:.0} draws/frame, \
+                 GPU; {back_ms:.1} copying back {back_mb:.1} MB; {reaper}{texback}), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
                 reaper = crate::reaper::summary(frames),
+                texback = crate::texback::summary(frames),
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
