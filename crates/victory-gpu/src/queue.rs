@@ -1470,6 +1470,13 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
     }
+    // VIcky (`VICTORY_LATE_WATER`): at late stage 3, with everything of
+    // the frame sent, the title goes on once the flights that copy
+    // textures back have landed.
+    #[cfg(windows)]
+    if !sent_behind {
+        crate::host::late_water::at_present();
+    }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK
