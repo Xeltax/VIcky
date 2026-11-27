@@ -423,7 +423,15 @@ The fps runs use the diagnostics exe, whose counters were arrays of adjacent sha
 
 Micro-benchmark (`cargo test -p victory-gpu --profile diag --lib perthread::tests::bench -- --ignored --nocapture`; each thread adds to four adjacent counters in turn, ns an add, wall over adds per thread):
 
-BENCH_TABLE
+| threads | shared adjacent atomics (before) | per-thread blocks (now) | |
+|---|---|---|---|
+| 1 | 4.24 ns | 1.16 ns | 3.7x |
+| 2 | 13.25 ns | 1.09 ns | 12.2x |
+| 4 | 31.77 ns | 1.44 ns | 22.1x |
+| 8 | 74.09 ns | 2.01 ns | 36.9x |
+| 12 | 110.28 ns | 2.66 ns | 41.5x |
+
+(Ryzen 9 9900X, `--profile diag`, 4,000,000 adds a thread. The 12-thread case spans both CCDs.) A counted lock site with the probes off, against the plain lock (`lot4::locks::tests::bench_off_against_plain`, one thread, 20,000,000 locks): 7.55 / 7.61 ns and 7.60 / 7.57 ns, the same within the noise.
 
 Expected in a run: a few ms a frame less on the threads that count most (the recording threads' 41,000 list calls, the sync's and pass's 87,000 + 67,000 slots, every allocation); not measured in a game run yet.
 
