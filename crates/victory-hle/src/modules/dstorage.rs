@@ -431,7 +431,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(workers = started, priority = priority_now(), "dstorage: workers (VICTORY_DSTORAGE_PRIORITY)");
     });
     Some(scheduler)
 }
@@ -488,6 +488,52 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     );
 }
 
+/// VIcky (`VICTORY_DSTORAGE_PRIORITY`; unset or `0`: normal priority, as
+/// before): the priority of the threads that unpack streamed assets,
+/// `<-2..2>` (`-1`: below normal, foxhound 9f8838b1's default, the
+/// companion of trustno1 80c70b71's `VICTORY_HELPER_PRIORITY`); `alt`:
+/// `-1` and normal by turns of twenty seconds, each change said as
+/// `... (VICTORY_DSTORAGE_PRIORITY=alt): ON` or `off, as usual`. In
+/// foxhound's timeline of a crowded cutscene 16 workers ran 10 ms a frame
+/// each beside the listing threads, and the threads a frame waits for stood
+/// "woken, not running yet" for 9.5 ms of each frame; below them in
+/// priority the workers take the processors nobody of the frame wants.
+fn priority_now() -> i32 {
+    static MODE: OnceLock<Option<i32>> = OnceLock::new();
+    // `None`: alt.
+    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_DSTORAGE_PRIORITY").as_deref().map(str::trim) {
+        Ok("alt") => None,
+        Ok(v) => Some(v.parse::<i32>().map_or(0, |p| p.clamp(-2, 2))),
+        Err(_) => Some(0),
+    });
+    let Some(priority) = mode else {
+        static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+        static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+        let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+        if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+            tracing::info!(
+                "the threads that unpack streamed assets run below normal priority from now (VICTORY_DSTORAGE_PRIORITY=alt): {}",
+                if on { "ON" } else { "off, as usual" }
+            );
+        }
+        return if on { -1 } else { 0 };
+    };
+    priority
+}
+
+/// A worker's priority ([`priority_now`]), asked of the system only when it
+/// changes; nothing is asked while it is normal and was never set.
+#[cfg(windows)]
+fn keep_priority(applied: &mut i32) {
+    let now = priority_now();
+    if now != *applied {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+        // SAFETY: this thread's own priority.
+        unsafe { SetThreadPriority(GetCurrentThread(), now) };
+        *applied = now;
+    }
+}
+
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
     // `VICTORY_DISK_CORES=slow`: the workers leave the fast cores to the
@@ -500,6 +546,8 @@ fn work(scheduler: &'static Scheduler) {
             victory_gpu::framelog::keep_on_slow_cores("dstorage worker");
         }
     }
+    #[cfg(windows)]
+    let mut priority = 0;
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -507,6 +555,8 @@ fn work(scheduler: &'static Scheduler) {
             continue;
         };
         drop(lanes);
+        #[cfg(windows)]
+        keep_priority(&mut priority);
         let started = std::time::Instant::now();
         let result = execute(&job.request);
         walls_request(&job.request, &result, started);

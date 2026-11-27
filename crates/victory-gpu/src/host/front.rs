@@ -169,6 +169,8 @@ pub(super) fn walk(runs: &[&HostList], keep: bool) -> Walk {
                 Step::GpuWrite(shadow, ..) => Touch::Write(Arc::as_ptr(shadow) as usize),
                 Step::Copy(..) | Step::Run(_) => Touch::Title,
                 Step::Fill(..) | Step::Host(_) | Step::Texture(_) | Step::HeapPass(_) => continue,
+                #[cfg(feature = "diagnostics")]
+                Step::Inspect(..) => continue,
             });
         }
     }
@@ -252,8 +254,8 @@ impl Batch {
         let ahead = due.len() > 1;
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = due.iter().filter(|r| !r.0.unwatched()).map(|r| (r.1, r.2)).collect();
-            crate::watch::ask_ahead(&ranges);
+            let ranges = due.iter().filter(|r| !r.0.unwatched()).map(|r| (r.1, r.2));
+            crate::watch::ask_ahead(ranges);
             let us = started.elapsed().as_micros() as u64;
             super::preparing(0, us);
             #[cfg(feature = "diagnostics")]

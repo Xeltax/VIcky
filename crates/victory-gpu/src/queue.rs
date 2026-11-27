@@ -511,7 +511,11 @@ fn wake() {
 #[cfg(windows)]
 fn worker() {
     crate::framelog::keep_on_fast_cores("victory-submit");
+    // VIcky (`VICTORY_HELPER_PRIORITY`, `crate::helpers`): the submitting
+    // thread with its helpers.
+    let mut priority = crate::helpers::Priority::new();
     loop {
+        priority.keep();
         {
             let mut work = lock(&WORK.0);
             while !*work {
@@ -1469,6 +1473,13 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
+    }
+    // VIcky (`VICTORY_LATE_WATER`): at late stage 3, with everything of
+    // the frame sent, the title goes on once the flights that copy
+    // textures back have landed.
+    #[cfg(windows)]
+    if !sent_behind {
+        crate::host::late_water::at_present();
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);

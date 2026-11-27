@@ -2178,6 +2178,10 @@ enum Step {
     /// its refreshes in place. They take its place once it has ended,
     /// before anything reads the steps ([`HostList::join_heap_passes`]).
     HeapPass(std::sync::Arc<crate::draw::heap_pass::Pending>),
+    /// Diagnostics (`VICTORY_BVH_INPUT_CHECK=1`, [`inspect`]): work that
+    /// reads a copy once its refresh is done and writes nothing.
+    #[cfg(feature = "diagnostics")]
+    Inspect(std::sync::Arc<crate::shadow::Shadow>, Box<dyn Fn() + Send>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2781,8 +2785,12 @@ enum Late {
 struct Line {
     line: Vec<Late>,
     /// The title memory the flights' shaders and texture readbacks may write
-    /// (address, end), in order and joined.
+    /// (address, end), in order and joined (the readbacks' unless
+    /// `VICTORY_TEXTURE_BACK_AHEAD`).
     written: Vec<(usize, usize)>,
+    /// The title memory the flights' texture readbacks write, the same way
+    /// (`texture_back::reading`).
+    texture_written: Vec<(usize, usize)>,
     /// Host lists in the flights.
     lists: usize,
     /// The value signalled on the host's fence behind the last flight.
@@ -2800,6 +2808,9 @@ struct Line {
     /// With [`relay`]: the bottom-of-pipe writes of the flights being
     /// landed (taken out of `line`, not done yet), for [`late_met`].
     in_hand: Vec<(usize, crate::queue::Written, usize)>,
+    /// VIcky: the flights in the air or being landed that copy textures
+    /// back ([`late_water`]).
+    backs: usize,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and host lists nothing records
@@ -2809,12 +2820,14 @@ unsafe impl Send for Line {}
 static LINE: Mutex<Line> = Mutex::new(Line {
     line: Vec::new(),
     written: Vec::new(),
+    texture_written: Vec::new(),
     lists: 0,
     target: 0,
     settling: false,
     poke: false,
     landed: Vec::new(),
     in_hand: Vec::new(),
+    backs: 0,
 });
 /// Told when a flight joins [`LINE`] or it is poked.
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
@@ -2858,15 +2871,61 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
 /// `ranges` with `more`, in order, joined where they overlap or touch.
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
+    merge_ranges(ranges);
+}
+
+/// Joins valid ranges in place, so the next flight reuses their storage
+/// (after ScarlettPort fbf382d1).
+fn merge_ranges(ranges: &mut Vec<(usize, usize)>) {
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for &(from, to) in ranges.iter() {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    ranges.dedup_by(|next, previous| {
+        if next.0 <= previous.1 {
+            previous.1 = previous.1.max(next.1);
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// What the flights among `items` may still write in title memory, into
+/// `written` and `texture_written` in place (their storage reused): every
+/// flight's shader and read-back ranges into `written`, its texture
+/// copy-backs' too while `hold` ([`crate::texback::holding`], i.e. unless
+/// `VICTORY_TEXTURE_BACK_AHEAD`), and the copy-backs' alone into
+/// `texture_written`; both joined. Returns the host lists in the flights.
+fn in_the_air(
+    items: &[Late],
+    hold: bool,
+    written: &mut Vec<(usize, usize)>,
+    texture_written: &mut Vec<(usize, usize)>,
+) -> usize {
+    written.clear();
+    texture_written.clear();
+    let mut lists = 0;
+    for item in items {
+        if let Late::Run(flight) = item {
+            lists += flight.order.len().max(1);
+            written.extend(
+                flight
+                    .back
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(flight.texture_back_ranges.iter().copied().filter(|_| hold))
+                    .filter(|&(from, to)| from < to),
+            );
+            texture_written.extend(
+                flight
+                    .texture_back_ranges
+                    .iter()
+                    .copied()
+                    .filter(|&(from, to)| from < to),
+            );
         }
     }
-    *ranges = out;
+    merge_ranges(written);
+    merge_ranges(texture_written);
+    lists
 }
 
 /// Whether anything is in the air.
@@ -2972,6 +3031,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 // (A pass beside stands for refreshes: put in their place
                 // before this is asked, `HostList::join_heap_passes`.)
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) | Step::HeapPass(_) => {}
+                #[cfg(feature = "diagnostics")]
+                Step::Inspect(..) => {}
             }
         }
     }
@@ -4017,7 +4078,10 @@ fn relay_worker() {
         fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));
     };
     let mut fetch: Option<RelayFetch> = None;
+    // VIcky (`VICTORY_HELPER_PRIORITY`, `crate::helpers`).
+    let mut priority = crate::helpers::Priority::new();
     loop {
+        priority.keep();
         let next = {
             let mut line = line();
             loop {
@@ -4291,7 +4355,41 @@ fn late_line(frames: f64) {
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{Flight, Late, continues, in_the_air, join_ranges, touches};
+
+    /// What is in the air: the texture copy-backs' ranges join `written`
+    /// only while held (without `VICTORY_TEXTURE_BACK_AHEAD`), and
+    /// `texture_written` always; empty ranges are left out, what was there
+    /// before is cleared, and both keep their storage.
+    #[test]
+    fn copy_backs_join_written_only_while_held() {
+        let flight = |number: u64, order: Vec<usize>, ranges: Vec<(usize, usize)>| {
+            Late::Run(Flight {
+                number,
+                fence: number,
+                lists: Vec::new(),
+                order,
+                card: None,
+                back: Vec::new(),
+                texture_back_ranges: ranges,
+            })
+        };
+        let items = [
+            flight(1, vec![0, 1], vec![(0x3000, 0x4000), (0x1000, 0x2000)]),
+            Late::Signal(0x100, 1),
+            flight(2, Vec::new(), vec![(0x2000, 0x2800), (0x5000, 0x5000)]),
+        ];
+        let (mut written, mut textures) = (Vec::with_capacity(8), Vec::with_capacity(8));
+        written.push((0x9000, 0xa000));
+        let storage = (written.as_ptr(), textures.as_ptr());
+        assert_eq!(in_the_air(&items, true, &mut written, &mut textures), 3);
+        assert_eq!(written, [(0x1000, 0x2800), (0x3000, 0x4000)]);
+        assert_eq!(textures, written);
+        assert_eq!(in_the_air(&items, false, &mut written, &mut textures), 3);
+        assert!(written.is_empty());
+        assert_eq!(textures, [(0x1000, 0x2800), (0x3000, 0x4000)]);
+        assert_eq!((written.as_ptr(), textures.as_ptr()), storage);
+    }
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -4316,11 +4414,13 @@ mod late_tests {
     /// range that only touches another's end does not touch it.
     #[test]
     fn ranges_touch_where_they_overlap() {
-        let mut ranges = Vec::new();
+        let mut ranges = Vec::with_capacity(8);
+        let storage = ranges.as_ptr();
         join_ranges(&mut ranges, [(40, 50), (10, 20), (20, 25), (45, 60), (7, 7)]);
         assert_eq!(ranges, [(10, 25), (40, 60)]);
         join_ranges(&mut ranges, [(25, 40)]);
         assert_eq!(ranges, [(10, 60)]);
+        assert_eq!(ranges.as_ptr(), storage);
         let ranges = [(10usize, 25usize), (40, 60), (100, 101)];
         for (from, to, hit) in [
             (0, 10, false),
@@ -4359,10 +4459,18 @@ mod late_tests {
 /// mapped now fails the joined copy as a whole (it then goes page by page,
 /// zeros for what cannot be read, as a single copy does), where before
 /// only the copy that held it did.
+///
+/// VIcky: the same switch as foxhound 9f8838b1's (the code is the same);
+/// `VICTORY_JOIN_COPIES=alt` joins them in turns of twenty seconds, said as
+/// "(VICTORY_JOIN_COPIES=alt): ON/off".
 fn join_copies() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+    JOIN_COPIES.on()
 }
+
+static JOIN_COPIES: crate::alt::Alt = crate::alt::Alt::new(
+    "VICTORY_JOIN_COPIES",
+    "a title buffer copy that continues the one recorded before it in its list becomes one step with it",
+);
 
 /// Since the last frame-rate line: title buffer copies recorded, and those
 /// that continue the one before ([`join_copies`]).
@@ -4419,18 +4527,14 @@ pub(crate) fn walls_trace() -> bool {
 }
 
 /// After `list` has run: the texels its read-backs copied into host
-/// buffers of ours go to the title's memory (`HostList::defer_read_back`).
+/// buffers of ours go to the title's memory (`HostList::defer_read_back`),
+/// after its texture copy-backs (`texture_back::read_backs`).
 ///
 /// A submission that is waited for did this itself. One sent ahead
 /// ([`late`]) did not, at any stage: the flights' lists were settled
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
-    // Textures shaders wrote that the title reads on the CPU
-    // ([`crate::texback`]).
-    for back in &list.deferred().texture_backs {
-        crate::texback::land(back);
-    }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -5876,9 +5980,7 @@ impl Host {
             match item {
                 Late::Run(flight) => {
                     last = flight.number;
-                    for &i in &flight.order {
-                        read_backs(flight.lists[i].host());
-                    }
+                    texture_back::read_backs(flight.order.iter().map(|&i| flight.lists[i].host()), true);
                     if let Some(card) = flight.card {
                         self.card_done(card);
                     }
@@ -5900,27 +6002,20 @@ impl Host {
             let Line {
                 line: items,
                 written,
+                texture_written,
                 lists,
                 settling,
                 poke,
                 landed: kept,
                 in_hand,
+                backs,
                 ..
             } = &mut *line;
             kept.extend(landed);
             in_hand.clear();
             // What is still in the air, from the flights that are.
-            written.clear();
-            *lists = 0;
-            let mut ranges = Vec::new();
-            for item in items.iter() {
-                if let Late::Run(flight) = item {
-                    *lists += flight.order.len().max(1);
-                    ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
-                    ranges.extend(flight.texture_back_ranges.iter().copied());
-                }
-            }
-            join_ranges(written, ranges);
+            *backs = late_water::carrying(items);
+            *lists = in_the_air(items, crate::texback::holding(), written, texture_written);
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
@@ -6129,15 +6224,18 @@ impl Host {
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, texture_written, lists: flying, target, backs, .. } = &mut *line;
+            let hold = crate::texback::holding();
             join_ranges(
                 written,
                 sent.back
                     .iter()
                     .flat_map(|(_, ranges)| ranges.iter().copied())
-                    .chain(sent.texture_back_ranges.iter().copied()),
+                    .chain(sent.texture_back_ranges.iter().copied().filter(|_| hold)),
             );
+            join_ranges(texture_written, sent.texture_back_ranges.iter().copied());
             *flying += order.len();
+            *backs += usize::from(!sent.texture_back_ranges.is_empty());
             *target = *submitted;
             items.push(Late::Run(Flight {
                 number: sent.number,
@@ -6180,15 +6278,18 @@ impl Host {
         let number = sent.number;
         {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, texture_written, lists: flying, target, backs, .. } = &mut *line;
+            let hold = crate::texback::holding();
             join_ranges(
                 written,
                 sent.back
                     .iter()
                     .flat_map(|(_, ranges)| ranges.iter().copied())
-                    .chain(sent.texture_back_ranges.iter().copied()),
+                    .chain(sent.texture_back_ranges.iter().copied().filter(|_| hold)),
             );
+            join_ranges(texture_written, sent.texture_back_ranges.iter().copied());
             *flying += 1;
+            *backs += usize::from(!sent.texture_back_ranges.is_empty());
             *target = *submitted;
             items.push(Late::Run(Flight {
                 number,
@@ -6232,6 +6333,9 @@ impl Host {
             // comes here, so each still sees title memory, fences and
             // bottom-of-pipe values as after a settle.
             relay_wait(why, |line| line.line.is_empty() && !line.settling);
+            // (`VICTORY_TEXTURE_BACK_ASYNC`: and the copy-backs the landing
+            // thread handed to their writer.)
+            crate::texback::drain();
             return;
         }
         let was_working = working(true);
@@ -6245,7 +6349,9 @@ impl Host {
                 }
                 line.settling = true;
                 line.written.clear();
+                line.texture_written.clear();
                 line.lists = 0;
+                line.backs = 0;
                 std::mem::take(&mut line.line)
             };
             let flights = items.iter().filter(|i| matches!(i, Late::Run(_))).count();
@@ -6330,9 +6436,7 @@ impl Host {
                 match item {
                     Late::Run(flight) => {
                         last = flight.number;
-                        for &i in &flight.order {
-                            read_backs(flight.lists[i].host());
-                        }
+                        texture_back::read_backs(flight.order.iter().map(|&i| flight.lists[i].host()), false);
                         if let Some(card) = flight.card {
                             self.card_done(card);
                         }
@@ -6392,6 +6496,7 @@ impl Host {
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(mut why) = late_blocked(runs) {
+            let reading = texture_back::reading(runs);
             loop {
                 // VIcky (`VICTORY_FILL_LATCH_PIECE=1`): a wait for a fill
                 // of a latched piece is timed (`fill_ahead`).
@@ -6418,6 +6523,9 @@ impl Host {
                     None => break,
                 }
             }
+            texture_back::waited(reading);
+        } else {
+            texture_back::went_ahead(runs);
         }
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted. VIcky
@@ -6576,6 +6684,7 @@ impl Host {
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
+            awake::sent(&self.device);
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
@@ -6620,6 +6729,7 @@ impl Host {
             unsafe {
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
+                awake::sent(&self.device);
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -6725,7 +6835,7 @@ impl Host {
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.
-            read_backs(list);
+            texture_back::read_backs(std::iter::once(*list), false);
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
@@ -8176,6 +8286,12 @@ impl HostList {
                     }
                     continue;
                 }
+                #[cfg(feature = "diagnostics")]
+                Step::Inspect(shadow, work) => {
+                    batch.flush_one(shadow);
+                    work();
+                    continue;
+                }
                 // Put in place at the start of the submission
                 // (`HostList::join_heap_passes`), so not met here; if it
                 // were, its refreshes are done as refresh steps are.
@@ -8322,6 +8438,18 @@ pub(crate) mod sparseknown;
 
 /// The host list's side of the texture copy-back ([`crate::texback`]).
 mod texture_back;
+
+/// VIcky: the host list's side of `VICTORY_BVH_INPUT_CHECK`.
+#[cfg(feature = "diagnostics")]
+mod inspect;
+
+/// VIcky: presents wait for the flights that copy textures back,
+/// `VICTORY_LATE_WATER`.
+pub(crate) mod late_water;
+
+/// VIcky: the card kept awake between submissions, `VICTORY_CARD_AWAKE`
+/// (port of foxhound 9f8838b1).
+mod awake;
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
@@ -8479,13 +8607,8 @@ impl Batch {
         let ahead = self.refreshes.len() > 1;
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = self
-                .refreshes
-                .iter()
-                .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
-                .collect();
-            crate::watch::ask_ahead(&ranges);
+            let ranges = self.refreshes.iter().filter(|r| !r.0.unwatched()).map(|r| (r.1, r.2));
+            crate::watch::ask_ahead(ranges);
             let us = started.elapsed().as_micros() as u64;
             preparing(0, us);
             #[cfg(feature = "diagnostics")]
@@ -9447,7 +9570,7 @@ impl Meter {
                 tracing::info!(
                     "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
                      (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
-                    if join_copies() { "on" } else { "off" }
+                    JOIN_COPIES.said()
                 );
             }
         }
@@ -9549,12 +9672,15 @@ impl Meter {
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB; {reaper}), {draws:.0} draws/frame, \
+                 GPU; {back_ms:.1} copying back {back_mb:.1} MB; {reaper}{texback}{water}{awake}), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
                 reaper = crate::reaper::summary(frames),
+                texback = crate::texback::summary(frames),
+                water = late_water::summary(frames),
+                awake = awake::summary(frames),
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),

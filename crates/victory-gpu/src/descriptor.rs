@@ -233,6 +233,7 @@ pub(crate) fn sync_heaps_told(asked: Option<&dyn Fn()>) {
     // VIcky: the phases of the `alt` switches of the heap sync's slots.
     host::note_kind::tick();
     host::sync_lean::tick();
+    host::par_mirror::tick();
     #[cfg(feature = "diagnostics")]
     host::note_kind::syncing(true);
     sync_held(asked, started);
@@ -300,6 +301,7 @@ fn sync_held(asked: Option<&dyn Fn()>, started: std::time::Instant) {
     }
     host::note_kind::synced(us, mirrored + drained);
     host::sync_lean::synced(us, mirrored + drained);
+    host::par_mirror::synced(us, mirrored + drained);
     // VIcky: for the line by place in the burst.
     #[cfg(feature = "diagnostics")]
     burst::synced(us, mirrored + drained);
@@ -337,8 +339,11 @@ fn walk_heap(
     page_bytes: &mut Vec<u8>,
 ) -> [u64; 3] {
     let threads = sync_threads();
-    if threads > 0 {
-        return sync_wide(host, ranges, (start, step), mirrored_count, threads);
+    // VIcky (`VICTORY_PARALLEL_MIRROR`, `host::par_mirror`): the pages read
+    // first (here on this thread alone without `VICTORY_HEAP_SYNC_THREADS`),
+    // then their slots made together.
+    if threads > 0 || host::par_mirror::now() {
+        return sync_wide(host, ranges, (start, step), mirrored_count, threads.max(1));
     }
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     for &(range_from, range_end) in ranges {
@@ -460,7 +465,11 @@ fn sync_wide(
     type Found = Option<(u64, Vec<(u32, u64)>, Vec<[u32; 3]>)>;
     let pages = Arc::new(pages);
     let found: Arc<Vec<Mutex<Found>>> = Arc::new((0..pages.len()).map(|_| Mutex::new(None)).collect());
-    let groups = threads.clamp(1, pages.len());
+    // VIcky (`VICTORY_SYNC_FINE`, [`SYNC_FINE`]): with the walk spread,
+    // jobs of [`SYNC_PAGES_FINE`] pages each, which the wide threads share,
+    // instead of one job per thread.
+    let fine = threads > 1 && SYNC_FINE.on();
+    let groups = if fine { pages.len().div_ceil(SYNC_PAGES_FINE) } else { threads.clamp(1, pages.len()) };
     let per = pages.len().div_ceil(groups);
     let heap_at = std::ptr::from_ref(host) as usize;
     let jobs: Vec<Box<dyn FnOnce() + Send>> = (0..groups)
@@ -496,6 +505,10 @@ fn sync_wide(
     }
     let read = started.elapsed();
     let (mut pages_read, mut looked, mut mirrored) = (0, 0, 0);
+    // VIcky (`VICTORY_PARALLEL_MIRROR`, `host::par_mirror`): every page's
+    // slots, in the same order, made together on several threads.
+    let wide = host::par_mirror::now();
+    let (mut all_due, mut all_records) = (Vec::new(), Vec::new());
     for page in found.iter() {
         let Some((seen, due, records)) = page.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             continue;
@@ -503,15 +516,65 @@ fn sync_wide(
         pages_read += 1;
         looked += seen;
         mirrored += due.len() as u64;
+        if wide {
+            all_due.extend(due);
+            all_records.extend(records);
+            continue;
+        }
         match lean {
             Some(check) => host.mirror_due_lean(&due, &records, check),
             None => host.mirror_due(&due),
         }
     }
+    if wide {
+        host.mirror_due_par(&all_due, &all_records, lean);
+    }
     WIDE[0].fetch_add(read.as_micros() as u64, Relaxed);
     WIDE[1].fetch_add((started.elapsed() - read).as_micros() as u64, Relaxed);
     WIDE[2].store(groups as u64, Relaxed);
     [pages_read, looked, mirrored]
+}
+
+/// VIcky: finer jobs for the heap sync's threads (`VICTORY_SYNC_FINE=1|alt`;
+/// off by default). Port of Belobug a284ca74 (there 2 pages and 64 records
+/// a job, against 8 and 256): a round for a submission finds a dozen pages
+/// or so, and by eight a job that was two jobs on two of six threads while
+/// the submission waited for the round (2 to 3.4 ms at a time, run city4).
+/// Here, with the walk spread (`VICTORY_HEAP_SYNC_THREADS` of 2 or more),
+/// the pages are read in jobs of [`SYNC_PAGES_FINE`] that the wide threads
+/// share, not in one job per thread; and with `VICTORY_PARALLEL_MIRROR` a
+/// round's slots are made in chunks of [`SYNC_SLOTS_FINE`], not one chunk
+/// per thread (`host::par_mirror`). What is read and made is the same;
+/// only the cut differs.
+#[cfg(windows)]
+pub(crate) static SYNC_FINE: crate::alt::Alt =
+    crate::alt::Alt::new("VICTORY_SYNC_FINE", "the heap sync's threads take finer jobs (2 pages, 64 slots)");
+
+/// Pages a job of the spread walk with [`SYNC_FINE`].
+#[cfg(windows)]
+const SYNC_PAGES_FINE: usize = 2;
+
+/// Slots a chunk of the parallel mirroring with [`SYNC_FINE`].
+#[cfg(windows)]
+pub(crate) const SYNC_SLOTS_FINE: usize = 64;
+
+/// VIcky: the sync line's part for `VICTORY_SYNC_FINE` and
+/// `VICTORY_SPANS_QUICK` (empty while neither is set).
+#[cfg(windows)]
+fn fine_part(frames: f64) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [quick, locked] = [0, 1].map(|i| host::SPANS_QUICK_COUNTS[i].swap(0, Relaxed) as f64 / frames);
+    let mut out = String::new();
+    if SYNC_FINE.set() {
+        out += &format!(" (VICTORY_SYNC_FINE {}: jobs of {SYNC_PAGES_FINE} pages, chunks of {SYNC_SLOTS_FINE} slots)", SYNC_FINE.said());
+    }
+    if host::SPANS_QUICK.set() {
+        out += &format!(
+            " (VICTORY_SPANS_QUICK {}: per frame {quick:.0} writes of slots left the spans of placed textures alone,              {locked:.0} took their lock)",
+            host::SPANS_QUICK.said()
+        );
+    }
+    out
 }
 
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
@@ -526,7 +589,7 @@ pub(crate) fn sync_line(frames: f64) {
     // heap page changed.)
     let tried = mirror_try::part(frames);
     // (VIcky: the sync's slots by kind, and the switches of its notes.)
-    let kinds = host::note_kind::part(frames) + &host::sync_lean::part(frames);
+    let kinds = host::note_kind::part(frames) + &host::sync_lean::part(frames) + &host::par_mirror::part(frames);
     if pages > 0 || !tried.is_empty() {
         tracing::info!(
             "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
@@ -539,7 +602,7 @@ pub(crate) fn sync_line(frames: f64) {
             wide_part(frames),
             beside,
             tried,
-            kinds,
+            kinds + &fine_part(frames),
         );
     }
     // VIcky (diagnostics): the sync and its join by the submission's place
@@ -627,15 +690,16 @@ fn changed_slots(
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// `heap`, if that heap still exists and is the host heap `id` that gave
+/// them ([`host::HostHeap::release`]).
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.release(first, n);
+        host.release(id, first, n);
     }
 }
 
@@ -1227,6 +1291,32 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
         PLACED => views_read().placed_of(i, generation),
         _ => None,
     }
+}
+
+/// VIcky (`VICTORY_PARALLEL_MIRROR`, `host::par_mirror`): [`view_at`] of
+/// each of `records` (tag, index, generation; `None` for a tag that is not
+/// ours), the table of views read once for all of them: the threads that
+/// make a heap sync's slots together took its lock in turn for every slot.
+pub(crate) fn views_of(records: &[[u32; 3]]) -> Vec<Option<View>> {
+    let mut views = None;
+    records
+        .iter()
+        .map(|&[tag, i, generation]| {
+            if tag != VIEW_TAG {
+                return None;
+            }
+            match generation >> KIND_SHIFT {
+                0 => {
+                    let views = views.get_or_insert_with(views_read);
+                    let (view, current) = views.list.get(i as usize)?;
+                    (*current == generation).then(|| view.clone())
+                }
+                CONSTANT => Some(constant_of(i, generation)),
+                PLACED => views.get_or_insert_with(views_read).placed_of(i, generation),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// VIcky (`crate::draw::heap_pass`): the three words of the record at

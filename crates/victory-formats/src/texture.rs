@@ -219,6 +219,114 @@ impl RenderPipeConfig {
     }
 }
 
+/// A run of bytes a row copies: tiled offset, linear offset, length.
+type CopyRun = (usize, usize, usize);
+
+/// What one mip's column runs and row offsets depend on: the swizzle
+/// pattern (given by the mode, the thickness, the element size and the
+/// block) and the mip's extent, pitch and place in the tail.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct TileShape {
+    swizzle: Swizzle,
+    thick: bool,
+    element_bytes: u32,
+    alignment: u64,
+    block: [u32; 3],
+    extent: [u32; 2],
+    pitch: u32,
+    tail: (u32, u32),
+}
+
+impl TileShape {
+    fn new(layout: &Layout, m: &Mip) -> Self {
+        Self {
+            swizzle: layout.desc.swizzle,
+            thick: layout.thick,
+            element_bytes: layout.desc.element_bytes,
+            alignment: layout.alignment,
+            block: layout.block,
+            extent: [m.width, m.height],
+            pitch: m.pitch,
+            tail: m.tail.map_or((0, 0), |t| (t.x, t.y)),
+        }
+    }
+}
+
+/// The copies of one mip of a swizzled layout: the runs every row repeats
+/// (the row and depth add one common base to every column, including in
+/// mip tails), their size if all but the last are equal and aligned, and,
+/// if kept, every row's offset by depth inside the block, then row.
+struct TilePlan {
+    runs: Vec<CopyRun>,
+    chunk_size: Option<usize>,
+    rows: Vec<u64>,
+}
+
+impl TilePlan {
+    fn new(layout: &Layout, m: &Mip, keep_rows: bool) -> Self {
+        let n = layout.desc.element_bytes as usize;
+        let mut runs = Vec::new();
+        let mut first_linear = 0;
+        let mut first_tiled = layout.column(m, 0) as usize;
+        for x in 1..m.width {
+            let offset = layout.column(m, x) as usize;
+            let at = x as usize * n;
+            if offset != first_tiled + (at - first_linear) {
+                runs.push((first_tiled, first_linear, at - first_linear));
+                first_tiled = offset;
+                first_linear = at;
+            }
+        }
+        runs.push((first_tiled, first_linear, m.width as usize * n - first_linear));
+        // A mip can end partway through the last run. Check the other runs
+        // once so each row can copy them as fixed-size chunks.
+        let body = &runs[..runs.len() - 1];
+        let chunk_size = body.first().map(|run| run.2).filter(|&size| {
+            body.iter()
+                .all(|&(offset, _, len)| len == size && offset.is_multiple_of(size))
+        });
+        let rows = if keep_rows {
+            let inner = if layout.thick { layout.block[2] } else { 1 };
+            (0..inner)
+                .flat_map(|z| (0..m.height).map(move |y| layout.row(m, y, z)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self { runs, chunk_size, rows }
+    }
+}
+
+/// The column runs and row offsets of the mips copied before, kept for
+/// copies of the same geometry (a thread that tiles the same textures
+/// again and again: the texture copy-back). After TaynanGT
+/// f0019f2e20 (Taynan Piza).
+#[derive(Default)]
+pub struct TilingCache {
+    plans: std::collections::HashMap<TileShape, TilePlan>,
+}
+
+impl TilingCache {
+    /// As [`Layout::tile`]: linear rows into tiled memory, mip and slice
+    /// `subresource`, rows and depth slices `pitches` bytes apart.
+    pub fn tile(
+        &mut self,
+        layout: &Layout,
+        tiled: &mut [u8],
+        subresource: (u32, u32),
+        linear: &[u8],
+        pitches: (usize, usize),
+    ) -> Result<(), Error> {
+        layout.walk::<false>(linear, tiled, subresource.0, subresource.1, pitches.0, pitches.1, Some(self))
+    }
+
+    fn plan(&mut self, layout: &Layout, m: &Mip) -> &TilePlan {
+        self.plans
+            .entry(TileShape::new(layout, m))
+            .or_insert_with(|| TilePlan::new(layout, m, true))
+    }
+}
+
 /// Micro tile (256 bytes) patterns by log2 of the element size: for each
 /// address bit, the element coordinate bit it takes (`x0`, `y1`, `z0`...),
 /// `--` for the bits inside an element. Thin `S`, thin `D`, thick `S`
@@ -648,7 +756,7 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk::<true>(tiled, linear, mip, slice, row_pitch, depth_pitch)
+        self.walk::<true>(tiled, linear, mip, slice, row_pitch, depth_pitch, None)
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -661,10 +769,12 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk::<false>(linear, tiled, mip, slice, row_pitch, depth_pitch)
+        self.walk::<false>(linear, tiled, mip, slice, row_pitch, depth_pitch, None)
     }
 
-    /// Copies contiguous runs in one direction between the two layouts.
+    /// Copies contiguous runs in one direction between the two layouts;
+    /// with `cache`, the runs and row offsets of a mip seen before are
+    /// taken from it.
     #[allow(clippy::too_many_arguments)]
     fn walk<const DETILE: bool>(
         &self,
@@ -674,6 +784,7 @@ impl Layout {
         slice: u32,
         row_pitch: usize,
         depth_pitch: usize,
+        cache: Option<&mut TilingCache>,
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
         let depth = m.depth;
@@ -718,39 +829,36 @@ impl Layout {
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
-        // the same contiguous runs repeat on every row, including mip tails.
-        let mut runs = Vec::new();
-        if !linear {
-            let mut first_linear = 0;
-            let mut first_tiled = self.column(m, 0) as usize;
-            for x in 1..m.width {
-                let offset = self.column(m, x) as usize;
-                let at = x as usize * n;
-                if offset != first_tiled + (at - first_linear) {
-                    runs.push((first_tiled, first_linear, at - first_linear));
-                    first_tiled = offset;
-                    first_linear = at;
+        // the same contiguous runs repeat on every row, including mip tails
+        // ([`TilePlan`]).
+        let local;
+        let plan = if linear {
+            None
+        } else {
+            Some(match cache {
+                Some(cache) => cache.plan(self, m),
+                None => {
+                    local = TilePlan::new(self, m, false);
+                    &local
                 }
-            }
-            runs.push((first_tiled, first_linear, bytes - first_linear));
-        }
-        // A mip can end partway through the last run. Check the other runs
-        // once so each row can copy them as fixed-size chunks.
+            })
+        };
+        let runs = plan.map_or(&[][..], |p| p.runs.as_slice());
         let (body, last) = runs.split_at(runs.len().saturating_sub(1));
-        let chunk_size = body.first().map(|run| run.2).filter(|&size| {
-            body.iter()
-                .all(|&(offset, _, len)| len == size && offset.is_multiple_of(size))
-        });
+        let chunk_size = plan.and_then(|p| p.chunk_size);
+        let offsets = plan.map_or(&[][..], |p| p.rows.as_slice());
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
+            let rows = inner as usize * m.height as usize;
             for y in 0..m.height {
                 let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
                 if linear {
                     let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
                     copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
                 } else {
-                    let tiled_row = (base + self.row(m, y, inner)) as usize;
+                    let row = offsets.get(rows + y as usize).copied().unwrap_or_else(|| self.row(m, y, inner));
+                    let tiled_row = (base + row) as usize;
                     match chunk_size {
                         Some(8) if tiled_row.is_multiple_of(8) => {
                             copy_runs::<8, DETILE>(src, dst, body, tiled_row, linear_row)
@@ -792,7 +900,7 @@ fn copy_run<const DETILE: bool>(
 fn copy_runs<const N: usize, const DETILE: bool>(
     src: &[u8],
     dst: &mut [u8],
-    runs: &[(usize, usize, usize)],
+    runs: &[CopyRun],
     tiled_row: usize,
     linear_row: usize,
 ) {
@@ -1043,6 +1151,8 @@ mod tests {
     /// the texture, and tiling then detiling gives the rows back.
     #[test]
     fn addresses_are_a_bijection_and_copies_round_trip() {
+        // One cache for every case: plans are told apart by their shape.
+        let mut cache = TilingCache::default();
         let cases = [
             desc(64, 64, 7, 16, Swizzle::SW_64KB_D),
             desc(100, 60, 7, 4, Swizzle::SW_64KB_D),
@@ -1069,6 +1179,7 @@ mod tests {
             let l = Layout::new(&d).unwrap();
             let mut seen = vec![false; l.size as usize];
             let mut tiled = vec![0u8; l.size as usize];
+            let mut cached = tiled.clone();
             let n = d.element_bytes as usize;
             let slices = if d.dimension == Dimension::Tex3d { 1 } else { d.depth };
             for slice in 0..slices {
@@ -1081,6 +1192,7 @@ mod tests {
                         .map(|i| (i * 7 + mip as usize * 13 + slice as usize) as u8)
                         .collect();
                     l.tile(&mut tiled, mip, slice, &linear, row, plane).unwrap();
+                    cache.tile(&l, &mut cached, (mip, slice), &linear, (row, plane)).unwrap();
                     let mut back = vec![0xcc; linear.len()];
                     l.detile(&tiled, mip, slice, &mut back, row, plane).unwrap();
                     for z in 0..m.depth {
@@ -1103,11 +1215,13 @@ mod tests {
                     }
                 }
             }
+            assert!(cached == tiled, "{d:?} with cached rows and columns");
         }
     }
 
     #[test]
     fn tiled_chunks_match_element_offsets_with_odd_row_pitches() {
+        let mut cache = TilingCache::default();
         for swizzle in [
             Swizzle::SW_256B_S,
             Swizzle::SW_256B_D,
@@ -1127,6 +1241,7 @@ mod tests {
                     .map(|i| (i.wrapping_mul(0x9e37_79b9) >> 24) as u8)
                     .collect();
                 let mut retiled = vec![0xbb; tiled.len()];
+                let mut cached = retiled.clone();
                 let mut expected_tiled = retiled.clone();
                 for slice in 0..l.slices {
                     for (mip, m) in l.mips.iter().enumerate() {
@@ -1151,9 +1266,12 @@ mod tests {
                         assert_eq!(linear, expected, "{swizzle:?} {n} mip {mip} slice {slice}");
                         l.tile(&mut retiled, mip, slice, &expected, pitch, len)
                             .unwrap();
+                        cache.tile(&l, &mut cached, (mip, slice), &expected, (pitch, len))
+                            .unwrap();
                     }
                 }
                 assert_eq!(retiled, expected_tiled, "{swizzle:?} {n}");
+                assert_eq!(cached, expected_tiled, "{swizzle:?} {n} with cached rows and columns");
             }
         }
     }

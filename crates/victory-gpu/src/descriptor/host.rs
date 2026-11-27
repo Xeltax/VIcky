@@ -19,9 +19,20 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 pub(crate) mod note_kind;
+pub(crate) mod par_mirror;
 pub(crate) mod sync_lean;
 
+/// The next host heap's identity ([`HostHeap::release`]).
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    /// This host heap's identity, recorded with the dynamic slots a list
+    /// takes from it and checked when they are given back
+    /// ([`HostHeap::release`]): a title heap can be let go before the lists
+    /// that used it are reset, and a new one made at the same address; the
+    /// old lists' reset must not free the new heap's slots. Port of
+    /// trustno1 47747d62 (fxceless #1324).
+    id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -120,6 +131,13 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// VIcky (`VICTORY_SPANS_QUICK`, [`spans_quick`]; empty without it): a
+    /// bit per title slot that may be in `placed` (put there under its lock
+    /// when the slot is noted there, taken out when it is forgotten there;
+    /// a slot another's view made stale keeps its bit, which says only
+    /// "may"). A write of no placed texture view to a slot without its bit
+    /// needs nothing of `placed`.
+    spanned: Vec<std::sync::atomic::AtomicU64>,
     /// VIcky (`VICTORY_HEAP_BUFFERS_SKIP_SAME=1`; empty without it): per
     /// title slot, whether the last [`HostHeap::note_buffer`] of the slot
     /// was of a plain buffer view ([`plain_buffer`]). Read and written
@@ -138,6 +156,10 @@ pub(crate) struct HostHeap {
     /// VIcky (`VICTORY_MIRROR_TRY`, [`super::mirror_try`]): the copied
     /// slots [`HostHeap::mirror_copy`] left to the next drain.
     deferred: super::mirror_try::Deferred,
+    /// VIcky (`VICTORY_PARALLEL_MIRROR`, [`par_mirror`]): `made` in pieces
+    /// for the threads that make slots together, slot `i` made with piece
+    /// `i % par_mirror::PIECES` locked.
+    pieces: par_mirror::Pieces,
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -698,6 +720,27 @@ static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
 /// memory outside is none of the texture pass's business.
+/// VIcky: whether a slot's write of no placed texture view leaves the
+/// spans of placed textures (`HostHeap::placed`) and their lock alone when
+/// the slot is not in them (`VICTORY_SPANS_QUICK=1|alt`; off by default,
+/// every write takes the lock, as before). Port of Belobug a284ca74, where
+/// it is on by default: every record the heap sync mirrors went by that
+/// one lock of the heap, from all its threads, with the title's own threads
+/// and the texture passes (4 of 16 ms of the sync's wait there, run
+/// city4). What is done is the same: forgetting a slot that is not there
+/// does nothing. Here `VICTORY_HEAP_NOTE_KIND` already spares the lock for
+/// notes from and to plain buffer views and bare slots; this spares it for
+/// the other writes of slots that hold no placed texture view (views of
+/// texture objects, constant views, typed and structured buffer views).
+pub(crate) static SPANS_QUICK: crate::alt::Alt = crate::alt::Alt::new(
+    "VICTORY_SPANS_QUICK",
+    "writes of heap slots of no placed texture view leave the spans' lock alone when the slot is not in them",
+);
+
+/// Since the last sync line, with [`SPANS_QUICK`] set: writes that left the
+/// spans alone, writes that took their lock.
+pub(crate) static SPANS_QUICK_COUNTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(u64::MAX),
     std::sync::atomic::AtomicU64::new(0),
@@ -1319,6 +1362,7 @@ impl HostHeap {
             None => (0, count, count),
         };
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -1362,6 +1406,9 @@ impl HostHeap {
             noted: (0..if sampler || !skip_same() { 0 } else { titled })
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
                 .collect(),
+            spanned: (0..if sampler || !(SPANS_QUICK.set() || cfg!(test)) { 0 } else { (titled as usize).div_ceil(64) })
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
             // (A slot never noted is in none of the sets: bare.)
             kinds: (0..if sampler { 0 } else { titled })
                 .map(|_| std::sync::atomic::AtomicU8::new(note_kind::BARE))
@@ -1375,6 +1422,7 @@ impl HostHeap {
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
             deferred: Default::default(),
+            pieces: par_mirror::Pieces::new(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1999,6 +2047,12 @@ impl HostHeap {
     /// Makes title slot `index`'s host slot null again, as it is before its
     /// view is made: a null view of the kind it held.
     fn unmake(&self, made: &Made, index: u32) {
+        // VIcky (`VICTORY_PARALLEL_MIRROR`): on a thread that makes slots
+        // with others, a slot of another piece than the one being made is
+        // unmade once that piece is let go of.
+        if self.par_stale(index) {
+            return;
+        }
         let Some(host) = made.host(index) else {
             return;
         };
@@ -2212,8 +2266,21 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        // VIcky (`VICTORY_SPANS_QUICK`, port of Belobug a284ca74): a write of
+        // no placed texture view to a slot that is not in the spans leaves
+        // their lock alone (forgetting a slot that is not there does
+        // nothing). Whether the slot's bit is set changes only here, under
+        // the slot's own lock (`made`, or its piece with
+        // `VICTORY_PARALLEL_MIRROR`), as every write of the slot.
+        let quick = !self.spanned.is_empty() && placed_view.is_none() && !self.in_spans(index) && SPANS_QUICK.on();
+        let stale = if quick {
+            SPANS_QUICK_COUNTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Vec::new()
+        } else {
             use std::sync::atomic::Ordering::Relaxed;
+            if !self.spanned.is_empty() {
+                SPANS_QUICK_COUNTS[1].fetch_add(1, Relaxed);
+            }
             let mut placed = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Placed, &*self.placed);
             let span = placed_view.and_then(|(resource, start, first)| {
                 Some((start, start.saturating_add(placed.bytes(resource)?), first))
@@ -2223,12 +2290,14 @@ impl HostHeap {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
                     placed.rule = stale_rule();
+                    self.set_spanned(index, true);
                     let stale = placed.note(index, start, end, !seen);
                     placed.shows(index, first);
                     stale
                 }
                 None => {
                     placed.forget(index);
+                    self.set_spanned(index, false);
                     Vec::new()
                 }
             }
@@ -2258,6 +2327,29 @@ impl HostHeap {
         self.set_noted(index, plain);
         self.set_kind(index, now);
         stale
+    }
+
+    /// VIcky (`VICTORY_SPANS_QUICK`): whether title slot `index` may be in
+    /// the spans of placed textures ([`HostHeap::spanned`]; a slot past
+    /// the set may).
+    fn in_spans(&self, index: u32) -> bool {
+        let bit = 1u64 << (index % 64);
+        self.spanned
+            .get(index as usize / 64)
+            .is_none_or(|w| w.load(std::sync::atomic::Ordering::Acquire) & bit != 0)
+    }
+
+    /// VIcky (`VICTORY_SPANS_QUICK`): title slot `index` is (`true`) or is
+    /// no longer in the spans; under the lock of `placed`.
+    fn set_spanned(&self, index: u32, there: bool) {
+        let bit = 1u64 << (index % 64);
+        if let Some(w) = self.spanned.get(index as usize / 64) {
+            if there {
+                w.fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
+            } else {
+                w.fetch_and(!bit, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
     }
 
     /// [`HostHeap::mark_changed`], or with `sink` (and `marks`) the mark
@@ -2349,11 +2441,20 @@ impl HostHeap {
         });
     }
 
+    /// This host heap's identity ([`HostHeap::release`]).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), if they were taken from this heap (`id`, its
+    /// [`HostHeap::id`] then); a release naming another heap frees nothing.
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.dynamic_first) else {
             return;
         };
@@ -2411,6 +2512,13 @@ impl HostHeap {
         if !self.kept.split() || (matches!(what, Later::Keep(_)) && !self.kept.low(index)) {
             return Err(what);
         }
+        // VIcky (`VICTORY_PARALLEL_MIRROR`, [`par_mirror::keep_now`]): on a
+        // thread that makes slots with others, a stale or pool slot that
+        // comes to hold nothing lets go at once (another thread may make it
+        // again, and keep that, before this chunk ends).
+        if matches!(what, Later::Keep(None)) && par_mirror::keep_now(self, index) {
+            return Err(what);
+        }
         let me = std::ptr::from_ref(self) as usize;
         KEPT_LATER.with_borrow_mut(|later| match later {
             Some(later) if later.heap == me => {
@@ -2430,15 +2538,22 @@ impl HostHeap {
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        // A view's range has to lie inside the buffer: a description that runs
+        // past it is not a valid call, and what a refused creation leaves in
+        // the slot is undefined rather than "whatever was there" -- enough to
+        // keep such a description away from a slot shaders read by index.
+        let Some(range) = raw_view_range(buffer, offset, len, "SRV") else {
+            self.null_raw_at(index);
+            return;
+        };
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                 },
@@ -2465,14 +2580,21 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        // As `raw_at`: the range inside the buffer, or nothing at all. What a
+        // refused description leaves in the slot is undefined: it may leave the
+        // slot unusable, and a dispatch reading it then returns wrong bytes or
+        // faults. Not observed on this machine; recorded as a possibility.
+        let Some(range) = raw_view_range(buffer, offset, len, "UAV") else {
+            self.null_raw_uav_at(index);
+            return;
+        };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
                     Flags: D3D12_BUFFER_UAV_FLAG_RAW,
@@ -2780,6 +2902,11 @@ impl HostHeap {
     /// pass's other threads.
     fn mirror_held(&self, alone: bool, slots: &[(u32, u64)], lookups: &mut [Lookups], marks: bool) -> Vec<Option<View>> {
         use crate::draw::heap_pass::parts::{Part, enter};
+        if !alone {
+            // VIcky (`VICTORY_PARALLEL_MIRROR`, [`par_mirror`]): each slot
+            // made with its piece locked.
+            return self.pass_job(|pieces| self.mirror_shared_in(pieces, slots, lookups, marks));
+        }
         let made = self.made_counted(alone);
         slots
             .iter()
@@ -2791,6 +2918,27 @@ impl HostHeap {
                 };
                 let _decide = enter(Part::Decide);
                 self.mirror_made(&made, alone, (index, handle, true, marks), record, lookups)
+            })
+            .collect()
+    }
+
+    /// [`HostHeap::mirror_held`] with `made` held with the pass's other
+    /// threads; with `pieces`, each slot made with its piece locked
+    /// ([`HostHeap::in_piece`]).
+    fn mirror_shared_in(&self, pieces: bool, slots: &[(u32, u64)], lookups: &mut [Lookups], marks: bool) -> Vec<Option<View>> {
+        use crate::draw::heap_pass::parts::{Part, enter};
+        let made = self.made_counted(false);
+        slots
+            .iter()
+            .zip(lookups)
+            .map(|(&(index, handle), lookups)| {
+                let record = {
+                    let _read = enter(Part::Read);
+                    self.record_at(index, handle, true)?
+                };
+                let _decide = enter(Part::Decide);
+                let mut make = || self.mirror_made(&made, false, (index, handle, true, marks), record, lookups);
+                if pieces { self.in_piece(&made, index, make) } else { make() }
             })
             .collect()
     }
@@ -3039,18 +3187,35 @@ impl HostHeap {
         &self,
         made: &Made,
         alone: bool,
-        (index, handle, for_draw, marks): (u32, u64, bool, bool),
+        slot: (u32, u64, bool, bool),
         [tag, i, generation]: [u32; 3],
         lookups: &mut Lookups,
     ) -> Option<View> {
-        use crate::draw::heap_pass::parts::{Count, Part, count, enter};
+        use crate::draw::heap_pass::parts::{Part, enter};
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let view = {
             let _view = enter(Part::View);
             (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
         };
-        // VIcky (`VICTORY_LOT4_PROBE`, P2): the sync's slots by kind.
+        self.mirror_view(made, alone, slot, key, view, lookups)
+    }
+
+    /// [`HostHeap::mirror_made`] with the record's view (`key` its record)
+    /// looked up by the caller: VIcky (`VICTORY_PARALLEL_MIRROR`,
+    /// [`par_mirror`]) looks up a chunk's views at once.
+    fn mirror_view(
+        &self,
+        made: &Made,
+        alone: bool,
+        (index, handle, for_draw, marks): (u32, u64, bool, bool),
+        key: u64,
+        view: Option<View>,
+        lookups: &mut Lookups,
+    ) -> Option<View> {
+        use crate::draw::heap_pass::parts::{Count, Part, count, enter};
+        // VIcky (`VICTORY_LOT4_PROBE`, P2): the sync's slots by kind (also
+        // those the parallel mirror's threads make).
         #[cfg(feature = "diagnostics")]
         if !for_draw {
             crate::lot4::sync_slot(view.as_ref());
@@ -3121,6 +3286,9 @@ impl HostHeap {
             if later
                 && keep_views()
                 && (!skip_same() || placed_texture_view(&view))
+                // (No record is 0: generations start at 1. The table's lock
+                // not taken for it, VIcky.)
+                && old != 0
                 && view_at(old as u32, (old >> 32) as u32)
                     .is_some_and(|old| same_placed_texture(&old, &view))
             {
@@ -5011,6 +5179,125 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     desc
 }
 
+/// Where a raw buffer view starts and how many dwords it covers, both inside
+/// `size` bytes of buffer: `None` when the request has nothing in the buffer.
+///
+/// `FirstElement` is 64-bit and `NumElements` 32-bit, so only the length is cut
+/// at `u32::MAX`; the start is used as asked and never moved. Moving it is what
+/// a clamp would do, and clamping the start of a request that lies entirely past
+/// the buffer turns it into a view of the buffer's tail: 100 bytes of buffer
+/// with an offset of 112 used to view bytes 96 to 99 as if they had been asked
+/// for. A start at or past the last dword is a view of nothing instead.
+///
+/// Callers pass `offset` on 16 bytes: `draw.rs` biases by `offset & 15` on the
+/// UAV path and makes a null view for a root SRV that is not on 16, so a raw
+/// view's start stays on that boundary. An offset off it is refused here too.
+#[derive(Clone, Copy)]
+struct RawRange {
+    first: u64,
+    elements: u32,
+}
+
+/// Why a request lost part of its range, for the counters below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cut {
+    /// The start is at or past the buffer's last dword: nothing to view.
+    Past,
+    /// The length was cut to what the buffer holds.
+    Length,
+    /// The title named less than a dword: one element, as before this guard.
+    Short,
+    /// The start is not on the 16 bytes a raw view needs.
+    Unaligned,
+}
+
+fn raw_range(size: u64, offset: u64, len: u64) -> (Option<RawRange>, Option<Cut>) {
+    let words = size / 4;
+    if !offset.is_multiple_of(16) {
+        return (None, Some(Cut::Unaligned));
+    }
+    let asked = offset / 4;
+    if asked >= words {
+        return (None, Some(Cut::Past));
+    }
+    let avail = words - asked;
+    // A length under a dword made one element before this guard. The floor is
+    // kept because nothing was gathered about why the title would ask for less
+    // than a dword; the buffer's end still caps it.
+    let want = (len / 4).max(1);
+    let elements = want.min(avail).min(u64::from(u32::MAX));
+    let cut = if elements < want {
+        Some(Cut::Length)
+    } else if len < 4 {
+        Some(Cut::Short)
+    } else {
+        None
+    };
+    (
+        Some(RawRange {
+            first: asked,
+            elements: elements as u32,
+        }),
+        cut,
+    )
+}
+
+/// Whether a raw buffer view's range is kept inside its buffer
+/// ([`raw_range`]; on unless `VICTORY_RAW_VIEW_CLAMP=0`, which views the
+/// range as asked, as before). From fxceless/victory-fork pull request
+/// 1266 by lichenlang89 (dd5e8c9e), with the switch as foxhound 9f8838b1
+/// carries it.
+fn raw_view_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEW_CLAMP").is_none_or(|v| v != "0"))
+}
+
+/// The range a raw view of `buffer` from `offset`, `len` bytes, gets
+/// ([`raw_range`], what it cut counted as `kind`); `None`: a null view.
+fn raw_view_range(buffer: &ID3D12Resource, offset: u64, len: u64, kind: &'static str) -> Option<RawRange> {
+    if !raw_view_clamp() {
+        return Some(RawRange { first: offset / 4, elements: (len / 4).clamp(1, u64::from(u32::MAX)) as u32 });
+    }
+    // SAFETY: a live buffer.
+    let size = unsafe { buffer.GetDesc() }.Width;
+    let (range, cut) = raw_range(size, offset, len);
+    if let Some(cut) = cut {
+        raw_range_count(kind, cut, offset, len, size);
+    }
+    range
+}
+
+/// Counts what [`raw_range`] refused or cut, by kind (SRV, UAV) and cause, so
+/// that a run can say whether the guard applied at all. One atomic per cell,
+/// said on the first and every 4096th: no lock, nothing per view beyond that.
+fn raw_range_count(kind: &'static str, cut: Cut, offset: u64, len: u64, size: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SRV: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static UAV: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    let cell = match (kind, cut) {
+        ("SRV", Cut::Past) => &SRV[0],
+        ("SRV", Cut::Length) => &SRV[1],
+        ("SRV", Cut::Short) => &SRV[2],
+        ("SRV", Cut::Unaligned) => &SRV[3],
+        (_, Cut::Past) => &UAV[0],
+        (_, Cut::Length) => &UAV[1],
+        (_, Cut::Short) => &UAV[2],
+        (_, Cut::Unaligned) => &UAV[3],
+    };
+    let n = cell.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 4096 == 0 {
+        tracing::warn!(
+            kind,
+            cut = ?cut,
+            offset,
+            len,
+            size,
+            seen = n,
+            "a raw buffer view the title's range did not cover"
+        );
+    }
+}
+
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
 /// buffers).
 fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
@@ -5588,17 +5875,17 @@ mod tests {
         assert_eq!((first, left, right, rest), (4, 5, 7, 9));
 
         // Reallocating the left half puts the cursor back in the middle.
-        heap.release(left, 2);
+        heap.release(heap.id(), left, 2);
         assert_eq!(heap.dynamic(2), Some(left));
-        heap.release(left, 2);
-        heap.release(right, 2);
+        heap.release(heap.id(), left, 2);
+        heap.release(heap.id(), right, 2);
         assert_eq!(heap.dynamic(4), Some(left));
         assert_eq!(heap.dynamic(1), None);
 
         // A free slot at each physical end does not form a two-slot range.
-        heap.release(first, 1);
+        heap.release(heap.id(), first, 1);
         let last = first + heap.dynamic - 1;
-        heap.release(last, 1);
+        heap.release(heap.id(), last, 1);
         assert_eq!(heap.dynamic(2), None);
     }
 
@@ -5661,9 +5948,26 @@ mod tests {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// trustno1 47747d62 (fxceless #1324): a release naming another heap's
+    /// identity frees nothing.
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        let (Some(a), Some(b)) = (HostHeap::new(false, 4), HostHeap::new(false, 4)) else {
+            return; // no host GPU
+        };
+        assert_ne!(a.id(), b.id());
+        let first = a.dynamic(2).unwrap();
+        let free = || a.free.load(std::sync::atomic::Ordering::Relaxed);
+        let taken = free();
+        a.release(b.id(), first, 2);
+        assert_eq!(free(), taken, "released with another heap's identity: nothing is freed");
+        a.release(a.id(), first, 2);
+        assert_eq!(free(), taken + 2);
     }
 
     /// The title's view heap on NVIDIA's 1,000,000 views with a
@@ -5927,6 +6231,34 @@ mod fast_tests {
 
     fn release(object: crate::object::This) -> u32 {
         crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(object, 0x10)(object)
+    }
+
+    /// VIcky (`VICTORY_SPANS_QUICK`, after Belobug a284ca74's test): every
+    /// slot in the spans of placed textures has its bit (what makes the
+    /// quick way safe: a slot without one is not there); a slot forgotten
+    /// there loses it; one another's view made stale keeps it ("may").
+    #[test]
+    fn the_spanned_bits_hold_every_slot_in_the_spans() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let holds = |heap: &HostHeap| heap.placed.lock().unwrap().by_slot.keys().all(|&slot| heap.in_spans(slot));
+        let at = 0x7fec_0000_0000u64;
+        assert!(heap.note_buffer(1, Some(&texture_view(at)), false).is_empty());
+        assert!(heap.in_spans(1) && !heap.in_spans(2) && holds(&heap));
+        // A texture starting in the first one's first 4 KiB: slot 1 is stale,
+        // out of the spans, and keeps its bit.
+        assert_eq!(heap.note_buffer(2, Some(&texture_view(at + 0x100)), false), [1]);
+        assert!(heap.in_spans(1) && heap.in_spans(2) && holds(&heap));
+        assert!(!heap.placed.lock().unwrap().by_slot.contains_key(&1));
+        // Written with no view, or with a buffer view: forgotten, bit cleared.
+        assert!(heap.note_buffer(2, None, false).is_empty());
+        assert!(heap.note_buffer(1, Some(&buffer_view(at + 0x10_0000, 0x1_0000, 0, 4)), false).is_empty());
+        assert!(!heap.in_spans(1) && !heap.in_spans(2) && holds(&heap));
+        assert!(heap.placed.lock().unwrap().by_slot.is_empty());
+        // A slot never in the spans stays without its bit.
+        assert!(heap.note_buffer(3, None, false).is_empty());
+        assert!(!heap.in_spans(3));
     }
 
     /// A placed structured buffer view of `width` bytes at `address`:
@@ -6524,6 +6856,122 @@ mod fast_tests {
                 );
                 TEST_FAST.set(None);
                 assert_eq!(release(title), 0);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod raw_range_tests {
+    use super::*;
+
+    fn rr(size: u64, offset: u64, len: u64) -> (Option<(u64, u32)>, Option<Cut>) {
+        let (range, cut) = raw_range(size, offset, len);
+        (range.map(|v| (v.first, v.elements)), cut)
+    }
+
+    fn range(size: u64, offset: u64, len: u64) -> Option<(u64, u32)> {
+        rr(size, offset, len).0
+    }
+
+    /// The table of the first review, plus the counterexample it found: 100
+    /// bytes of buffer, an offset of 112 — the clamp this replaced viewed bytes
+    /// 96 to 99, which the request had asked nothing about.
+    #[test]
+    fn the_range_stays_inside_the_buffer() {
+        assert_eq!(range(1024, 0, 256), Some((0, 64)));
+        assert_eq!(range(1024, 768, 512), Some((192, 64)));
+        assert_eq!(range(1024, 1024, 16), None, "a start at the end");
+        assert_eq!(range(1024, 1040, 16), None, "a start past the end");
+        assert_eq!(range(100, 112, 16), None, "no intersection: never the tail");
+        assert_eq!(range(100, 96, 16), Some((24, 1)), "the last dword");
+        assert_eq!(range(100, 96, 4), Some((24, 1)));
+        assert_eq!(range(0, 0, 16), None, "an empty buffer");
+        assert_eq!(range(3, 0, 16), None, "no whole dword");
+        assert_eq!(range(1024, 0, 0), Some((0, 1)), "the floor of one element stands");
+        assert_eq!(range(1024, 0, 1), Some((0, 1)), "as does a length under a dword");
+        assert_eq!(range(1024, 3, 16), None, "not on 16 bytes");
+        assert_eq!(range(1024, u64::MAX, 16), None, "no wrap, no clamp back");
+        assert_eq!(range(1024, 0, u64::MAX), Some((0, 256)), "the length is cut");
+    }
+
+    /// Why a request was refused or cut, which is what the counters report.
+    #[test]
+    fn the_cause_is_the_one_the_counters_would_report() {
+        assert_eq!(rr(100, 112, 16), (None, Some(Cut::Past)));
+        assert_eq!(rr(1024, 3, 16), (None, Some(Cut::Unaligned)));
+        assert_eq!(rr(1024, 0, 0), (Some((0, 1)), Some(Cut::Short)));
+        assert_eq!(rr(1024, 768, 512), (Some((192, 64)), Some(Cut::Length)));
+        // Nothing cut, nothing refused: no counter is touched at all.
+        assert_eq!(rr(1024, 0, 256), (Some((0, 64)), None));
+        assert_eq!(rr(1024, 0, 1020), (Some((0, 255)), None), "255 of 256 dwords");
+    }
+
+    /// `FirstElement` is 64-bit: a start past the 32-bit element index is kept
+    /// as it is, not narrowed to `u32::MAX`.
+    #[test]
+    fn a_start_past_32_bits_is_kept() {
+        let size = 1u64 << 40;
+        let offset = (u64::from(u32::MAX) + 10) * 16;
+        let range = range(size, offset, 64).expect("inside the buffer");
+        assert_eq!(range.0, offset / 4);
+        assert!(range.0 > u64::from(u32::MAX));
+        assert_eq!(range.1, 16);
+    }
+
+    /// `NumElements` is 32-bit: the length alone is cut at `u32::MAX`.
+    #[test]
+    fn the_length_is_cut_at_32_bits() {
+        let size = 1u64 << 40;
+        assert_eq!(range(size, 0, u64::MAX), Some((0, u32::MAX)));
+    }
+
+    /// An aligned start far past a buffer is still refused: alignment is not a
+    /// reason to accept a request, and the check is not reached by the
+    /// unaligned case first.
+    #[test]
+    fn an_aligned_start_past_the_buffer_is_refused() {
+        let size = 1u64 << 40;
+        assert_eq!(rr(size, 1u64 << 60, 64), (None, Some(Cut::Past)));
+        assert_eq!(rr(size, size, 64), (None, Some(Cut::Past)));
+        assert_eq!(rr(size, size - 16, 64), (Some((size / 4 - 4, 4)), Some(Cut::Length)));
+    }
+
+    /// Every accepted range holds the four things the patch promises, and no
+    /// request that the input rules allow is turned away for no reason.
+    #[test]
+    fn accepted_ranges_hold_their_invariant() {
+        let sizes = [0u64, 1, 3, 4, 100, 1024, 4096, 1 << 30];
+        let offsets = [0u64, 4, 16, 48, 96, 112, 1024, 1040, 4096, u64::MAX];
+        let lens = [0u64, 1, 3, 4, 16, 512, 1 << 20, u64::MAX];
+        for size in sizes {
+            for offset in offsets {
+                for len in lens {
+                    let (range, _) = raw_range(size, offset, len);
+                    let aligned = offset.is_multiple_of(16);
+                    let inside = offset / 4 < size / 4;
+                    match range {
+                        Some(range) => {
+                            assert!(range.elements > 0, "{size} {offset} {len}");
+                            assert_eq!(
+                                range.first,
+                                offset / 4,
+                                "{size} {offset} {len}: the start moved"
+                            );
+                            assert_eq!(range.first % 4, 0, "a raw view starts on 16 bytes");
+                            assert!(
+                                range.first + u64::from(range.elements) <= size / 4,
+                                "{size} {offset} {len}: {} + {} past the buffer",
+                                range.first,
+                                range.elements
+                            );
+                        }
+                        None => assert!(
+                            !(aligned && inside),
+                            "{size} {offset} {len}: refused though the rules allow it"
+                        ),
+                    }
+                }
             }
         }
     }

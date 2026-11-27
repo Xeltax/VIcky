@@ -25,6 +25,8 @@ use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
 mod bvh_copy;
+#[cfg(feature = "diagnostics")]
+mod bvh_input;
 pub(crate) mod heap_pass;
 mod texture_chunk;
 
@@ -518,9 +520,10 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds: title heap, host heap identity
+    /// (`HostHeap::id`), first, count; given back when the list has run, is
+    /// reset or released, to that host heap only.
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -547,8 +550,8 @@ enum BindMade {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for &(heap, id, first, n) in &self.dynamic {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
     }
 }
@@ -569,8 +572,8 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for (heap, id, first, n) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
         self.fresh_tables.clear();
         self.root_srv_slots.clear();
@@ -1325,8 +1328,8 @@ impl State {
                 }
             }
         }
-        for (heap, first, n) in self.dynamic.drain(reserved..) {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for (heap, id, first, n) in self.dynamic.drain(reserved..) {
+            crate::descriptor::release_dynamic(heap, id, first, n);
         }
     }
 
@@ -1628,7 +1631,7 @@ impl State {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.id(), index, 1));
                 self.bind_made.push(BindMade::RootUav(key));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
@@ -1700,7 +1703,7 @@ impl State {
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
+                self.dynamic.push((key.0, host.id(), index, 1));
                 self.bind_made.push(BindMade::RootSrv(key));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
@@ -2520,6 +2523,10 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         crate::pipeline::note_ran(self.pipeline as This);
+        // The builder's rehydration programs' input against title memory
+        // (`VICTORY_BVH_INPUT_CHECK=1`).
+        #[cfg(feature = "diagnostics")]
+        self.bvh_input_check(list, p, [gx, gy, gz]);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             let parts = if gx > crate::indirect::PART && crate::indirect::parts_on() {
@@ -3063,7 +3070,7 @@ impl State {
             self.fresh_tables.insert(key, first);
             self.bind_made.push(BindMade::Table(key));
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());

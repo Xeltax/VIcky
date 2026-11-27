@@ -15,8 +15,9 @@
 //!   parallel mirror's threads (`victory-mirror-*`), the pass over buffer
 //!   views (`victory-heap-pass*`) and the title's recording threads (every
 //!   thread that makes a list call);
-//! - on the other: the wide copy threads (`victory-wide-*`) and the relay
-//!   (`victory-relay`).
+//! - on the other: the wide copy threads (`victory-wide-*`), the relay
+//!   (`victory-relay`) and the texture copy-back's writer
+//!   (`victory-texture-back`, with `VICTORY_TEXTURE_BACK_ASYNC`).
 //!
 //! The CCDs are found at run time from the L3 caches
 //! (`GetLogicalProcessorInformationEx`, `RelationCache`), not assumed. A
@@ -141,7 +142,7 @@ pub(crate) fn mode() -> u8 {
             tracing::info!(
                 "threads placed by CCD (VICTORY_CCD_PLACE={}): {}; the heap's lock sharers (the submitting thread, the heap \
                  sync, the mirror's and the pass's threads, the title's recording threads) on CCD {a}, the bulk copy threads \
-                 (wide, relay) on CCD {b}",
+                 (wide, relay, texture copy-back writer) on CCD {b}",
                 if mode == 1 { "1" } else { "alt: twenty seconds without, twenty with" },
                 ccds_text(),
             );
@@ -201,7 +202,7 @@ enum Side {
 /// The side of one of our named threads, if it is placed.
 fn side_of_name(name: &str) -> Option<Side> {
     const LOCKS: [&str; 4] = ["victory-submit", "victory-heap-sync", "victory-mirror-", "victory-heap-pass"];
-    const BULK: [&str; 2] = ["victory-wide-", "victory-relay"];
+    const BULK: [&str; 3] = ["victory-wide-", "victory-relay", "victory-texture-back"];
     if LOCKS.iter().any(|p| name.starts_with(p)) {
         Some(Side::Locks)
     } else if BULK.iter().any(|p| name.starts_with(p)) {
@@ -505,6 +506,7 @@ mod tests {
         assert_eq!(side_of_name("victory-mirror-0"), Some(Side::Locks));
         assert_eq!(side_of_name("victory-wide-2"), Some(Side::Bulk));
         assert_eq!(side_of_name("victory-relay"), Some(Side::Bulk));
+        assert_eq!(side_of_name("victory-texture-back"), Some(Side::Bulk));
         assert_eq!(side_of_name("victory-late-wait"), None);
     }
 
