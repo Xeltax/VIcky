@@ -444,10 +444,126 @@ pub(crate) fn dense_whole() -> Option<u64> {
     })
 }
 
+/// VIcky (`VICTORY_DENSE_PAGE_FIRST=1|alt`, lever 3 of profile PF5b; off by
+/// default; needs `VICTORY_DENSE_PAGE_WHOLE=1`, and so the relay): see
+/// [`dense_first`]. `alt`: twenty seconds off, twenty on, in turn.
+static PAGE_FIRST: crate::alt::Alt = crate::alt::Alt::new(
+    "VICTORY_DENSE_PAGE_FIRST",
+    "a quiet page of a card copy that the title wrote under flights' shader writes goes up whole before its runs are counted",
+);
+
+/// Whether `VICTORY_DENSE_PAGE_FIRST` is set (`1` or `alt`) and can work:
+/// with [`dense_whole`], whose rules and counts it shares.
+pub(crate) fn dense_first_set() -> bool {
+    static SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
+        if !PAGE_FIRST.set() {
+            return false;
+        }
+        if dense_whole().is_none() {
+            tracing::warn!(
+                "VICTORY_DENSE_PAGE_FIRST needs VICTORY_DENSE_PAGE_WHOLE=1 (and the relay): off, the pages' runs go up as before"
+            );
+            return false;
+        }
+        true
+    })
+}
+
+/// VIcky: a page of a copy in the card's memory that the title wrote while
+/// flights that may write it are in the air goes up whole, before its runs
+/// are counted, whatever their number, if the card's compare has not found
+/// its piece written by shaders for this many frames ([`dense_whole`]'s,
+/// `VICTORY_DENSE_PAGE_WHOLE_FRAMES`, 64), as [`dense_whole`] does only for
+/// a page with more runs than are left (`VICTORY_DENSE_PAGE_FIRST=1|alt`,
+/// [`PAGE_FIRST`]; `None` while off, or in an `alt` phase off).
+///
+/// Profile PF5b (lever 3): under flights, about 400 such pages a frame gave
+/// 13,500 changed runs of about 14 bytes, each a note, a range and a copy
+/// of its own on the queue (`crate::host`'s `card_before`: "sent up in
+/// 13,768 ranges"), most of `card_before` (14.5 ms of the submitting
+/// thread) and of the look for them (`stale_under_flights`, 12.7 ms, the
+/// compare 4.9 of it); [`dense_whole`] took only the 95 pages over the
+/// runs left.
+///
+/// The page goes onto the list [`whole_pages_done`] puts up when nothing
+/// settles the flights, with the same rules: only a quiet piece, never a
+/// page holding shaders' bytes left on the card (`VICTORY_SKIP_WC_BACK`),
+/// queued behind the flights in the air and ahead of the next lists, noted
+/// as sent whole so that a landing that finds its piece written by those
+/// flights counts it ([`whole_overwritten`], "must stay about 0"); dropped
+/// if the flights are settled all the same. Where it is put in
+/// ([`Shadow::card_put_whole`]) its runs are counted against the CPU's
+/// side, on the title bytes read there: with fewer than
+/// [`dense_first_runs`] it goes up as its runs instead, as under the cap,
+/// and with none nothing goes up, as before.
+///
+/// What it gives up is what [`dense_whole`] gives up, on three to four
+/// times as many pages: a whole page takes the title's bytes everywhere in
+/// it, also where a flight still in the air has its shaders write a byte
+/// the title did not change, if that piece was quiet for 64 frames.
+pub(crate) fn dense_first() -> Option<u64> {
+    if !dense_first_set() || !PAGE_FIRST.on() {
+        return None;
+    }
+    dense_whole()
+}
+
+/// The fewest runs a page [`dense_first`] took goes up whole with
+/// (`VICTORY_DENSE_PAGE_FIRST_RUNS`, 2 by default, at least 1): with fewer
+/// it goes up as its runs. One run is one range either way, and fewer bytes
+/// and no shader write gone over as itself.
+fn dense_first_runs() -> usize {
+    static RUNS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RUNS.get_or_init(|| {
+        std::env::var("VICTORY_DENSE_PAGE_FIRST_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(2, |n| n.max(1))
+    })
+}
+
+/// [`dense_first`], since the last frame-rate line: pages sent up whole,
+/// their bytes and the changed runs they held; pages with fewer runs than
+/// [`dense_first_runs`] sent as their runs, and those runs; pages with
+/// nothing changed; pages found but not sent because the flights were
+/// settled all the same. Only the submitting thread adds to them.
+static FIRST: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+const FIRST_WHOLE: usize = 0;
+const FIRST_BYTES: usize = 1;
+const FIRST_RUNS: usize = 2;
+const FIRST_FEW: usize = 3;
+const FIRST_FEW_RUNS: usize = 4;
+const FIRST_NONE: usize = 5;
+const FIRST_DROPPED: usize = 6;
+
+/// [`dense_first`]'s clause of the line of title bytes put in under
+/// flights' shader writes (`crate::host`), per frame over `frames`; empty
+/// without the switch. A page sent whole is one range where its runs were
+/// as many: the copy regions saved are the runs less the pages.
+pub(crate) fn dense_first_said(frames: f64) -> String {
+    if !dense_first_set() {
+        return String::new();
+    }
+    let f = FIRST.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+    format!(
+        "; quiet pages sent up whole before their runs were counted (VICTORY_DENSE_PAGE_FIRST, {}): {:.1} pages ({:.2} MB) \
+         holding {:.0} changed runs, so {:.0} copy regions fewer; {:.1} pages with under {} runs sent as their {:.0} runs, \
+         {:.1} with nothing changed, {:.1} found but settled all the same",
+        PAGE_FIRST.said(),
+        f[FIRST_WHOLE],
+        f[FIRST_BYTES] / (1 << 20) as f64,
+        f[FIRST_RUNS],
+        f[FIRST_RUNS] - f[FIRST_WHOLE],
+        f[FIRST_FEW],
+        dense_first_runs(),
+        f[FIRST_FEW_RUNS],
+        f[FIRST_NONE],
+        f[FIRST_DROPPED],
+    )
+}
+
 /// A page [`Shadow::merge_under_writes`] found over the runs left whose
-/// piece the card's compare has not flagged lately ([`dense_whole`]): it
-/// goes up whole if nothing else settles the flights
-/// ([`whole_pages_done`]).
+/// piece the card's compare has not flagged lately ([`dense_whole`]), or
+/// any page whose piece is quiet ([`dense_first`]): it goes up whole if
+/// nothing else settles the flights ([`whole_pages_done`]).
 pub(crate) struct WholePage {
     /// Title memory `[lo, hi)`: the page's part in the declared range.
     lo: usize,
@@ -459,6 +575,8 @@ pub(crate) struct WholePage {
     /// The range holds all of the page that is in the copy: once up, the
     /// page is noted as taken at `now`.
     all: bool,
+    /// Taken by [`dense_first`], its runs not counted yet.
+    first: bool,
 }
 
 /// [`dense_whole`], since the last frame-rate line: pages sent up whole and
@@ -498,12 +616,16 @@ pub(crate) fn whole_pages_done(pages: Vec<(Arc<Shadow>, Vec<WholePage>)>, settle
         return;
     }
     if settled {
-        DENSE[DENSE_DROPPED].fetch_add(pages.iter().map(|p| p.1.len() as u64).sum(), Ordering::Relaxed);
+        let first: u64 = pages.iter().map(|p| p.1.iter().filter(|w| w.first).count() as u64).sum();
+        let all: u64 = pages.iter().map(|p| p.1.len() as u64).sum();
+        DENSE[DENSE_DROPPED].fetch_add(all - first, Ordering::Relaxed);
+        FIRST[FIRST_DROPPED].fetch_add(first, Ordering::Relaxed);
         return;
     }
     // The send that takes them: the next one (`Host::card_before`, later
     // in this submission, under the same submission lock).
     let order = crate::host::queue_order() + 1;
+    // (Pages over the runs left; those of [`dense_first`] are counted apart.)
     let sent: u64 = pages.into_iter().map(|(shadow, pages)| shadow.card_put_whole(pages, order)).sum();
     if sent > 0 {
         DENSE[DENSE_AVOIDED].fetch_add(1, Ordering::Relaxed);
@@ -5092,13 +5214,28 @@ impl Shadow {
     /// its runs put into the CPU's side as under the cap and is noted to be
     /// patched on the card ([`PatchPage`]) instead of settling the flights
     /// (it takes one run of what is left).
+    ///
+    /// VIcky ([`dense_first`]): a page of a copy in the card's memory whose
+    /// piece is quiet goes onto `whole` first, its runs not counted (it
+    /// takes one run of what is left).
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize, whole: &mut Vec<WholePage>) -> bool {
-        self.merge_under_writes_as(address, len, runs_left, whole, dense_patch())
+        self.merge_under_writes_as(address, len, runs_left, whole, dense_patch(), dense_first())
     }
 
     /// [`Shadow::merge_under_writes`], with pages over the runs left patched
-    /// on the card if `patch`.
-    fn merge_under_writes_as(&self, address: usize, len: usize, runs_left: &mut usize, whole: &mut Vec<WholePage>, patch: bool) -> bool {
+    /// on the card if `patch`, and with `first` ([`dense_first`]'s frames)
+    /// pages whose piece is that quiet put on `whole` before their runs are
+    /// counted.
+    fn merge_under_writes_as(
+        &self,
+        address: usize,
+        len: usize,
+        runs_left: &mut usize,
+        whole: &mut Vec<WholePage>,
+        patch: bool,
+        first: Option<u64>,
+    ) -> bool {
+        let first = first.filter(|_| self.card.is_some());
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -5141,6 +5278,22 @@ impl Shadow {
                 if lo >= hi {
                     continue;
                 }
+                // VIcky (`VICTORY_DENSE_PAGE_FIRST`): a quiet page goes up
+                // whole, under the rules of the branch for a page over the
+                // runs left below; title memory is read, and the runs
+                // counted, where the caller puts it in (`card_put_whole`).
+                // Counted as looked at, so that the line's pages are the
+                // same with the switch and without.
+                if let Some(frames) = first
+                    && self.card_quiet(page, frames)
+                    && crate::census::stale_pages(self.id, lo, hi).is_empty()
+                {
+                    let all = (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e;
+                    whole.push(WholePage { lo, hi, page, now, all, first: true });
+                    *runs_left = runs_left.saturating_sub(1);
+                    MERGED[0].fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 let n = hi - lo;
                 let title = &mut title[..n];
                 // The lock of the copy's reference (the snapshot, or the
@@ -5176,7 +5329,7 @@ impl Shadow {
                             && crate::census::stale_pages(self.id, lo, hi).is_empty()
                         {
                             let all = (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e;
-                            whole.push(WholePage { lo, hi, page, now, all });
+                            whole.push(WholePage { lo, hi, page, now, all, first: false });
                             *runs_left = runs_left.saturating_sub(1);
                             continue;
                         }
@@ -5737,7 +5890,15 @@ impl Shadow {
     /// `order` it is noted as sent whole ([`Dense::whole`]), and taken at
     /// its asking if its range held all of it. A page that is not there is
     /// left as it is (stale, looked at again next time). Returns the pages
-    /// put in.
+    /// put in, of those over the runs left ([`dense_first`]'s are counted
+    /// in [`FIRST`]).
+    ///
+    /// A page of [`dense_first`] has its runs counted here first, against
+    /// the CPU's side as [`Shadow::merge_under_writes`] counts them: with
+    /// none nothing goes up and it is only taken; with fewer than
+    /// [`dense_first_runs`] they go up as runs, as under the cap; else it
+    /// goes up whole as above. Either way the CPU's side takes the runs
+    /// only (the bytes between are equal already).
     fn card_put_whole(&self, mut pages: Vec<WholePage>, order: u64) -> u64 {
         let Some(card) = &self.card else {
             return 0;
@@ -5762,10 +5923,39 @@ impl Shadow {
             // `hi` lie in the copy), which only the submitting thread
             // writes, and the relay's merges under the lock held here.
             let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-            held.copy_from_slice(title);
-            self.card_changed(at, at + n);
-            if let Some(whole) = card.dense.whole.get(p.page - start / PIECE) {
-                whole.store(order, Ordering::Relaxed);
+            if p.first {
+                let runs = under_runs(title, held);
+                for &(r, m) in &runs {
+                    held[r..r + m].copy_from_slice(&title[r..r + m]);
+                }
+                if runs.is_empty() {
+                    FIRST[FIRST_NONE].fetch_add(1, Ordering::Relaxed);
+                } else if runs.len() < dense_first_runs() {
+                    for &(r, m) in &runs {
+                        self.card_changed(at + r, at + r + m);
+                        MERGED[1].fetch_add(1, Ordering::Relaxed);
+                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    }
+                    FIRST[FIRST_FEW].fetch_add(1, Ordering::Relaxed);
+                    FIRST[FIRST_FEW_RUNS].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                } else {
+                    self.card_changed(at, at + n);
+                    if let Some(whole) = card.dense.whole.get(p.page - start / PIECE) {
+                        whole.store(order, Ordering::Relaxed);
+                    }
+                    FIRST[FIRST_WHOLE].fetch_add(1, Ordering::Relaxed);
+                    FIRST[FIRST_BYTES].fetch_add(n as u64, Ordering::Relaxed);
+                    FIRST[FIRST_RUNS].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                }
+            } else {
+                held.copy_from_slice(title);
+                self.card_changed(at, at + n);
+                if let Some(whole) = card.dense.whole.get(p.page - start / PIECE) {
+                    whole.store(order, Ordering::Relaxed);
+                }
+                DENSE[DENSE_PAGES].fetch_add(1, Ordering::Relaxed);
+                DENSE[DENSE_BYTES].fetch_add(n as u64, Ordering::Relaxed);
+                put += 1;
             }
             drop(before);
             if p.all {
@@ -5774,9 +5964,6 @@ impl Shadow {
                     *at = p.now;
                 }
             }
-            DENSE[DENSE_PAGES].fetch_add(1, Ordering::Relaxed);
-            DENSE[DENSE_BYTES].fetch_add(n as u64, Ordering::Relaxed);
-            put += 1;
         }
         put
     }
@@ -7219,6 +7406,7 @@ mod card_merge_tests {
             page,
             now: 77,
             all: true,
+            first: false,
         };
         let order = 9;
         assert_eq!(shadow.card_put_whole(vec![whole], order), 1);
@@ -7287,14 +7475,14 @@ mod card_merge_tests {
         let mut side = content.clone();
         let shadow = shadow_of(title, &mut side);
         let mut left = 512;
-        assert!(shadow.merge_under_writes_as(title as usize, LEN, &mut left, &mut Vec::new(), false));
+        assert!(shadow.merge_under_writes_as(title as usize, LEN, &mut left, &mut Vec::new(), false, None));
         drop(shadow);
         assert_eq!(side, content);
         // With it: no settle.
         let mut side = content.clone();
         let shadow = shadow_of(title, &mut side);
         let mut left = 512;
-        assert!(!shadow.merge_under_writes_as(title as usize, LEN, &mut left, &mut Vec::new(), true), "no settle");
+        assert!(!shadow.merge_under_writes_as(title as usize, LEN, &mut left, &mut Vec::new(), true, None), "no settle");
         assert_eq!(left, 512 - 1 - 3);
         let card = shadow.card.as_ref().unwrap();
         let (runs, span) = {
@@ -7354,6 +7542,101 @@ mod card_merge_tests {
         assert_eq!(memory(later), after[later], "written after the patch: merged");
         assert_eq!(memory(both), wanted[both]);
         drop(shadow);
+        // SAFETY: ours, no longer used.
+        unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// VIcky (`VICTORY_DENSE_PAGE_FIRST`), on a real copy in the card's
+    /// memory and write-watched title memory: three pages the title wrote
+    /// (a field of every 12-byte record rewritten; one byte; the same bytes
+    /// again). Without the switch, or with no piece quiet, the first page
+    /// is over the runs left and settles, nothing put in. With every piece
+    /// quiet, `merge_under_writes` asks for no settle and puts nothing in:
+    /// the three pages are left to go up, a run of what is left each. Put
+    /// in, the dense page goes up whole and is noted as sent whole, the
+    /// one-byte page goes up as its run, the unchanged one not at all; all
+    /// three are taken, and the CPU's side holds title memory.
+    #[test]
+    fn a_quiet_page_goes_up_whole_before_its_runs_are_counted() {
+        use super::{FIRST, FIRST_FEW, FIRST_FEW_RUNS, FIRST_NONE, FIRST_RUNS, FIRST_WHOLE};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const LEN: usize = 3 * PAGE;
+        let content: Vec<u8> = (0..LEN).map(|i| (i * 7 + 3) as u8).collect();
+        let shadow_of = |title: *mut u8, side: &mut Vec<u8>| {
+            let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title as u64, LEN as u64);
+            let pieces = || (0..5).map(|_| AtomicU64::new(0)).collect();
+            shadow.card = Some(Card {
+                staging: staging.clone(),
+                before: Mutex::new(None),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                // 0: no card bytes counted (`Drop` takes them off again).
+                size: 0,
+                dense: Dense {
+                    made: 0,
+                    flagged: pieces(),
+                    whole: pieces(),
+                },
+            });
+            *shadow.pending.lock().unwrap() = vec![(title as usize, title as usize + LEN)];
+            shadow
+        };
+        // Title memory, write-watched as the title's is (on a 64 KiB
+        // boundary, as every allocation).
+        // SAFETY: a plain allocation of our own.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!title.is_null());
+        let mut wanted = content.clone();
+        let dense: Vec<usize> = (4..PAGE).step_by(12).collect();
+        for &i in dense.iter().chain(&[PAGE + 500]) {
+            wanted[i] ^= 0x3c;
+        }
+        // SAFETY: inside the allocation, ours alone (all three pages written).
+        unsafe { std::ptr::copy_nonoverlapping(wanted.as_ptr(), title, LEN) };
+        // Without the switch, and with it but no piece quiet: settled.
+        for first in [None, Some(u64::MAX)] {
+            let mut side = content.clone();
+            let shadow = shadow_of(title, &mut side);
+            let (mut left, mut whole) = (512, Vec::new());
+            assert!(shadow.merge_under_writes_as(title as usize, LEN, &mut left, &mut whole, false, first), "{first:?}");
+            assert!(whole.is_empty());
+            drop(shadow);
+            assert_eq!(side, content);
+        }
+        // Every piece quiet: no settle, and nothing put in yet.
+        let mut side = content.clone();
+        let shadow = shadow_of(title, &mut side);
+        let (mut left, mut whole) = (512, Vec::new());
+        assert!(!shadow.merge_under_writes_as(title as usize, LEN, &mut left, &mut whole, false, Some(0)), "no settle");
+        assert_eq!(left, 512 - 3);
+        let at = title as usize;
+        let found: Vec<_> = whole.iter().map(|w| (w.lo - at, w.hi - at, w.page - at / PAGE, w.first, w.all)).collect();
+        assert_eq!(found, [(0, PAGE, 0, true, true), (PAGE, 2 * PAGE, 1, true, true), (2 * PAGE, 3 * PAGE, 2, true, true)]);
+        let card = shadow.card.as_ref().unwrap();
+        assert!(card.dirty.lock().unwrap().ranges.is_empty(), "nothing noted yet");
+        // SAFETY: inside `side`, which the shadow maps; nothing else
+        // touches it meanwhile.
+        let side_now = |at: usize| unsafe { *shadow.data.add(at) };
+        assert_eq!(side_now(4), content[4], "nothing put in yet");
+        // Put in with send 9.
+        let counted = || FIRST.each_ref().map(|n| n.load(Ordering::Relaxed));
+        let before = counted();
+        assert_eq!(shadow.card_put_whole(whole, 9), 0, "none of them over the runs left");
+        let after = counted();
+        let added = |i: usize| after[i] - before[i];
+        assert_eq!((added(FIRST_WHOLE), added(FIRST_RUNS)), (1, dense.len() as u64), "page 0 whole, holding its runs");
+        assert_eq!((added(FIRST_FEW), added(FIRST_FEW_RUNS), added(FIRST_NONE)), (1, 1, 1));
+        assert_eq!(card.dirty.lock().unwrap().ranges, [(0, PAGE), (PAGE + 500, PAGE + 501)], "page 0 whole, page 1 its run");
+        let sent: Vec<u64> = card.dense.whole.iter().take(3).map(|w| w.load(Ordering::Relaxed)).collect();
+        assert_eq!(sent, [9, 0, 0], "only page 0 noted as sent whole");
+        assert!(shadow.copied.lock().unwrap().iter().all(|&at| at > 0), "all three taken");
+        drop(shadow);
+        assert_eq!(side, wanted, "the CPU's side holds title memory");
         // SAFETY: ours, no longer used.
         unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
     }
