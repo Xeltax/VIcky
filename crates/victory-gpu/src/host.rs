@@ -2800,6 +2800,9 @@ struct Line {
     /// With [`relay`]: the bottom-of-pipe writes of the flights being
     /// landed (taken out of `line`, not done yet), for [`late_met`].
     in_hand: Vec<(usize, crate::queue::Written, usize)>,
+    /// VIcky: the flights in the air or being landed that copy textures
+    /// back ([`late_water`]).
+    backs: usize,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and host lists nothing records
@@ -2816,6 +2819,7 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     poke: false,
     landed: Vec::new(),
     in_hand: Vec::new(),
+    backs: 0,
 });
 /// Told when a flight joins [`LINE`] or it is poked.
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
@@ -5903,6 +5907,7 @@ impl Host {
                 poke,
                 landed: kept,
                 in_hand,
+                backs,
                 ..
             } = &mut *line;
             kept.extend(landed);
@@ -5911,6 +5916,7 @@ impl Host {
             written.clear();
             texture_written.clear();
             *lists = 0;
+            *backs = late_water::carrying(items);
             let (mut ranges, mut textures) = (Vec::new(), Vec::new());
             for item in items.iter() {
                 if let Late::Run(flight) = item {
@@ -6132,7 +6138,7 @@ impl Host {
         let told = !sent.writes.is_empty();
         let most = {
             let mut line = line();
-            let Line { line: items, written, texture_written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, texture_written, lists: flying, target, backs, .. } = &mut *line;
             let hold = crate::texback::holding();
             join_ranges(
                 written,
@@ -6143,6 +6149,7 @@ impl Host {
             );
             join_ranges(texture_written, sent.texture_back_ranges.iter().copied());
             *flying += order.len();
+            *backs += usize::from(!sent.texture_back_ranges.is_empty());
             *target = *submitted;
             items.push(Late::Run(Flight {
                 number: sent.number,
@@ -6185,7 +6192,7 @@ impl Host {
         let number = sent.number;
         {
             let mut line = line();
-            let Line { line: items, written, texture_written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, texture_written, lists: flying, target, backs, .. } = &mut *line;
             let hold = crate::texback::holding();
             join_ranges(
                 written,
@@ -6196,6 +6203,7 @@ impl Host {
             );
             join_ranges(texture_written, sent.texture_back_ranges.iter().copied());
             *flying += 1;
+            *backs += usize::from(!sent.texture_back_ranges.is_empty());
             *target = *submitted;
             items.push(Late::Run(Flight {
                 number,
@@ -6254,6 +6262,7 @@ impl Host {
                 line.written.clear();
                 line.texture_written.clear();
                 line.lists = 0;
+                line.backs = 0;
                 std::mem::take(&mut line.line)
             };
             let flights = items.iter().filter(|i| matches!(i, Late::Run(_))).count();
@@ -8343,6 +8352,10 @@ mod texture_back;
 #[cfg(feature = "diagnostics")]
 mod inspect;
 
+/// VIcky: presents wait for the flights that copy textures back,
+/// `VICTORY_LATE_WATER`.
+pub(crate) mod late_water;
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
@@ -9558,13 +9571,14 @@ impl Meter {
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB; {reaper}{texback}), {draws:.0} draws/frame, \
+                 GPU; {back_ms:.1} copying back {back_mb:.1} MB; {reaper}{texback}{water}), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
                 reaper = crate::reaper::summary(frames),
                 texback = crate::texback::summary(frames),
+                water = late_water::summary(frames),
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
