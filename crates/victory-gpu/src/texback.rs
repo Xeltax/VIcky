@@ -31,7 +31,7 @@
 //!
 //! A thread that lands copy-backs keeps its buffer for the title's bytes
 //! and the tiling geometry of the textures it tiled ([`Scratch`]), after
-//! TaynanGT/Vice-Tay f0019f2e20 (Taynan Piza): a buffer of the texture's
+//! TaynanGT f0019f2e20 (Taynan Piza): a buffer of the texture's
 //! size (up to 512 KiB) was made, and the runs of its layout found again,
 //! at every landing.
 //!
@@ -461,7 +461,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
 /// What a thread that lands copy-backs keeps from one landing to the next:
 /// the title's bytes being tiled, the same as read
 /// (`VICTORY_TEXTURE_BACK_LEAN`), and the tiling geometry of the mips it
-/// tiled. After TaynanGT/Vice-Tay f0019f2e20 (there one is handed down by
+/// tiled. After TaynanGT f0019f2e20 (there one is handed down by
 /// each caller; here each thread that lands keeps its own).
 #[derive(Default)]
 struct Scratch {
