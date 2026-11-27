@@ -3968,6 +3968,8 @@ impl Shadow {
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::inplace::ground_pc(&self.census(), taken as u64, 0, 0);
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
@@ -4130,6 +4132,8 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::inplace::ground_pc(&self.census(), 0, 0, written as u64);
         written
     }
 
@@ -4137,7 +4141,10 @@ impl Shadow {
     /// the frame line's counts.
     fn compared(&self, from: usize, to: usize) {
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::BackCompared, (to - from) as u64);
+        {
+            crate::copystat::add(crate::copystat::C::BackCompared, (to - from) as u64);
+            crate::inplace::ground_pc(&self.census(), 0, (to - from) as u64, 0);
+        }
         let (bytes, ranges) = if self.window { (2, 5) } else { (3, 6) };
         BACK_CLASS[bytes].fetch_add((to - from) as u64, Ordering::Relaxed);
         BACK_CLASS[ranges].fetch_add(1, Ordering::Relaxed);
@@ -4176,6 +4183,8 @@ impl Shadow {
         let timed = std::time::Instant::now();
         let written = self.relay_merge_timed(at, n, now, title);
         BACK_PUT[7].fetch_add(timed.elapsed().as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::inplace::ground_pc(&self.census(), 0, 0, written as u64);
         if written != 0 {
             BACK_PUT[6].fetch_add(1, Ordering::Relaxed);
         }

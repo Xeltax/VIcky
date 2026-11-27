@@ -802,6 +802,8 @@ fn row(which: Which, f: impl FnOnce(&mut Row)) {
 
 /// `bytes` of copy `which` were sent up to the card in `ranges` ranges.
 pub(crate) fn sent(which: Which, bytes: u64, ranges: u64) {
+    #[cfg(feature = "diagnostics")]
+    crate::inplace::ground_sent(&which, bytes, ranges);
     if !on() {
         return;
     }
@@ -816,6 +818,8 @@ pub(crate) fn sent(which: Which, bytes: u64, ranges: u64) {
 /// `pieces` 64 KiB pieces of copy `which` were compared on the card for the
 /// declared title range `declared`.
 pub(crate) fn compared(which: Which, declared: (usize, usize), pieces: u64) {
+    #[cfg(feature = "diagnostics")]
+    crate::inplace::ground_compared(&which, pieces);
     if !on() {
         return;
     }
@@ -832,6 +836,8 @@ pub(crate) fn compared(which: Which, declared: (usize, usize), pieces: u64) {
 /// (bytes a newer fetch brought are left out). `check`: in a check landing
 /// ([`check_landing`]).
 pub(crate) fn merged(which: Which, lo: usize, hi: usize, written: usize, check: bool) {
+    #[cfg(feature = "diagnostics")]
+    crate::inplace::ground_merged(&which, hi.saturating_sub(lo) as u64, written as u64);
     if !tracking() || lo >= hi {
         return;
     }

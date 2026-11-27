@@ -8361,6 +8361,7 @@ impl Batch {
         {
             use crate::copystat::{C, add};
             crate::copystat::range(from, to - from, us, 0);
+            crate::inplace::ground_update(shadow, copied, us);
             add(C::Updates, 1);
             add(C::UpdateUs, us);
             match _at {

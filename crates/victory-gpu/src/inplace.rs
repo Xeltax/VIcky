@@ -273,7 +273,8 @@ fn say() {
 /// What it costs the card: its reads of the heap cross the bus (fxceless'
 /// run 75: a skinning list 4.5 ms in the card's memory, 50.5 ms over the
 /// bus); what it saves: our refreshes, sends, hash and compare passes and
-/// fetches for it.
+/// fetches for it (in diagnostics builds the big title buffers' line,
+/// `ground_line`, says how much they are, with the switch or without).
 ///
 /// shortcut: another host copy of bytes in the heap that is not a title
 /// buffer (a window, a texture placed in it) is not told what the card
@@ -531,6 +532,172 @@ fn constants_say() {
         s[5],
         s[6],
         s[7]
+    );
+}
+
+// What our copies spend on the big title buffers (diagnostics, always on):
+// the ground `VICTORY_INPLACE_CONSTANTS` takes away, and what is left of it
+// with the switch on. One line a frame-rate line ([`ground_line`]).
+
+/// Per big title buffer, since the last line: refreshes
+/// (`Shadow::update` from the submissions' batch), their microseconds and
+/// the bytes they copied in from title memory; bytes sent up to the card
+/// side and in how many ranges; 64 KiB pieces of declared shader-write
+/// ranges compared on the card (counted per range, as the copies line
+/// does); bytes fetched back and merged into title memory; for a copy in
+/// the PC's memory, bytes taken into snapshots, compared after a
+/// submission and merged into title memory.
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy)]
+enum G {
+    Updates,
+    UpdateUs,
+    Copied,
+    Sent,
+    SentRanges,
+    Compared,
+    Fetched,
+    Merged,
+    Snapshot,
+    PcCompared,
+    PcMerged,
+}
+
+#[cfg(feature = "diagnostics")]
+const GS: usize = 11;
+
+/// A big title buffer the line follows: start, bytes, its form when last
+/// refreshed, and its counts ([`G`]).
+#[cfg(feature = "diagnostics")]
+struct Ground {
+    start: u64,
+    len: u64,
+    form: &'static str,
+    n: [u64; GS],
+}
+
+/// The big title buffers seen so far (sixteen at most), by start.
+#[cfg(feature = "diagnostics")]
+static GROUND: Mutex<Vec<Ground>> = Mutex::new(Vec::new());
+
+/// Whether copy `which` is one of the big title buffers: a title buffer
+/// (not a window) of `VICTORY_INPLACE_CONSTANTS_MIN_MB` (64) or more,
+/// whether or not the switch is on.
+#[cfg(feature = "diagnostics")]
+fn ground_of(which: &crate::census::Which) -> bool {
+    !which.window && which.len >= constants_min()
+}
+
+/// Adds `counts` to big title buffer `which` (and notes its `form`).
+#[cfg(feature = "diagnostics")]
+fn ground_add(which: &crate::census::Which, form: Option<&'static str>, counts: &[(G, u64)]) {
+    if !ground_of(which) {
+        return;
+    }
+    let mut all = GROUND.lock().unwrap_or_else(|e| e.into_inner());
+    let i = match all.iter().position(|g| g.start == which.start && g.len == which.len) {
+        Some(i) => i,
+        None if all.len() < 16 => {
+            all.push(Ground { start: which.start, len: which.len, form: "", n: [0; GS] });
+            all.len() - 1
+        }
+        None => return,
+    };
+    if let Some(form) = form {
+        all[i].form = form;
+    }
+    for &(g, n) in counts {
+        all[i].n[g as usize] += n;
+    }
+}
+
+/// A refresh of `shadow` copied `copied` bytes in `us` (`Batch::update`).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn ground_update(shadow: &crate::shadow::Shadow, copied: usize, us: u64) {
+    let which = shadow.census();
+    if !ground_of(&which) {
+        return;
+    }
+    let form = if shadow.in_place() {
+        "in place"
+    } else if shadow.carded() {
+        "a copy in the card's memory"
+    } else {
+        "a copy in the PC's memory"
+    };
+    ground_add(&which, Some(form), &[(G::Updates, 1), (G::UpdateUs, us), (G::Copied, copied as u64)]);
+}
+
+/// `bytes` of copy `which` were sent up to the card in `ranges` ranges.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn ground_sent(which: &crate::census::Which, bytes: u64, ranges: u64) {
+    ground_add(which, None, &[(G::Sent, bytes), (G::SentRanges, ranges)]);
+}
+
+/// `pieces` 64 KiB pieces of copy `which` were compared on the card.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn ground_compared(which: &crate::census::Which, pieces: u64) {
+    ground_add(which, None, &[(G::Compared, pieces)]);
+}
+
+/// `fetched` bytes of copy `which` came back from the card and `written`
+/// of them went into title memory.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn ground_merged(which: &crate::census::Which, fetched: u64, written: u64) {
+    ground_add(which, None, &[(G::Fetched, fetched), (G::Merged, written)]);
+}
+
+/// A copy in the PC's memory: `snapshot` bytes taken before a submission,
+/// `compared` bytes compared after one, `written` bytes merged into title
+/// memory.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn ground_pc(which: &crate::census::Which, snapshot: u64, compared: u64, written: u64) {
+    ground_add(which, None, &[(G::Snapshot, snapshot), (G::PcCompared, compared), (G::PcMerged, written)]);
+}
+
+/// The line of the big title buffers, per frame over `frames` frames
+/// (`crate::copystat::log`, with the frame-rate line); the counts start
+/// again.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn ground_line(frames: f64) {
+    let frames = frames.max(1.0);
+    let mut all = GROUND.lock().unwrap_or_else(|e| e.into_inner());
+    let mb = |v: u64| v as f64 / 1e6 / frames;
+    let text: Vec<String> = all
+        .iter_mut()
+        .map(|g| {
+            let n = std::mem::replace(&mut g.n, [0; GS]);
+            let at = |c: G| n[c as usize];
+            format!(
+                "{:#x}+{} MB {}: {:.0} refreshes {:.2} ms, {:.2} MB copied in from title memory; {:.2} MB sent up to the card in {:.0} \
+                 ranges, {:.0} pieces of 64 KiB compared on the card, {:.2} MB fetched back, {:.2} MB merged into title memory; in the PC's \
+                 memory {:.2} MB into snapshots, {:.2} MB compared, {:.2} MB merged",
+                g.start,
+                g.len >> 20,
+                if g.form.is_empty() { "not refreshed yet" } else { g.form },
+                at(G::Updates) as f64 / frames,
+                at(G::UpdateUs) as f64 / 1e3 / frames,
+                mb(at(G::Copied)),
+                mb(at(G::Sent)),
+                at(G::SentRanges) as f64 / frames,
+                at(G::Compared) as f64 / frames,
+                mb(at(G::Fetched)),
+                mb(at(G::Merged)),
+                mb(at(G::Snapshot)),
+                mb(at(G::PcCompared)),
+                mb(at(G::PcMerged)),
+            )
+        })
+        .collect();
+    drop(all);
+    if text.is_empty() {
+        return;
+    }
+    tracing::info!(
+        "  the big title buffers per frame ({} MB or more, VICTORY_INPLACE_CONSTANTS' ground; {}): {}",
+        constants_min() >> 20,
+        if constants_on() { "the switch on" } else { "the switch off" },
+        text.join("; ")
     );
 }
 
