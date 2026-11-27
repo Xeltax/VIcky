@@ -3962,6 +3962,16 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            // With `VICTORY_INPLACE_CONSTANTS` the range still goes into the
+            // flights' account of title memory their shaders may write
+            // (nothing is snapshot or copied back for it: `writing`,
+            // `copy_back` and `copy_back_done` pass over a copy in place),
+            // so that what reads or writes it on the CPU at a later
+            // submission waits for them as it does for a copy's range.
+            if crate::inplace::constants_on() {
+                let len = len.min(self.left(address));
+                list.defer_gpu_write(self, address as usize, len as usize);
+            }
             return;
         }
         let len = len.min(self.left(address));
@@ -4022,6 +4032,8 @@ impl Shadow {
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::inplace::ground_pc(&self.census(), taken as u64, 0, 0);
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
@@ -4184,6 +4196,8 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::inplace::ground_pc(&self.census(), 0, 0, written as u64);
         written
     }
 
@@ -4191,7 +4205,10 @@ impl Shadow {
     /// the frame line's counts.
     fn compared(&self, from: usize, to: usize) {
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::BackCompared, (to - from) as u64);
+        {
+            crate::copystat::add(crate::copystat::C::BackCompared, (to - from) as u64);
+            crate::inplace::ground_pc(&self.census(), 0, (to - from) as u64, 0);
+        }
         let (bytes, ranges) = if self.window { (2, 5) } else { (3, 6) };
         BACK_CLASS[bytes].fetch_add((to - from) as u64, Ordering::Relaxed);
         BACK_CLASS[ranges].fetch_add(1, Ordering::Relaxed);
@@ -4230,6 +4247,8 @@ impl Shadow {
         let timed = std::time::Instant::now();
         let written = self.relay_merge_timed(at, n, now, title);
         BACK_PUT[7].fetch_add(timed.elapsed().as_micros() as u64, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::inplace::ground_pc(&self.census(), 0, 0, written as u64);
         if written != 0 {
             BACK_PUT[6].fetch_add(1, Ordering::Relaxed);
         }
@@ -5234,6 +5253,11 @@ impl Shadow {
         self.card.is_some()
     }
 
+    /// Whether this is title memory in place (`crate::inplace`), not a copy.
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
     fn card_changed(&self, from: usize, to: usize) {
@@ -5681,12 +5705,16 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 /// Returns its length and whether a copy was made.
 pub(crate) fn copy_ahead_of(resource: usize, start: u64) -> Option<(u64, bool)> {
     let mut map = buffers();
-    let entry = map.get_mut(&(start, resource))?;
+    let key = (start, resource);
+    let entry = map.get(&key)?;
     let len = entry.end - start;
     if entry.shadow.is_some() {
         return Some((len, false));
     }
-    make_copy(entry, (start, resource))?;
+    // In place in the constants heap as at a first use
+    // (`VICTORY_INPLACE_CONSTANTS`).
+    let fresh = constants_fresh(&map, key);
+    make_copy(map.get_mut(&key)?, key, fresh)?;
     Some((len, true))
 }
 
@@ -5794,18 +5822,41 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         drop(map);
         return loose(address, end, len <= 1, any);
     };
+    let fresh = constants_fresh(&map, key);
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
-        make_copy(entry, key)?;
+        make_copy(entry, key, fresh)?;
     }
     entry.shadow.clone()
 }
 
+/// With `VICTORY_INPLACE_CONSTANTS`, for the title buffer `key` if it has
+/// no copy yet: whether no title buffer in its pages has one either (the
+/// constants heap opens a region only then: one memory, one form,
+/// `crate::inplace::place_constants`).
+fn constants_fresh(map: &BTreeMap<(u64, usize), Entry>, key: (u64, usize)) -> bool {
+    crate::inplace::constants_on()
+        && map.get(&key).is_some_and(|entry| entry.shadow.is_none())
+        && {
+            let (at, to) = crate::inplace::pages_of_range(key.0, map.get(&key).map_or(0, |entry| entry.end - key.0));
+            let copied = |entry: &Entry| entry.shadow.as_ref().is_some_and(|s| !s.in_place());
+            !map.range((at, 0)..(to, 0)).any(|(_, entry)| copied(entry))
+                && !map.range(..(at, 0)).rev().take(256).any(|(_, entry)| entry.end > at && copied(entry))
+        }
+}
+
 /// Makes the host copy of the title buffer `key` (`entry`, which has none
 /// yet) and puts it in the entry: on first use ([`lookup`]) or, with
-/// [`crate::copy_ahead`], when the title declares the buffer.
-fn make_copy(entry: &mut Entry, key: (u64, usize)) -> Option<()> {
+/// [`crate::copy_ahead`], when the title declares the buffer. `fresh`:
+/// [`constants_fresh`].
+fn make_copy(entry: &mut Entry, key: (u64, usize), fresh: bool) -> Option<()> {
     let len = entry.end - key.0;
+    // The title's constants heap, and what lies inside it, in place
+    // whatever its size (`crate::inplace::constants_on`).
+    if let Some(placed) = crate::inplace::place_constants(key.0, len, fresh) {
+        entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+        return Some(());
+    }
     // Rounded up so that views ending in the buffer's last 256 bytes fit.
     // Shaders write some buffers (unordered access), so not upload memory.
     let size = len.next_multiple_of(1 << 16);

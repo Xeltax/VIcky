@@ -182,6 +182,9 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
+    // A region of the constants heap over it shows the pages the title had
+    // there, not those it maps now: the next ask opens the memory anew.
+    constants_forget(at as u64, len as u64);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -209,6 +212,496 @@ fn say() {
         s[5],
         s[6],
         s[7]
+    );
+}
+
+// The title's constants heap in place (`VICTORY_INPLACE_CONSTANTS`; port of
+// fxceless/victory-fork bcc542151d, GPL-3.0).
+
+/// `VICTORY_INPLACE_CONSTANTS`: 0 (unset) off; 1 on. (`alt` is turned
+/// down and runs as off, said in the log: see below.)
+///
+/// With it a title buffer below 4 GiB (the title's graphics memory for
+/// 32-bit addresses) that is view memory, one run of a section, and
+/// `VICTORY_INPLACE_CONSTANTS_MIN_MB` (64) or more, and every title buffer
+/// that lies inside such a one, are buffers placed in a host heap opened
+/// on the title's own pages: the card reads and writes the bytes where the
+/// title writes them. In fxceless' runs 115 and 363 that is one buffer:
+/// the 174 MB heap at 0x3de00000, in the 185 MB section of the graphics
+/// memory, which holds the per-draw constants and which the skinning
+/// passes write through one unordered view of all of it. Nothing is
+/// refreshed, asked of the write watch, sent up, hashed, compared,
+/// fetched, merged under flights or patched for it, and no copy of it
+/// takes the card's memory (by default it is a copy in the card's memory,
+/// `crate::shadow::cards`).
+///
+/// Why [`place_for`] does not take it: view memory is turned down there,
+/// because the page pool's section is made reserved (`SEC_RESERVE`), which
+/// `OpenExistingHeapFromFileMapping` refuses, and a heap opened on the
+/// title's own view would pin its pages there. Here the heap is opened
+/// with `OpenExistingHeapFromAddress1` on a view of OUR own of the same
+/// section pages ([`constants_open`]): the title's views stay free to be
+/// unmapped, remapped or guarded.
+///
+/// The order of things is the console's: the card reads the constants
+/// when it runs a list, not when the list is submitted; the title writes
+/// its ring again only after its fence says the card is done, and its
+/// fences are told only when the card has really run the work (`host.rs`,
+/// `late`). What the flights' shaders may write in it still goes into the
+/// flights' account of title memory (`Shadow::gpu_writes`), so whatever
+/// reads or writes it on the CPU at a later submission (a title copy into
+/// it, a texture's memory, a step of ours) waits for them as before.
+/// Indirect executions whose arguments or count lie in it are clamped
+/// alone, right before they run, never ahead in a window or a list's
+/// prelude (`crate::draw`'s `in_place_order`,
+/// `VICTORY_INPLACE_CONSTANTS_ORDER`).
+///
+/// Not with `VICTORY_FENCE_SENT=1` while submissions are sent ahead
+/// (`crate::host::late`): the frame-begin value is then told to the title
+/// before the frame before's lists have run (`crate::fence::sent`, point
+/// 3 of what the title may do early), and the title may rewrite constants
+/// those lists still read in place; a copy in the card's memory is
+/// refreshed behind them on the queue. The switch is turned down then,
+/// said in the log.
+///
+/// One memory, one form: a region is opened only while no title buffer in
+/// it has a copy yet (the caller says so: `fresh`), and nothing ever
+/// changes form while the title runs. A descriptor slot keeps the copy it
+/// was made with (a static slot of the title's heap, such as its view of
+/// the whole 174 MB, is never made again), and a copy is not told what the
+/// card writes in place (write watching and the guards see only the CPU):
+/// a buffer let go for the other form would leave such slots reading
+/// stale bytes. That is why `alt` (twenty seconds each way) is turned
+/// down: compare a launch with 1 against one without, at equal draws.
+///
+/// What it costs the card: its reads of the heap cross the bus (fxceless'
+/// run 75: a skinning list 4.5 ms in the card's memory, 50.5 ms over the
+/// bus); what it saves: our refreshes, sends, hash and compare passes and
+/// fetches for it (in diagnostics builds the big title buffers' line,
+/// `ground_line`, says how much they are, with the switch or without).
+///
+/// shortcut: another host copy of bytes in the heap that is not a title
+/// buffer (a window, a texture placed in it) is not told what the card
+/// wrote there (as for every copy in place, `Shadow::gpu_writes`).
+pub(crate) fn constants_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match mode_of(std::env::var("VICTORY_INPLACE_CONSTANTS").ok().as_deref()) {
+        1 if crate::host::late() && crate::fence::sent::on() => {
+            tracing::warn!(
+                "VICTORY_INPLACE_CONSTANTS=1 turned down: with VICTORY_FENCE_SENT=1 the title is told a frame begins before the frame \
+                 before's lists have run, and may rewrite constants they still read in place; the constants heap stays a copy. Measure it \
+                 without VICTORY_FENCE_SENT"
+            );
+            false
+        }
+        1 => {
+            tracing::info!(
+                "the constants heap is read and written by the card in place (VICTORY_INPLACE_CONSTANTS=1): a title buffer of {} MB or more \
+                 below 4 GiB that is view memory, one run of a section, and the title buffers inside it",
+                constants_min() >> 20
+            );
+            true
+        }
+        2 => {
+            tracing::warn!(
+                "VICTORY_INPLACE_CONSTANTS=alt turned down: a title buffer cannot change form while the title runs (descriptor slots keep the copy \
+                 they were made with); the constants heap stays a copy. Compare a launch with =1 against one without, at equal draws"
+            );
+            false
+        }
+        _ => false,
+    })
+}
+
+/// The switch's value: 0 off, 1 on, 2 `alt`.
+fn mode_of(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("1") => 1,
+        Some("alt") => 2,
+        _ => 0,
+    }
+}
+
+/// The least size of a title buffer that opens a region
+/// (`VICTORY_INPLACE_CONSTANTS_MIN_MB`, 64), in bytes.
+fn constants_min() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| std::env::var("VICTORY_INPLACE_CONSTANTS_MIN_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64) << 20)
+}
+
+/// The title's graphics memory for 32-bit addresses lies below this.
+const LOW: u64 = 1 << 32;
+
+/// A region: the 64 KiB pages of a title buffer, opened as a heap through
+/// a view of ours of the same section pages.
+struct Region {
+    start: u64,
+    end: u64,
+    heap: ID3D12Heap,
+}
+
+static REGIONS: Mutex<Vec<Region>> = Mutex::new(Vec::new());
+
+/// How many regions there are, for a look without the lock (every mapping
+/// the runtime changes asks [`constants_forget`]).
+static ALIVE: AtomicU64 = AtomicU64::new(0);
+
+/// Since the start: regions opened, their bytes; title buffers placed in
+/// them; asks turned down because the memory is not view memory below
+/// 4 GiB that is one run of a section, because no view of ours could be
+/// made or committed, because the host refused, because a title buffer in
+/// it had a copy already; regions forgotten because the title mapped
+/// other pages there.
+static CSTATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Whether the 64 KiB pages `[at, at + bytes)` can open a region: below
+/// 4 GiB and view memory that is one run of a section; else why not.
+fn constants_wanted(at: u64, bytes: u64) -> Result<(), String> {
+    if at.checked_add(bytes).is_none_or(|end| end > LOW) {
+        return Err("above 4 GiB, not the title's graphics memory for 32-bit addresses".to_owned());
+    }
+    match cover(at as usize, bytes as usize) {
+        Cover::Run(..) => Ok(()),
+        Cover::None => Err("not view memory (private memory: VICTORY_INPLACE=2 is for that)".to_owned()),
+        Cover::Holes => Err("view memory with holes".to_owned()),
+        Cover::Scattered => Err(
+            "view memory from several places or sections, not one run of a section (VICTORY_SECTION_MB cuts the title's allocations into \
+             sections of that many MiB)"
+                .to_owned(),
+        ),
+    }
+}
+
+/// The 64 KiB pages `[at, end)` that hold `[start, start + len)`.
+pub(crate) fn pages_of_range(start: u64, len: u64) -> (u64, u64) {
+    (start & !(K64 as u64 - 1), (start + len.max(1)).next_multiple_of(K64 as u64))
+}
+
+/// A title buffer `[start, start + len)` that has no copy yet, in place in
+/// a region: one that holds it, or one it opens if it is wanted and
+/// `fresh` (no title buffer in its pages has a copy). `None` leaves the
+/// caller to make a copy, as before. Counted with [`place_for`]'s title
+/// buffers ([`gone`] takes them off).
+pub(crate) fn place_constants(start: u64, len: u64, fresh: bool) -> Option<Placed> {
+    if !constants_on() {
+        return None;
+    }
+    let host = crate::host::host()?;
+    match constants_place(&host.device, start, len, constants_min(), fresh) {
+        Ok(Some(placed)) => {
+            STATS[2].fetch_add(1, Ordering::Relaxed);
+            STATS[3].fetch_add(len, Ordering::Relaxed);
+            CSTATS[2].fetch_add(1, Ordering::Relaxed);
+            Some(placed)
+        }
+        Ok(None) => None,
+        Err((stat, why)) => {
+            if CSTATS[stat].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(
+                    start = format_args!("{start:#x}"),
+                    mb = len >> 20,
+                    why,
+                    "a big title buffer not in place: a copy as before (VICTORY_INPLACE_CONSTANTS)"
+                );
+            }
+            None
+        }
+    }
+}
+
+/// [`place_constants`]' work on `device`: `Ok(None)` if no region holds the
+/// buffer and it is under `min` bytes (nothing asked of the host), `Err`
+/// with the statistic to count and why.
+fn constants_place(device: &ID3D12Device, start: u64, len: u64, min: u64, fresh: bool) -> Result<Option<Placed>, (usize, String)> {
+    let (at, end) = pages_of_range(start, len);
+    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let i = match regions.iter().position(|r| r.start <= at && end <= r.end) {
+        Some(i) => i,
+        None => {
+            if end - at < min.max(1) {
+                return Ok(None);
+            }
+            constants_wanted(at, end - at).map_err(|why| (3, why))?;
+            if !fresh {
+                return Err((6, "a title buffer in its pages has a copy already".to_owned()));
+            }
+            let region = constants_open(device, at, end)?;
+            CSTATS[0].fetch_add(1, Ordering::Relaxed);
+            CSTATS[1].fetch_add(end - at, Ordering::Relaxed);
+            tracing::info!(
+                start = format_args!("{at:#x}"),
+                bytes = end - at,
+                mb = (end - at) >> 20,
+                "a title buffer of the constants heap in place: the card reads and writes the title's pages through a view of ours \
+                 (VICTORY_INPLACE_CONSTANTS)"
+            );
+            regions.push(region);
+            ALIVE.store(regions.len() as u64, Ordering::Relaxed);
+            regions.len() - 1
+        }
+    };
+    let region = &regions[i];
+    let buffer = place(device, &region.heap, at - region.start, end - at).map_err(|e| (5, format!("no buffer placed in the region: {e}")))?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+    Ok(Some(Placed { buffer, heap: region.heap.clone(), gpu, bias: start - at }))
+}
+
+/// Opens `[at, end)` (64 KiB aligned title view memory, one run of a
+/// section) as a heap through a view of ours of the same section pages.
+/// Opening locks the pages into the PC's memory (the title's views have
+/// committed them all already): some tens of ms for the 174 MB, once.
+///
+/// shortcut: the view of ours is never unmapped (a view a heap stands on
+/// cannot be, and the heap goes only when the last placed buffer does): a
+/// region's bytes of address space each time the title maps other pages
+/// over one, which it was not seen to do. While the heap stands its pages
+/// stay locked in the PC's memory, and the view keeps the section alive.
+fn constants_open(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
+    let bytes = (end - at) as usize;
+    let Cover::Run(section, offset) = cover(at as usize, bytes) else {
+        return Err((3, format!("not one run of a section: {:?}", cover(at as usize, bytes))));
+    };
+    if !offset.is_multiple_of(K64 as u64) {
+        return Err((3, format!("the run starts at {offset:#x} of its section")));
+    }
+    // SAFETY: the section of a view the title has (the runtime keeps its
+    // handle while views of it are mapped; a view keeps the section alive
+    // after that); the range lies in the run.
+    let view = unsafe { mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes) }.Value;
+    if view.is_null() {
+        return Err((4, format!("no view of ours: {}", std::io::Error::last_os_error())));
+    }
+    let unmap = || {
+        // SAFETY: our own view, nothing opened on it.
+        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view }) };
+    };
+    // The title's views committed these section pages when they were
+    // mapped; asked once more through ours (a reserved section's pages are
+    // committed through a view), which changes nothing if they are.
+    // SAFETY: inside our own view.
+    if unsafe { mem::VirtualAlloc(view, bytes, mem::MEM_COMMIT, mem::PAGE_READWRITE) }.is_null() {
+        let error = std::io::Error::last_os_error();
+        unmap();
+        return Err((4, format!("the view of ours not committed: {error}")));
+    }
+    match open(device, From::Part(view as usize, bytes)) {
+        Ok(heap) => Ok(Region { start: at, end, heap }),
+        Err(e) => {
+            unmap();
+            Err((5, format!("refused by the host: {e}")))
+        }
+    }
+}
+
+/// The title maps other pages at `[at, at + len)`: the regions over it are
+/// forgotten (what is placed in them is let go by [`title_memory_freeing`]).
+fn constants_forget(at: u64, len: u64) {
+    if ALIVE.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let before = regions.len();
+    regions.retain(|r| r.end <= at || r.start >= end);
+    ALIVE.store(regions.len() as u64, Ordering::Relaxed);
+    CSTATS[7].fetch_add((before - regions.len()) as u64, Ordering::Relaxed);
+}
+
+/// The line of the constants heap in place, every ten seconds while the
+/// switch is on (called by [`tick`]).
+fn constants_say() {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let s: Vec<u64> = CSTATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    let (alive, bytes) = {
+        let regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+        (regions.len(), regions.iter().map(|r| r.end - r.start).sum::<u64>())
+    };
+    tracing::info!(
+        "the constants heap in place (VICTORY_INPLACE_CONSTANTS=1): {alive} regions {} MB (opened so far {}, {} MB), {} title buffers placed in them so far \
+         (no copy, no refresh, nothing sent up, hashed, compared or fetched for them); turned down: {} not view memory below 4 GiB that is one run of \
+         a section, {} no view of ours, {} refused by the host, {} a title buffer in its pages had a copy already; {} regions forgotten because the \
+         title mapped other pages there",
+        bytes >> 20,
+        s[0],
+        s[1] >> 20,
+        s[2],
+        s[3],
+        s[4],
+        s[5],
+        s[6],
+        s[7]
+    );
+}
+
+// What our copies spend on the big title buffers (diagnostics, always on):
+// the ground `VICTORY_INPLACE_CONSTANTS` takes away, and what is left of it
+// with the switch on. One line a frame-rate line ([`ground_line`]).
+
+/// Per big title buffer, since the last line: refreshes
+/// (`Shadow::update` from the submissions' batch), their microseconds and
+/// the bytes they copied in from title memory; bytes sent up to the card
+/// side and in how many ranges; 64 KiB pieces of declared shader-write
+/// ranges compared on the card (counted per range, as the copies line
+/// does); bytes fetched back and merged into title memory; for a copy in
+/// the PC's memory, bytes taken into snapshots, compared after a
+/// submission and merged into title memory.
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy)]
+enum G {
+    Updates,
+    UpdateUs,
+    Copied,
+    Sent,
+    SentRanges,
+    Compared,
+    Fetched,
+    Merged,
+    Snapshot,
+    PcCompared,
+    PcMerged,
+}
+
+#[cfg(feature = "diagnostics")]
+const GS: usize = 11;
+
+/// A big title buffer the line follows: start, bytes, its form when last
+/// refreshed, and its counts ([`G`]).
+#[cfg(feature = "diagnostics")]
+struct Ground {
+    start: u64,
+    len: u64,
+    form: &'static str,
+    n: [u64; GS],
+}
+
+/// The big title buffers seen so far (sixteen at most), by start.
+#[cfg(feature = "diagnostics")]
+static GROUND: Mutex<Vec<Ground>> = Mutex::new(Vec::new());
+
+/// Whether copy `which` is one of the big title buffers: a title buffer
+/// (not a window) of `VICTORY_INPLACE_CONSTANTS_MIN_MB` (64) or more,
+/// whether or not the switch is on.
+#[cfg(feature = "diagnostics")]
+fn ground_of(which: &crate::census::Which) -> bool {
+    !which.window && which.len >= constants_min()
+}
+
+/// Adds `counts` to big title buffer `which` (and notes its `form`).
+#[cfg(feature = "diagnostics")]
+fn ground_add(which: &crate::census::Which, form: Option<&'static str>, counts: &[(G, u64)]) {
+    if !ground_of(which) {
+        return;
+    }
+    let mut all = GROUND.lock().unwrap_or_else(|e| e.into_inner());
+    let i = match all.iter().position(|g| g.start == which.start && g.len == which.len) {
+        Some(i) => i,
+        None if all.len() < 16 => {
+            all.push(Ground { start: which.start, len: which.len, form: "", n: [0; GS] });
+            all.len() - 1
+        }
+        None => return,
+    };
+    if let Some(form) = form {
+        all[i].form = form;
+    }
+    for &(g, n) in counts {
+        all[i].n[g as usize] += n;
+    }
+}
+
+/// A refresh of `shadow` copied `copied` bytes in `us` (`Batch::update`).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn ground_update(shadow: &crate::shadow::Shadow, copied: usize, us: u64) {
+    let which = shadow.census();
+    if !ground_of(&which) {
+        return;
+    }
+    let form = if shadow.in_place() {
+        "in place"
+    } else if shadow.carded() {
+        "a copy in the card's memory"
+    } else {
+        "a copy in the PC's memory"
+    };
+    ground_add(&which, Some(form), &[(G::Updates, 1), (G::UpdateUs, us), (G::Copied, copied as u64)]);
+}
+
+/// `bytes` of copy `which` were sent up to the card in `ranges` ranges.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn ground_sent(which: &crate::census::Which, bytes: u64, ranges: u64) {
+    ground_add(which, None, &[(G::Sent, bytes), (G::SentRanges, ranges)]);
+}
+
+/// `pieces` 64 KiB pieces of copy `which` were compared on the card.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn ground_compared(which: &crate::census::Which, pieces: u64) {
+    ground_add(which, None, &[(G::Compared, pieces)]);
+}
+
+/// `fetched` bytes of copy `which` came back from the card and `written`
+/// of them went into title memory.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn ground_merged(which: &crate::census::Which, fetched: u64, written: u64) {
+    ground_add(which, None, &[(G::Fetched, fetched), (G::Merged, written)]);
+}
+
+/// A copy in the PC's memory: `snapshot` bytes taken before a submission,
+/// `compared` bytes compared after one, `written` bytes merged into title
+/// memory.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn ground_pc(which: &crate::census::Which, snapshot: u64, compared: u64, written: u64) {
+    ground_add(which, None, &[(G::Snapshot, snapshot), (G::PcCompared, compared), (G::PcMerged, written)]);
+}
+
+/// The line of the big title buffers, per frame over `frames` frames
+/// (`crate::copystat::log`, with the frame-rate line); the counts start
+/// again.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn ground_line(frames: f64) {
+    let frames = frames.max(1.0);
+    let mut all = GROUND.lock().unwrap_or_else(|e| e.into_inner());
+    let mb = |v: u64| v as f64 / 1e6 / frames;
+    let text: Vec<String> = all
+        .iter_mut()
+        .map(|g| {
+            let n = std::mem::replace(&mut g.n, [0; GS]);
+            let at = |c: G| n[c as usize];
+            format!(
+                "{:#x}+{} MB {}: {:.0} refreshes {:.2} ms, {:.2} MB copied in from title memory; {:.2} MB sent up to the card in {:.0} \
+                 ranges, {:.0} pieces of 64 KiB compared on the card, {:.2} MB fetched back, {:.2} MB merged into title memory; in the PC's \
+                 memory {:.2} MB into snapshots, {:.2} MB compared, {:.2} MB merged",
+                g.start,
+                g.len >> 20,
+                if g.form.is_empty() { "not refreshed yet" } else { g.form },
+                at(G::Updates) as f64 / frames,
+                at(G::UpdateUs) as f64 / 1e3 / frames,
+                mb(at(G::Copied)),
+                mb(at(G::Sent)),
+                at(G::SentRanges) as f64 / frames,
+                at(G::Compared) as f64 / frames,
+                mb(at(G::Fetched)),
+                mb(at(G::Merged)),
+                mb(at(G::Snapshot)),
+                mb(at(G::PcCompared)),
+                mb(at(G::PcMerged)),
+            )
+        })
+        .collect();
+    drop(all);
+    if text.is_empty() {
+        return;
+    }
+    tracing::info!(
+        "  the big title buffers per frame ({} MB or more, VICTORY_INPLACE_CONSTANTS' ground; {}): {}",
+        constants_min() >> 20,
+        if constants_on() { "the switch on" } else { "the switch off" },
+        text.join("; ")
     );
 }
 
@@ -1309,6 +1802,9 @@ pub(crate) fn tick() {
     if level() > 0 {
         say();
     }
+    if constants_on() {
+        constants_say();
+    }
     if probe_level() == 0 {
         return;
     }
@@ -1482,6 +1978,155 @@ mod tests {
             assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// `VICTORY_INPLACE_CONSTANTS`' values (`alt`, 2, is turned down by
+    /// `constants_on`).
+    #[test]
+    fn the_constants_switch_reads_off_on_and_alt() {
+        assert_eq!(mode_of(None), 0);
+        assert_eq!(mode_of(Some("0")), 0);
+        assert_eq!(mode_of(Some("1")), 1);
+        assert_eq!(mode_of(Some(" 1 ")), 1);
+        assert_eq!(mode_of(Some("alt")), 2);
+        assert_eq!(mode_of(Some("yes")), 0);
+    }
+
+    /// The pages of a range, and why memory opens no region.
+    #[test]
+    fn the_constants_heap_wants_one_run_of_a_section_below_4_gib() {
+        assert_eq!(pages_of_range(0x3de0_0040, 0x100), (0x3de0_0000, 0x3de1_0000));
+        assert_eq!(pages_of_range(0x3de0_0000, 0x1_0000), (0x3de0_0000, 0x3de1_0000));
+        assert_eq!(pages_of_range(0x3de0_0000, 0), (0x3de0_0000, 0x3de1_0000));
+        assert!(constants_wanted(LOW - K64 as u64, 2 * K64 as u64).unwrap_err().contains("above 4 GiB"));
+        // Views of the test's own below 4 GiB, only noted, in address space
+        // reserved for it (no other test's views land there).
+        let hole = reserve_low(16 * K64, mem::MEM_RESERVE);
+        let at = hole as usize;
+        title_memory_view(at, 2 * K64, 91, 0);
+        title_memory_view(at + 2 * K64, 2 * K64, 91, 2 * K64 as u64);
+        title_memory_view(at + 4 * K64, K64, 92, 0);
+        assert_eq!(constants_wanted(at as u64, 4 * K64 as u64), Ok(()));
+        assert!(constants_wanted(at as u64, 5 * K64 as u64).unwrap_err().contains("several places or sections"));
+        assert!(constants_wanted(at as u64, 6 * K64 as u64).unwrap_err().contains("holes"));
+        assert!(constants_wanted((at + 8 * K64) as u64, K64 as u64).unwrap_err().contains("not view memory"));
+        views_gone(at, 5 * K64);
+        // SAFETY: the reservation above.
+        unsafe { mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE) };
+    }
+
+    /// `bytes` of address space below 4 GiB, reserved with `flags`
+    /// (`MEM_RESERVE`, and `MEM_RESERVE_PLACEHOLDER` for views).
+    fn reserve_low(bytes: usize, flags: u32) -> *mut u8 {
+        let mut low = mem::MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: std::ptr::null_mut(),
+            HighestEndingAddress: (LOW - 1) as *mut c_void,
+            Alignment: 0,
+        };
+        let mut parameter = mem::MEM_EXTENDED_PARAMETER::default();
+        parameter.Anonymous1._bitfield = mem::MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = (&raw mut low).cast();
+        // SAFETY: a reservation of the caller's; the parameter lives
+        // through the call.
+        let hole = unsafe {
+            let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            mem::VirtualAlloc2(process, std::ptr::null(), bytes, flags, mem::PAGE_NOACCESS, &mut parameter, 1)
+        }
+        .cast::<u8>();
+        assert!(!hole.is_null(), "{}", std::io::Error::last_os_error());
+        assert!((hole as u64) + bytes as u64 <= LOW);
+        hole
+    }
+
+    /// The constants heap's own call on the software adapter: a reserved
+    /// section below 4 GiB, mapped as `xmem` maps physical pages (two views
+    /// of consecutive pages in turn, committed), and a title buffer in it
+    /// that begins off the 64 KiB lines. It is placed in a heap opened on a
+    /// view of ours: the card reads the title's bytes across both views,
+    /// also those the CPU writes afterwards with no call between; a copy
+    /// and a shader's store through a root unordered view land at the
+    /// title's address; a second buffer inside is placed in the same
+    /// region; the title can unmap its own views while the heap stands;
+    /// private memory opens nothing; a remap forgets the region.
+    #[test]
+    fn warp_the_constants_heap_is_read_and_written_in_place_through_a_view_of_ours() {
+        let Some(device) = warp() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            return;
+        }
+        // SAFETY (the whole test): the section, placeholder, views and
+        // private memory made here.
+        unsafe {
+            let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            let section = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_RESERVE, 0, 8 * K64 as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let hole = reserve_low(8 * K64, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER);
+            mem::VirtualFree(hole.cast(), 3 * K64, mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER);
+            let mut views = Vec::new();
+            for (page, n) in [(0usize, 3usize), (3, 5)] {
+                let view = mem::MapViewOfFile3(section, process, hole.add(page * K64).cast(), (page * K64) as u64, n * K64, mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
+                assert!(!view.Value.is_null(), "{}", std::io::Error::last_os_error());
+                assert!(!mem::VirtualAlloc(view.Value, n * K64, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+                title_memory_view(view.Value as usize, n * K64, section as usize, (page * K64) as u64);
+                views.push(view);
+            }
+            let base = hole as u64;
+            assert_eq!(cover(base as usize, 8 * K64), Cover::Run(section as usize, 0));
+            let (start, len) = (base + K64 as u64 + 0x40, 5 * K64 as u64);
+            let regions = || REGIONS.lock().unwrap().len();
+            let before = regions();
+            // Under the least size: nothing opened, the host not asked.
+            assert!(constants_place(&device, start, len, 64 << 20, true).unwrap().is_none());
+            assert_eq!(regions(), before);
+            // A title buffer in its pages has a copy already: turned down.
+            assert_eq!(constants_place(&device, start, len, K64 as u64, false).err().map(|e| e.0), Some(6));
+            assert_eq!(regions(), before);
+            let placed = constants_place(&device, start, len, K64 as u64, true).unwrap_or_else(|e| panic!("not placed: {e:?}")).expect("placed");
+            assert_eq!(regions(), before + 1);
+            assert_eq!(placed.bias, 0x40);
+            assert_eq!(placed.gpu, placed.buffer.GetGPUVirtualAddress() + 0x40);
+            let mut rig = Rig::new(&device).unwrap();
+            fill(start as *mut u8, len as usize, 11);
+            let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
+            assert!(same(start as *const u8, &got), "the card reads the title's bytes across both views");
+            fill(start as *mut u8, len as usize, 97);
+            let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
+            assert!(same(start as *const u8, &got), "and what the CPU wrote afterwards, with no call between");
+            rig.store(&placed.buffer, placed.bias + 3 * K64 as u64, &[0x5a; 256]).unwrap();
+            assert!(same((start + 3 * K64 as u64) as *const u8, &[0x5a; 256]), "the card's copy lands at the title's address");
+            (start as *mut [u32; 3]).write_unaligned([40, 2, 0]);
+            rig.shade(placed.gpu).unwrap();
+            assert_eq!((start as *const [u32; 3]).read_unaligned()[2], 42, "a shader's store lands at the title's address");
+            // A buffer inside: the same region, whatever its size.
+            let inside = constants_place(&device, base + 6 * K64 as u64, 100, u64::MAX, false).unwrap().expect("placed in the region");
+            assert_eq!(regions(), before + 1, "one region");
+            assert_eq!(inside.bias, 0);
+            // Private memory: turned down, nothing opened.
+            let private = mem::VirtualAlloc(std::ptr::null(), 4 * K64, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE);
+            assert_eq!(constants_place(&device, private as u64, 4 * K64 as u64, K64 as u64, true).err().map(|e| e.0), Some(3));
+            assert_eq!(regions(), before + 1);
+            mem::VirtualFree(private, 0, mem::MEM_RELEASE);
+            // The title's own views are free while the heap stands.
+            for view in views {
+                assert!(mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER) != 0, "the title's view unmapped under the heap");
+            }
+            views_gone(base as usize, 8 * K64);
+            // The card still writes the section's pages: a view mapped
+            // afterwards shows it.
+            rig.store(&placed.buffer, placed.bias, &[0xc3; 64]).unwrap();
+            let other = mem::MapViewOfFile(section, mem::FILE_MAP_READ, 0, 0, 2 * K64);
+            assert!(!other.Value.is_null());
+            assert!(same((other.Value as usize + K64 + 0x40) as *const u8, &[0xc3; 64]), "the heap is the section's pages, not the title's view");
+            mem::UnmapViewOfFile(other);
+            // The title maps other pages there: the region is forgotten.
+            constants_forget(base, 8 * K64 as u64);
+            assert_eq!(regions(), before);
+            drop((placed, inside));
+            mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE);
+            mem::VirtualFree(hole.add(3 * K64).cast(), 0, mem::MEM_RELEASE);
+            windows_sys::Win32::Foundation::CloseHandle(section);
         }
     }
 
