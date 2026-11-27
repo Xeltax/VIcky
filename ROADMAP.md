@@ -68,6 +68,21 @@ Only 5–16 % of these takes cross CCDs, so the cost is contention itself, not C
 
   No user-mode API exposes them.
 
+## Status (2026-11-27 night)
+
+| Item | Switch | Result | Verdict |
+|---|---|---|---|
+| **A1** | `VICTORY_BUFFERS_STRIPES` | `BUFFERS` waits 72 ms → 0; fps +0.11 | Done. The recording threads' lock waits are off the critical path. |
+| **A2** | `VICTORY_MADE_TURNS` | -0.11 fps | Left off |
+| **B1** | `VICTORY_HEAP_SYNC_AT_SUBMIT` | Join 25 → 22-24 ms; -0.03 fps | Left off |
+| **B2** | `VICTORY_PAGE_PLACE` + `VICTORY_INPLACE_CONSTANTS` | Constants heap in place, but -0.6 fps | Left off: the card's PCIe reads cost more than the copies |
+
+Next focus: the submitting thread itself, ~137 ms. In order:
+
+1. B3, the snapshots.
+2. C1-C2, the texture copy-back's 21 ms.
+3. The 44 ms of "other" preparing work, which still needs a breakdown.
+
 ## Tracks
 
 Each item lists its goal, the measure to beat, and where to start.

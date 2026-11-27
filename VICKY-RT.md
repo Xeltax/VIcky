@@ -123,6 +123,29 @@ This work is for making the title's compute ray tracing (the BVH structure build
 
 **Chapter-1 boat mission with ray tracing (2026-11-27, verified on an RTX 4080, Series X, RT on):** with this main, a save in the boat mission loads, the boat floats and the mission plays, with no extra switch: the texture copy-back (`VICTORY_TEXTURE_BACK`, on by default) gives the title's physics the water it computes on the card, and the builder's box rehydration programs' parent-link stores are left out by default (`VICTORY_BVH_LINK_STORES=keep` keeps them; with them the title crashed on that save's loading screen). Add `VICTORY_LATE_WAIT=2` in water scenes (at the relay's default stage 3 testers elsewhere saw the water surface vanish for single frames); `VICTORY_LATE_WATER=1` at stage 3 is the narrower wait to try instead, not measured yet (water section below). Measured: 480 s on that save, RT on, the fps set below plus `VICTORY_LATE_WAIT=2 VICTORY_REAPER=1`: no crash, 7.34 fps true mean of the last 12 lines (lines 7.8-8.5, about 122-127 ms a frame: preparing ~68, copy-back ~23-27, a wait for the card of ~17 ms that is the copy-back's read-back). The prologue cell with the same build: 5.32 fps true (a slow stretch mid-run; last lines 6.3-7.5), about level with 6.91 before the batch. `VICTORY_INPLACE_CONSTANTS` does not place the constants heap here ("view memory from several places") even without `VICTORY_FENCE_SENT`/`VICTORY_SECTION_MB`: leave it off, or try it with `VICTORY_PAGE_PLACE=1` and without `VICTORY_FENCE_SENT` (roadmap B2, section "Physical pages placed at their first mapping").
 
+**Lot 5 measured (2026-11-27 night, prologue cell, RT on, RTX 4080):** recommended set plus one `=alt` switch per run. These runs loaded slowly, so only 2-3 ON phases count; treat the medians as indications.
+
+| Switch | Paired median | What the probes show | Verdict |
+|---|---|---|---|
+| `VICTORY_BUFFERS_STRIPES` | +0.11 fps | P7: `BUFFERS` waits went from 72 ms a frame to 0 (297k striped reads, 2 waits) | optional, harmless |
+| `VICTORY_MADE_TURNS` | -0.11 fps | `made` waits went from 165 to 117 ms a frame | leave off |
+| `VICTORY_HEAP_SYNC_AT_SUBMIT` | -0.03 fps | 7 of 9 syncs a frame start early and are taken, but the join only goes from 25 to 22-24 ms | leave off |
+
+`VICTORY_PAGE_PLACE=1 VICTORY_INPLACE_CONSTANTS=1` puts the 174 MB constants heap in place. Both runs are without `VICTORY_FENCE_SENT`, which these two need, and are true fps over 12 lines:
+
+| Settings | fps |
+|---|---|
+| without `FENCE_SENT` | 7.16 |
+| without `FENCE_SENT`, heap in place | 6.56 |
+
+The card reading the heap over PCIe costs more than the copies it saves: leave both off.
+
+Best prologue run so far with the recommended set: **8.49 fps true** (L5a). Runs of the same set spread from 7.0 to 8.5 there.
+
+Removing the `BUFFERS` waits did not move the frame. The recording threads' lock waits run in parallel with the submitting thread, so they are not on the critical path today: **the submitting thread's ~137 ms is the wall**.
+
+The BC7 rotation fix (port of fxceless 06702fe8 via trustno1 PR #23 6726920a) is always on.
+
 **Recommended since 2026-11-27 evening (lots 2-3 and the foxhound/trustno1/Belobug port batch; RTX 4080, Series X, RT on):** the fps set below plus `VICTORY_SYNC_FINE=1 VICTORY_CCD_PLACE=1`, and `VICTORY_COMPOSITE_GRADE_EDGE=1` for the picture. In water scenes, use no `VICTORY_LATE_WAIT` and no water set (`VICTORY_WAVE_PAIRS_ONLY`/`VICTORY_LDS_FLAGS` for the water programs).
 
 Measured as true fps over the last 12 frame-time lines:
