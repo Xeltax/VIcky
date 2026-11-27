@@ -1676,7 +1676,7 @@ mod tests {
 
     #[test]
     fn a_childs_lines_are_picked_out_of_its_output() {
-        let text = "running 1 test\ntest lot4::tests::child_entry ... lot4 child: heap of 1024 KiB\r\nnoise\nlot4 child: VERDICT pc-heap WORKS: yes\nok\n";
+        let text = "running 1 test\ntest lot4::device::tests::child_entry ... lot4 child: heap of 1024 KiB\r\nnoise\nlot4 child: VERDICT pc-heap WORKS: yes\nok\n";
         assert_eq!(child_lines(text), vec!["heap of 1024 KiB".to_owned(), "VERDICT pc-heap WORKS: yes".to_owned()]);
     }
 
@@ -1776,7 +1776,7 @@ mod tests {
     fn test_child() -> Child {
         Child {
             exe: std::env::current_exe().expect("the test binary"),
-            args: vec!["--exact".to_owned(), "lot4::tests::child_entry".to_owned(), "--nocapture".to_owned(), "--test-threads=1".to_owned()],
+            args: vec!["--exact".to_owned(), "lot4::device::tests::child_entry".to_owned(), "--nocapture".to_owned(), "--test-threads=1".to_owned()],
         }
     }
 
