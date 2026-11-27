@@ -40,12 +40,12 @@
 //!   the round's threads are done, `made` still held (`HostHeap::reclaim`,
 //!   as `HostHeap::make_room` does for the pass's threads).
 //! - The keeps of the slots a thread makes are gathered for its chunk's
-//!   end as before (`KeptLater`, the lean chunk), but a slot that comes to
-//!   hold nothing (a stale slot unmade, a slot emptied) lets go of its
-//!   resource at once: a slot's later making on another thread may be kept
-//!   before this thread's chunk ends, and the resource a slot's descriptor
-//!   views must never be let go of after it. At worst a slot made null
-//!   holds its last resource a little longer.
+//!   end as before (`KeptLater`, the lean chunk), but a stale slot unmade,
+//!   or a pool slot that comes to hold nothing, lets go of its resource at
+//!   once ([`keep_now`]): that slot's later making on another thread may be
+//!   kept before this thread's chunk ends, and the resource a slot's
+//!   descriptor views must never be let go of after it. At worst a slot
+//!   made null holds its last resource a little longer.
 //!
 //! What may differ from one thread: the order in which the round's slots
 //! are made (each slot is made by itself, so what is made of each is the
@@ -59,6 +59,14 @@
 //! asks for none (noaclr makes `heap_buffers` in 8 chunks too); with the
 //! switch set at all, the pass's threads make each slot with its piece
 //! locked as above.
+//!
+//! What the threads still share: a chunk's views are looked up under one
+//! read of the table of views (`super::super::views_of`), the notes'
+//! counters are gathered per thread (`note_kind::gather`), but the notes'
+//! sets (`buffers`, the texture queue, the spans) are taken slot by slot. On
+//! the benchmark (`tests::rounds_83k`) the threads gain on views with
+//! `VICTORY_HEAP_NOTE_KIND=1` (null views 1.9x, a mix 1.15-1.25x) and lose
+//! without it (a mix 0.75-0.86x): use it with that switch.
 //!
 //! `VICTORY_PARALLEL_MIRROR=check`: one round in [`CHECK_EVERY`] is made
 //! from records read once before it, and then, `made` still held, each of
@@ -275,16 +283,21 @@ pub(crate) const PASS_THREADS: usize = 8;
 pub(crate) const CHECK_EVERY: u64 = 16;
 
 /// The locks of `made`'s pieces.
-pub(crate) struct Pieces(Vec<Mutex<()>>);
+pub(crate) struct Pieces(Vec<Piece>);
+
+/// One piece's lock, on a cache line of its own: the threads take the
+/// pieces of neighbouring slots at once.
+#[repr(align(128))]
+struct Piece(Mutex<()>);
 
 impl Pieces {
     pub(crate) fn new() -> Self {
-        Pieces((0..PIECES).map(|_| Mutex::new(())).collect())
+        Pieces((0..PIECES).map(|_| Piece(Mutex::new(()))).collect())
     }
 
     /// Slot `index`'s piece locked.
     fn lock(&self, index: u32) -> std::sync::MutexGuard<'_, ()> {
-        self.0[(index % PIECES) as usize].lock().unwrap_or_else(|e| e.into_inner())
+        self.0[(index % PIECES) as usize].0.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -293,17 +306,27 @@ thread_local! {
     /// other threads (a chunk of a round, a thread of the pass over buffer
     /// views); 0: none.
     static JOB: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// In such a job, the piece of the slot being made, while it is locked.
+    /// In such a job, the title slot being made, while its piece is locked.
     static AT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     /// Stale slots of other pieces, unmade once that piece is let go of.
     static LATER: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Whether this thread makes `heap`'s slots together with other threads
-/// now: a slot that comes to hold nothing lets go of its resource at once
-/// (`HostHeap::later`, the lean chunk's keep).
-pub(crate) fn in_job(heap: &HostHeap) -> bool {
+/// now.
+fn in_job(heap: &HostHeap) -> bool {
     JOB.get() == std::ptr::from_ref(heap) as usize
+}
+
+/// Whether host slot `host` of `heap`, coming to hold nothing on this
+/// thread, lets go of its resource at once (`HostHeap::later`, the lean
+/// chunk's keep): on a thread that makes slots with others, unless it is
+/// the slot being made, at its own index (no other thread makes that title
+/// slot in the round; another may unmake it, at once). A stale slot may be
+/// made again on another thread, and a pool slot given back may be taken
+/// by another title slot, before this thread's chunk ends.
+pub(crate) fn keep_now(heap: &HostHeap, host: u32) -> bool {
+    in_job(heap) && !(host < heap.count && AT.get() == Some(host))
 }
 
 /// Whether the threads of the pass over buffer views make each slot with
@@ -328,6 +351,7 @@ pub(crate) fn pass_threads(slots: usize) -> usize {
 /// back after it ([`Job::enter`]).
 struct Job {
     was: usize,
+    gathering: bool,
     #[cfg(feature = "diagnostics")]
     syncing: Option<bool>,
 }
@@ -341,6 +365,8 @@ impl Job {
         let _ = syncing;
         Job {
             was,
+            // The notes' counts gathered on this thread for its job.
+            gathering: note_kind::gather(true),
             #[cfg(feature = "diagnostics")]
             syncing: syncing.then(|| {
                 let was = note_kind::syncing_now();
@@ -354,6 +380,7 @@ impl Job {
 impl Drop for Job {
     fn drop(&mut self) {
         JOB.set(self.was);
+        note_kind::gather(self.gathering);
         #[cfg(feature = "diagnostics")]
         if let Some(was) = self.syncing {
             note_kind::syncing(was);
@@ -666,20 +693,43 @@ impl HostHeap {
         // (What this thread gathered before, if it was in a chunk of its
         // own, is given back after.)
         let outer = RETIRE_LATER.replace(Some(Vec::new()));
+        // Each slot's record (`None`: no host slot), then their views, looked
+        // up together: the table of views is read once for the chunk, not
+        // by every thread for every slot.
+        let mirrored = self.mirrored();
+        let records: Vec<Option<[u32; 3]>> = slots
+            .iter()
+            .enumerate()
+            .map(|(i, &(index, handle))| match (lean, words) {
+                (Some(check), Some(words)) if index < mirrored => {
+                    Some(if check { sync_lean::compared(handle, words[i]) } else { words[i] })
+                }
+                (Some(_), _) => {
+                    // (Counted and said there, as before.)
+                    let _ = self.record_at(index, handle, false);
+                    None
+                }
+                (None, _) => {
+                    let read = self.record_at(index, handle, false)?;
+                    Some(words.map_or(read, |w| w[i]))
+                }
+            })
+            .collect();
+        let mut views = {
+            let _view = crate::draw::heap_pass::parts::enter(crate::draw::heap_pass::parts::Part::View);
+            super::super::views_of(&records.iter().map(|r| r.unwrap_or([0; 3])).collect::<Vec<_>>())
+        };
+        let key = |[_, i, generation]: [u32; 3]| u64::from(generation) << 32 | u64::from(i);
         match lean {
-            Some(check) => {
-                let words = words.unwrap_or_default();
-                let mirrored = self.mirrored();
+            Some(_) => {
                 let mut chunk = sync_lean::Chunk::new(self, false);
                 self.note_title_start(slots);
                 for (i, &(index, handle)) in slots.iter().enumerate() {
-                    if index >= mirrored {
-                        // (Counted and said there, as before.)
-                        let _ = self.record_at(index, handle, false);
+                    let Some(record) = records[i] else {
                         continue;
-                    }
-                    let record = if check { sync_lean::compared(handle, words[i]) } else { words[i] };
-                    self.in_piece(made, index, || self.mirror_lean(made, (index, handle), record, &mut chunk));
+                    };
+                    let view = views[i].take();
+                    self.in_piece(made, index, || self.mirror_lean_view(made, (index, handle), key(record), view, &mut chunk));
                 }
                 sync_lean::counted(slots.len());
                 chunk.end(self, made);
@@ -687,12 +737,12 @@ impl HostHeap {
             None => {
                 let later = KeptLater::begin(self);
                 for (i, &(index, handle)) in slots.iter().enumerate() {
-                    let Some(read) = self.record_at(index, handle, false) else {
+                    let Some(record) = records[i] else {
                         continue;
                     };
-                    let record = words.map_or(read, |w| w[i]);
+                    let view = views[i].take();
                     self.in_piece(made, index, || {
-                        self.mirror_made(made, false, (index, handle, false, true), record, &mut Lookups::each())
+                        self.mirror_view(made, false, (index, handle, false, true), key(record), view, &mut Lookups::each())
                     });
                 }
                 drop(later);
@@ -711,7 +761,7 @@ impl HostHeap {
     pub(super) fn in_piece<R>(&self, made: &Made, index: u32, f: impl FnOnce() -> R) -> R {
         let out = {
             let _piece = self.pieces.lock(index);
-            AT.set(Some(index % PIECES));
+            AT.set(Some(index));
             let out = f();
             AT.set(None);
             out
@@ -729,7 +779,7 @@ impl HostHeap {
                 continue;
             }
             // (No piece is noted as held: unmade as usual, its resource
-            // let go of at once, `in_job`.)
+            // let go of at once, `keep_now`.)
             self.unmake(made, stale);
             count(Count::LaterUnmade, 1);
         }
@@ -741,10 +791,10 @@ impl HostHeap {
     /// another piece than that slot, is left for when that piece is let go
     /// of ([`HostHeap::in_piece`]); true if so (the caller unmakes nothing).
     pub(super) fn par_stale(&self, index: u32) -> bool {
-        let Some(piece) = AT.get() else {
+        let Some(making) = AT.get() else {
             return false;
         };
-        if !in_job(self) || index % PIECES == piece {
+        if !in_job(self) || index % PIECES == making % PIECES {
             return false;
         }
         LATER.with_borrow_mut(|later| later.push(index));
@@ -1026,11 +1076,14 @@ mod tests {
         test.join().unwrap();
     }
 
-    /// noaclr's `parallel_mirror_83k_slots_speedup`: 83,000 slots of
-    /// constant views (as many as the title's world entry has its heap
-    /// sync and pass make), made by the heap sync's chunks on one thread and
-    /// in rounds on several. Run with
-    /// `cargo test --release -p victory-gpu --lib par_mirror::tests::rounds_83k -- --ignored --nocapture`.
+    /// noaclr's `parallel_mirror_83k_slots_speedup`: 83,000 slots (as many
+    /// as the title's world entry has its heap sync and pass make), made by
+    /// the heap sync's chunks on one thread and in rounds on several, from
+    /// the same records: constant views (noaclr's), null views (made, no
+    /// note), then a mix of buffer, constant, null and texture views that
+    /// changes every round, with and without `VICTORY_HEAP_NOTE_KIND`. Run
+    /// with
+    /// `cargo test --profile diag -p victory-gpu --lib par_mirror::tests::rounds_83k -- --ignored --nocapture`.
     #[test]
     #[ignore = "benchmark"]
     fn rounds_83k() {
@@ -1039,31 +1092,64 @@ mod tests {
         }
         const SLOTS: u32 = 83_000;
         let _switches = Switches::set(None, true);
-        let one = HostHeap::new(false, SLOTS).unwrap();
-        let many = HostHeap::new(false, SLOTS).unwrap();
         let base = 0x4f_0000_0000u64;
-        let mut memory = vec![[0u32; 8]; SLOTS as usize];
-        let start = memory.as_mut_ptr() as u64;
-        for (s, slot) in memory.iter_mut().enumerate() {
-            slot[..3].copy_from_slice(&record_of(&View::Constant(base + (s as u64 % 256) * 256, 256)));
-        }
-        let due: Vec<(u32, u64)> = (0..SLOTS).map(|s| (s, start + u64::from(s) * TITLE_SLOT_BYTES)).collect();
+        let views = [
+            buffer(base, 16),
+            View::NullConstant,
+            buffer(base + 0x1_0000, 32),
+            View::Constant(base, 256),
+            texture(base + 0x10_0000, 64),
+            View::NullConstant,
+            buffer(base + 0x2_0000, 16),
+            View::Constant(base + 0x100, 256),
+            texture(base + 0x20_0000, 64),
+        ];
+        let records: Vec<[u32; 3]> = views.iter().map(record_of).collect();
+        let constant = record_of(&View::Constant(base, 256));
+        let null = record_of(&View::NullConstant);
         // The crew started first.
         crew_run((0..8).map(|_| Box::new(|| {}) as CrewJob).collect());
-        TEST_MODE.set(Some(Mode::Off));
-        let t = std::time::Instant::now();
-        one.mirror_due_par(&due, &[], None);
-        let serial = t.elapsed();
-        TEST_MODE.set(Some(Mode::On));
-        let t = std::time::Instant::now();
-        many.mirror_due_par(&due, &[], None);
-        let parallel = t.elapsed();
-        eprintln!(
-            "par_mirror ({SLOTS} slots): one thread {serial:?}, {} threads {parallel:?} ({:.2}x)",
-            crew_size() + 1,
-            serial.as_secs_f64() / parallel.as_secs_f64()
-        );
-        assert!(many.made(SLOTS - 1));
-        drop(memory);
+        for (name, mixed, kind) in [
+            ("no views", Some([0; 3]), note_kind::Mode::On),
+            ("constant views", Some(constant), note_kind::Mode::Off),
+            ("null views, NOTE_KIND", Some(null), note_kind::Mode::On),
+            ("mixed views", None, note_kind::Mode::Off),
+            ("mixed views, NOTE_KIND", None, note_kind::Mode::On),
+        ] {
+            note_kind::TEST_MODE.set(Some(kind));
+            let one = HostHeap::new(false, SLOTS).unwrap();
+            let many = HostHeap::new(false, SLOTS).unwrap();
+            let mut memory = vec![[0u32; 8]; SLOTS as usize];
+            let start = memory.as_mut_ptr() as u64;
+            let due: Vec<(u32, u64)> = (0..SLOTS).map(|s| (s, start + u64::from(s) * TITLE_SLOT_BYTES)).collect();
+            let (mut serial, mut parallel) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+            let summed = COUNTS[Count::Threads as usize].load(Relaxed);
+            for round in 0..4u32 {
+                for s in 0..SLOTS {
+                    let pick = ((s * 7 + round * 13) % (views.len() as u32 + 3)) as usize;
+                    let record = mixed.unwrap_or_else(|| records.get(pick).copied().unwrap_or([0; 3]));
+                    memory[s as usize][..3].copy_from_slice(&record);
+                }
+                TEST_MODE.set(Some(Mode::Off));
+                let t = std::time::Instant::now();
+                one.mirror_due_par(&due, &[], None);
+                serial += t.elapsed();
+                TEST_MODE.set(Some(Mode::On));
+                let t = std::time::Instant::now();
+                many.mirror_due_par(&due, &[], None);
+                parallel += t.elapsed();
+            }
+            let summed = COUNTS[Count::Threads as usize].load(Relaxed) - summed;
+            eprintln!(
+                "par_mirror ({SLOTS} slots, {name}, 4 rounds): one thread {:.1} ms a round, {} threads {:.1} ms ({:.2}x),                  summed over the threads {:.1} ms",
+                serial.as_secs_f64() * 250.0,
+                crew_size() + 1,
+                parallel.as_secs_f64() * 250.0,
+                serial.as_secs_f64() / parallel.as_secs_f64(),
+                summed as f64 / 4000.0
+            );
+            drop(memory);
+        }
+        note_kind::TEST_MODE.set(None);
     }
 }

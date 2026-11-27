@@ -2423,11 +2423,11 @@ impl HostHeap {
         if !self.kept.split() || (matches!(what, Later::Keep(_)) && !self.kept.low(index)) {
             return Err(what);
         }
-        // VIcky (`VICTORY_PARALLEL_MIRROR`, [`par_mirror`]): on a thread that
-        // makes slots with others, a slot that comes to hold nothing lets go
-        // at once (another thread may make it again, and keep that, before
-        // this chunk ends).
-        if matches!(what, Later::Keep(None)) && par_mirror::in_job(self) {
+        // VIcky (`VICTORY_PARALLEL_MIRROR`, [`par_mirror::keep_now`]): on a
+        // thread that makes slots with others, a stale or pool slot that
+        // comes to hold nothing lets go at once (another thread may make it
+        // again, and keep that, before this chunk ends).
+        if matches!(what, Later::Keep(None)) && par_mirror::keep_now(self, index) {
             return Err(what);
         }
         let me = std::ptr::from_ref(self) as usize;
@@ -3077,17 +3077,33 @@ impl HostHeap {
         &self,
         made: &Made,
         alone: bool,
-        (index, handle, for_draw, marks): (u32, u64, bool, bool),
+        slot: (u32, u64, bool, bool),
         [tag, i, generation]: [u32; 3],
         lookups: &mut Lookups,
     ) -> Option<View> {
-        use crate::draw::heap_pass::parts::{Count, Part, count, enter};
+        use crate::draw::heap_pass::parts::{Part, enter};
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let view = {
             let _view = enter(Part::View);
             (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
         };
+        self.mirror_view(made, alone, slot, key, view, lookups)
+    }
+
+    /// [`HostHeap::mirror_made`] with the record's view (`key` its record)
+    /// looked up by the caller: VIcky (`VICTORY_PARALLEL_MIRROR`,
+    /// [`par_mirror`]) looks up a chunk's views at once.
+    fn mirror_view(
+        &self,
+        made: &Made,
+        alone: bool,
+        (index, handle, for_draw, marks): (u32, u64, bool, bool),
+        key: u64,
+        view: Option<View>,
+        lookups: &mut Lookups,
+    ) -> Option<View> {
+        use crate::draw::heap_pass::parts::{Count, Part, count, enter};
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
@@ -3154,6 +3170,9 @@ impl HostHeap {
             if later
                 && keep_views()
                 && (!skip_same() || placed_texture_view(&view))
+                // (No record is 0: generations start at 1. The table's lock
+                // not taken for it, VIcky.)
+                && old != 0
                 && view_at(old as u32, (old >> 32) as u32)
                     .is_some_and(|old| same_placed_texture(&old, &view))
             {

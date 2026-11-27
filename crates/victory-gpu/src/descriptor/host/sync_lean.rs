@@ -167,8 +167,8 @@ pub(super) struct Chunk {
     split: bool,
     /// `made` held alone (false: by the round of `VICTORY_PARALLEL_MIRROR`
     /// for this chunk and the round's others, [`super::par_mirror`]: no
-    /// pool slot of another slot is given back, and a slot that comes to
-    /// hold nothing lets go at once).
+    /// pool slot of another slot is given back, and a stale or pool slot
+    /// that comes to hold nothing lets go at once, `par_mirror::keep_now`).
     alone: bool,
     keeps: Vec<(u32, Option<ID3D12Resource>)>,
     marks: Vec<u32>,
@@ -205,7 +205,7 @@ impl Chunk {
     /// [`HostHeap::keep`] of host slot `index`.
     fn keep(&mut self, heap: &HostHeap, index: u32, resource: Option<ID3D12Resource>) {
         let _keep = crate::draw::heap_pass::parts::enter(crate::draw::heap_pass::parts::Part::Keep);
-        if self.split && heap.kept.low(index) && (self.alone || resource.is_some()) {
+        if self.split && heap.kept.low(index) && (self.alone || resource.is_some() || !super::par_mirror::keep_now(heap, index)) {
             self.keeps.push((index, resource));
         } else {
             heap.kept.replace(index, resource, retire_held);
@@ -312,13 +312,20 @@ impl HostHeap {
     /// [`HostHeap::mirror_made`] of the heap sync (`made` held alone, not
     /// for a draw, marking) for title slot `index` at `handle`, which held
     /// `record`; with the chunk's ways.
-    pub(super) fn mirror_lean(&self, made: &Made, (index, handle): (u32, u64), [tag, i, generation]: [u32; 3], chunk: &mut Chunk) {
-        use crate::draw::heap_pass::parts::{Count, Part, count, enter};
+    fn mirror_lean(&self, made: &Made, slot: (u32, u64), [tag, i, generation]: [u32; 3], chunk: &mut Chunk) {
+        use crate::draw::heap_pass::parts::{Part, enter};
         let key = u64::from(generation) << 32 | u64::from(i);
         let view = {
             let _view = enter(Part::View);
             (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
         };
+        self.mirror_lean_view(made, slot, key, view, chunk);
+    }
+
+    /// [`HostHeap::mirror_lean`] with the record's view (`key` its record)
+    /// looked up by the caller (`VICTORY_PARALLEL_MIRROR`, a chunk's at once).
+    pub(super) fn mirror_lean_view(&self, made: &Made, (index, handle): (u32, u64), key: u64, view: Option<View>, chunk: &mut Chunk) {
+        use crate::draw::heap_pass::parts::{Count, Part, count, enter};
         let Some(view) = view else {
             count(Count::NotOurs);
             #[cfg(feature = "diagnostics")]
@@ -366,6 +373,7 @@ impl HostHeap {
         if later
             && chunk.keep_views
             && (!chunk.skip_same || placed_texture_view(&view))
+            && old != 0
             && view_at(old as u32, (old >> 32) as u32).is_some_and(|old| same_placed_texture(&old, &view))
         {
             KEPT_VIEWS.fetch_add(1, Relaxed);

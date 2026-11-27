@@ -1242,6 +1242,32 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     }
 }
 
+/// VIcky (`VICTORY_PARALLEL_MIRROR`, `host::par_mirror`): [`view_at`] of
+/// each of `records` (tag, index, generation; `None` for a tag that is not
+/// ours), the table of views read once for all of them: the threads that
+/// make a heap sync's slots together took its lock in turn for every slot.
+pub(crate) fn views_of(records: &[[u32; 3]]) -> Vec<Option<View>> {
+    let mut views = None;
+    records
+        .iter()
+        .map(|&[tag, i, generation]| {
+            if tag != VIEW_TAG {
+                return None;
+            }
+            match generation >> KIND_SHIFT {
+                0 => {
+                    let views = views.get_or_insert_with(views_read);
+                    let (view, current) = views.list.get(i as usize)?;
+                    (*current == generation).then(|| view.clone())
+                }
+                CONSTANT => Some(constant_of(i, generation)),
+                PLACED => views.get_or_insert_with(views_read).placed_of(i, generation),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 /// VIcky (`crate::draw::heap_pass`): the three words of the record at
 /// `handle`, read in place, as `host::HostHeap::mirror` reads them.
 pub(crate) fn record_words(handle: u64) -> [u32; 3] {
