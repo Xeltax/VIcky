@@ -23,12 +23,17 @@
 //!   first mapping, simulated; the alias census), and the title's
 //!   reservations by class ([`reserved`]).
 //! - P6: [`faults`] (protects the pages the landings wrote for one frame in
-//!   64; `VICTORY_LOT4_PROBE_FAULTS=0` leaves it out).
+//!   64, half way between P8's; `VICTORY_LOT4_PROBE_FAULTS=0` leaves it out).
 //! - P7: [`locks`] (acquisitions and waits of the hot locks) and [`ccd`]
 //!   (`VICTORY_CCD_PLACE=1|alt`, which works without the probes).
 //!
 //! Off, each hook is one load of a flag (diagnostics builds; in others the
 //! hooks are compiled out and [`on`] is false).
+//!
+//! P0 and P8, the device side ([`device`]), read the same switch with the
+//! same parser (`device::on`, in every build): P0 once when the device is
+//! made, P8 one frame in 64 from the sweep. Their lines start
+//! `lot4 probe P0:` and `lot4 probe P8:`.
 
 // (Called from diagnostics builds only; the lock helpers are used in all.)
 #![cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
@@ -40,8 +45,13 @@ use std::sync::{Arc, Mutex};
 use crate::perthread::Counters;
 
 pub(crate) mod ccd;
+pub mod device;
 pub(crate) mod faults;
 pub(crate) mod locks;
+
+/// The device probe's child processes' entry (`device::child`), for the
+/// front end.
+pub use device::child;
 
 /// The probes' block: the console's 64 KiB page.
 pub(crate) const BLOCK: usize = 64 << 10;
@@ -70,11 +80,13 @@ pub(crate) fn on() -> bool {
 #[cfg(feature = "diagnostics")]
 #[cold]
 fn read_switch(on: &std::sync::atomic::AtomicU8) -> bool {
-    let is = std::env::var_os("VICTORY_LOT4_PROBE").is_some_and(|v| v == "1");
+    // (The device probes' parser: "1", spaces around allowed.)
+    let is = device::switch_on(std::env::var("VICTORY_LOT4_PROBE").ok().as_deref());
     if on.swap(if is { 2 } else { 1 }, Relaxed) == 0 && is {
         tracing::info!(
-            "lot 4 probes on (VICTORY_LOT4_PROBE=1): lines 'lot4 probe P1..P7' with the frame log's readings; P6 protects \
-             the pages the landings wrote for one frame in 64 (VICTORY_LOT4_PROBE_FAULTS=0: not)"
+            "lot 4 probes on (VICTORY_LOT4_PROBE=1): lines 'lot4 probe P1..P7' with the frame log's readings (P0 once at \
+             the device's making, P8 one frame in 64); P6 protects the pages the landings wrote for one frame in 64, half way \
+             between P8's (VICTORY_LOT4_PROBE_FAULTS=0: not)"
         );
     }
     is

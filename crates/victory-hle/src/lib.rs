@@ -19,6 +19,10 @@ pub mod runtime;
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
 pub use victory_gpu::console;
+/// The lot 4 device probe's child processes (`VICTORY_LOT4_PROBE=1`): the
+/// front end hands one over before anything else.
+#[cfg(windows)]
+pub use victory_gpu::lot4::child as lot4_child;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;

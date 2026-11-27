@@ -135,6 +135,12 @@ fn main() -> Result<()> {
     if victory_hle::modules::audio::capture::child() {
         return Ok(());
     }
+    // A child of the lot 4 device probe (`VICTORY_LOT4_PROBE=1`): tile
+    // mappings that may remove its own device, never the run's.
+    #[cfg(windows)]
+    if victory_hle::lot4_child() {
+        return Ok(());
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Inspect {

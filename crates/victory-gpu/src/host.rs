@@ -184,6 +184,8 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 fn sweep() {
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
     crate::inplace::tick();
+    // Lot 4's copy-queue pull, if asked for (`VICTORY_LOT4_PROBE`).
+    crate::lot4::device::tick();
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP").is_none_or(|v| v != "0")) {
         return;
@@ -724,7 +726,7 @@ fn create() -> windows::core::Result<Host> {
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
         tracing::info!("host D3D12 device ready");
-        Ok(Host {
+        let host = Host {
             device,
             queue,
             fence,
@@ -739,7 +741,13 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
-        })
+        };
+        // Lot 4's device probe, once, if asked for (`VICTORY_LOT4_PROBE`):
+        // queues, heaps and children of its own; it never calls `host()`.
+        if crate::lot4::device::on() {
+            crate::lot4::device::p0(&host.device, host.video_memory_groups());
+        }
+        Ok(host)
     }
 }
 
@@ -8396,6 +8404,10 @@ impl Batch {
         let started = std::time::Instant::now();
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
+        // Lot 4's P8, one frame in 64 with `VICTORY_LOT4_PROBE=1`.
+        if crate::lot4::device::recording() {
+            crate::lot4::device::refreshed(shadow.id(), us);
+        }
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};

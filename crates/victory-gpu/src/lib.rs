@@ -48,8 +48,11 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 pub mod list;
+/// Lot 4's probes (`VICTORY_LOT4_PROBE=1`): the host side's P1-P7 and the
+/// device's P0 and P8 ([`lot4::device`]); public for the entry of the
+/// device probe's child processes ([`lot4::child`]).
 #[cfg(windows)]
-mod lot4;
+pub mod lot4;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

@@ -4,8 +4,8 @@
 //! be left stale and fetched on a fault, instead of written at every
 //! landing.
 //!
-//! One frame in [`EVERY`]: each 64 KiB block a landing wrote into title
-//! memory in that frame (`crate::shadow`'s write-back, the texture
+//! One frame in [`EVERY`] (half way between P8's, `super::device`): each
+//! 64 KiB block a landing wrote into title memory in that frame (`crate::shadow`'s write-back, the texture
 //! copy-back) is made no-access right after the write, and stays so through
 //! the next frame. A fault on it opens it again (its protection given
 //! back), and is counted: a read or a write, by code of the title (or a
@@ -87,13 +87,24 @@ fn enabled() -> bool {
     super::on() && *ON.get_or_init(|| std::env::var_os("VICTORY_LOT4_PROBE_FAULTS").is_none_or(|v| v != "0"))
 }
 
-/// Frame `frame` ended: the sampling's steps.
-pub(crate) fn frame(frame: u64) {
+/// The 64-frame stretch (of `crate::frame::current`) last sampled.
+static SAMPLED: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// A frame ended: the sampling's steps. A sample starts half way through a
+/// stretch of [`EVERY`] frames of `crate::frame::current`, once a stretch,
+/// and not while P8 (`super::device`, which records frames 64k + 1 of the
+/// same counter and then pulls a region opened in place) records: its CPU
+/// copies would be timed with P6's protections in them.
+pub(crate) fn frame(_frame: u64) {
     if !enabled() {
         return;
     }
+    let current = crate::frame::current();
+    let stretch = current / EVERY;
+    let due = current % EVERY >= EVERY / 2 && SAMPLED.load(Relaxed) != stretch && !super::device::recording();
     match STATE.load(Relaxed) {
-        0 if frame.is_multiple_of(EVERY) => {
+        0 if due => {
+            SAMPLED.store(stretch, Relaxed);
             install();
             {
                 let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
