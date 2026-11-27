@@ -175,6 +175,8 @@ fn reservations() -> MutexGuard<'static, BTreeMap<usize, Reservation>> {
 /// at an address of its choice), with the title's own `kind`, XMem `flags`
 /// and console `protect` (before the runtime cleans them).
 pub fn title_memory_reserved(at: usize, len: usize, kind: u32, flags: u64, protect: u32) {
+    // Holes found there are no longer known (`VICTORY_SPARSE_KNOWN`).
+    crate::host::sparseknown::forget(at, len);
     if !tracking() || at == 0 || len == 0 {
         return;
     }
