@@ -122,6 +122,8 @@ impl Written {
     }
 }
 
+mod reservation;
+
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
@@ -355,6 +357,12 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)], mut view: impl FnMut(usize)) {
         look_at_holes(HOLES_A_LOOK);
     }
     ask_once_end();
+    let _timed = reservation::timed();
+    // By reservation (`VICTORY_WATCH_RESERVATION`), unless the runtime is
+    // changing a mapping.
+    if reservation::on() && reservation::ask(ranges, &mut view) {
+        return;
+    }
     ask_ahead(ranges.iter().copied());
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
@@ -480,6 +488,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let started = std::time::Instant::now();
     #[cfg(feature = "diagnostics")]
     let pages = count;
+    reservation::count_kernel(count);
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -2738,6 +2747,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    reservation::completed_write(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -2861,6 +2871,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    reservation::remapped();
     // Holes found there are no longer known (`VICTORY_SPARSE_KNOWN`).
     crate::host::sparseknown::forget(at, len);
     crate::texback::remapped(at, len);
@@ -3198,7 +3209,7 @@ mod tests {
             Some((view / PAGE..view / PAGE + 1).collect())
         );
         // The guards are told before the address can be mapped again by
-        // another test.
+        // another test (a guard they kept, or opened late, is a view's).
         title_memory_remapped(view, 2 * BLOCK);
         // SAFETY: our view.
         unsafe {
