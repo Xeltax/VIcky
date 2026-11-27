@@ -122,8 +122,8 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use per_program::{
     MASK_COPIES_RETRY_ON, MaskCopies, deep_skips_allowed, for_program, mask_copies, mask_copies_retried, shader_opt_allowed,
-    dropped_stores, site_pairs_allowed, wave64_program, wave64_retried, wave_pairs_allowed, wave_pairs_settings,
-    with_mask_copies,
+    dropped_stores, lds_flags_allowed, site_pairs_allowed, wave64_program, wave64_retried, wave_pairs_allowed,
+    wave_pairs_settings, with_mask_copies,
 };
 pub(crate) use per_program::{current as program_hash, mask_copies_here, site_pairs_here, store_dropped_here};
 #[cfg(test)]

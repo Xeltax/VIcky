@@ -35,6 +35,8 @@ use paired::{LaneState, lane_scalars};
 mod paired_fp32;
 #[path = "lds_init.rs"]
 mod lds_init;
+#[path = "lds_flags.rs"]
+mod lds_flags;
 
 type Why = &'static str;
 
@@ -957,7 +959,18 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
+    // A region that reads and writes LDS is still taken when it only raises flags
+    // (`lds_flags`): a read that misses the other host wave's write changes nothing the region
+    // leaves behind. (After DrTardis1963 1b5c3a1e; for the programs `VICTORY_LDS_FLAGS` names.)
+    let flags_on = super::per_program::lds_flags_here();
+    let unflagged: Vec<usize> = (0..n)
+        .filter(|&r| reads[r] && writes[r])
+        .filter(|&r| {
+            let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
+            !(flags_on && lds_flags::lds_flag_region(p, st, &blocks))
+        })
+        .collect();
+    if !unflagged.is_empty() {
         return None;
     }
     let mut meet = vec![(false, false); n];
