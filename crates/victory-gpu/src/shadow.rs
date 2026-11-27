@@ -5605,6 +5605,21 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    crate::copy_ahead::declared(resource, start);
+}
+
+/// With [`crate::copy_ahead`]: makes the copy of the buffer `resource` at
+/// `start` if the title has not let it go and no ask made the copy yet.
+/// Returns its length and whether a copy was made.
+pub(crate) fn copy_ahead_of(resource: usize, start: u64) -> Option<(u64, bool)> {
+    let mut map = buffers();
+    let entry = map.get_mut(&(start, resource))?;
+    let len = entry.end - start;
+    if entry.shadow.is_some() {
+        return Some((len, false));
+    }
+    make_copy(entry, (start, resource))?;
+    Some((len, true))
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
@@ -5713,83 +5728,91 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
-        let len = entry.end - key.0;
-        // Rounded up so that views ending in the buffer's last 256 bytes fit.
-        // Shaders write some buffers (unordered access), so not upload memory.
-        let size = len.next_multiple_of(1 << 16);
-        // In place, if asked for and the memory can be opened
-        // (`crate::inplace::place_for`): the buffer is the title's own
-        // memory. Not the big ones `cards` puts in the card's memory: those
-        // are read too often to stay in the PC's.
-        let big = cards() && size >= card_limits().0;
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
-        }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
-                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                if size < 1 << 20 {
-                    // Only with `VICTORY_CARD_BUFFERS_MIN_KB` (some 3,700
-                    // of them): the first 32, then every 256th.
-                    let n = CARD_SMALL[0].fetch_add(1, Ordering::Relaxed) + 1;
-                    let bytes = CARD_SMALL[1].fetch_add(size, Ordering::Relaxed) + size;
-                    if n <= 32 || n.is_multiple_of(256) {
-                        tracing::info!(
-                            start = format_args!("{:#x}", key.0),
-                            len,
-                            "a buffer's host copy under 1 MiB is in the card's memory (VICTORY_CARD_BUFFERS_MIN_KB): {n} such \
-                             copies so far, {} MB",
-                            bytes >> 20
-                        );
-                    }
-                } else {
+        make_copy(entry, key)?;
+    }
+    entry.shadow.clone()
+}
+
+/// Makes the host copy of the title buffer `key` (`entry`, which has none
+/// yet) and puts it in the entry: on first use ([`lookup`]) or, with
+/// [`crate::copy_ahead`], when the title declares the buffer.
+fn make_copy(entry: &mut Entry, key: (u64, usize)) -> Option<()> {
+    let len = entry.end - key.0;
+    // Rounded up so that views ending in the buffer's last 256 bytes fit.
+    // Shaders write some buffers (unordered access), so not upload memory.
+    let size = len.next_multiple_of(1 << 16);
+    // In place, if asked for and the memory can be opened
+    // (`crate::inplace::place_for`): the buffer is the title's own
+    // memory. Not the big ones `cards` puts in the card's memory: those
+    // are read too often to stay in the PC's.
+    let big = cards() && size >= card_limits().0;
+    if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+        entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+        return Some(());
+    }
+    let (buffer, data) = host()?.shared_buffer(size)?;
+    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+    // A big one, with `cards`: shaders get a buffer in the card's own
+    // memory, and the one just made is the CPU's side.
+    let (buffer, card) = match card_for(size) {
+        Some(on_card) => {
+            crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
+            if size < 1 << 20 {
+                // Only with `VICTORY_CARD_BUFFERS_MIN_KB` (some 3,700
+                // of them): the first 32, then every 256th.
+                let n = CARD_SMALL[0].fetch_add(1, Ordering::Relaxed) + 1;
+                let bytes = CARD_SMALL[1].fetch_add(size, Ordering::Relaxed) + size;
+                if n <= 32 || n.is_multiple_of(256) {
                     tracing::info!(
                         start = format_args!("{:#x}", key.0),
                         len,
-                        "a buffer's host copy is in the card's memory"
+                        "a buffer's host copy under 1 MiB is in the card's memory (VICTORY_CARD_BUFFERS_MIN_KB): {n} such \
+                         copies so far, {} MB",
+                        bytes >> 20
                     );
                 }
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                    size,
-                    dense: Dense::new(size),
-                };
-                (on_card, Some(card))
+            } else {
+                tracing::info!(
+                    start = format_args!("{:#x}", key.0),
+                    len,
+                    "a buffer's host copy is in the card's memory"
+                );
             }
-            None => (buffer, None),
-        };
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if len >= 16 << 20 {
-            tracing::info!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "large buffer copied to the host"
-            );
-        } else {
-            tracing::debug!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "buffer copied to the host"
-            );
+            let card = Card {
+                staging: buffer,
+                before: Mutex::default(),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                size,
+                dense: Dense::new(size),
+            };
+            (on_card, Some(card))
         }
-        let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
-        shadow.card = card;
-        let shadow = Arc::new(shadow);
-        if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
-        }
-        entry.shadow = Some(shadow);
+        None => (buffer, None),
+    };
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    if len >= 16 << 20 {
+        tracing::info!(
+            start = format_args!("{:#x}", key.0),
+            len,
+            "large buffer copied to the host"
+        );
+    } else {
+        tracing::debug!(
+            start = format_args!("{:#x}", key.0),
+            len,
+            "buffer copied to the host"
+        );
     }
-    entry.shadow.clone()
+    let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+    shadow.card = card;
+    let shadow = Arc::new(shadow);
+    if shadow.card.is_some() {
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    }
+    entry.shadow = Some(shadow);
+    Some(())
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
