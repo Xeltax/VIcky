@@ -71,7 +71,7 @@ struct Journal {
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
-    ahead: Vec<(usize, usize)>,
+    ahead: Ahead,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
@@ -79,11 +79,64 @@ struct Journal {
     kept: bool,
 }
 
+/// Page ranges `[a, b)` asked ahead, by start, each as asked (none merged):
+/// whether one of them holds a range is asked at every refresh of a
+/// submission (thousands a frame) and at every range of [`ask_once`], where
+/// a scan of all of them made the submission's asking quadratic in its
+/// ranges. `reach[i]` is the furthest end of `ranges[..=i]`, so "some range
+/// with `a <= first` ends at `last` or later", which is "one range holds
+/// `[first, last)`", is one binary search (after ScarlettPort 50a9f7c5; the
+/// answers are the scan's).
+struct Ahead {
+    ranges: Vec<(usize, usize)>,
+    reach: Vec<usize>,
+}
+
+impl Ahead {
+    const fn new() -> Ahead {
+        Ahead {
+            ranges: Vec::new(),
+            reach: Vec::new(),
+        }
+    }
+
+    /// Whether one range asked holds all of `[first, last)`.
+    fn holds(&self, first: usize, last: usize) -> bool {
+        let i = self.ranges.partition_point(|&(a, _)| a <= first);
+        i > 0 && self.reach[i - 1] >= last
+    }
+
+    fn push(&mut self, range: (usize, usize)) {
+        let i = self.ranges.partition_point(|&r| r <= range);
+        self.ranges.insert(i, range);
+        self.reach_from(i);
+    }
+
+    /// `reach` again from range `i` on.
+    fn reach_from(&mut self, i: usize) {
+        self.reach.truncate(i);
+        let mut far = i.checked_sub(1).map_or(0, |i| self.reach[i]);
+        for &(_, b) in &self.ranges[i..] {
+            far = far.max(b);
+            self.reach.push(far);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
+        self.reach.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+}
+
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
-    ahead: Vec::new(),
+    ahead: Ahead::new(),
     ahead_asked: 0,
     kept: false,
 });
@@ -255,7 +308,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)], mut view: impl FnMut(usize)) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
+        if !j.ahead.holds(first, last) && ask_kernel(j, first, last) {
             j.ahead.push((first, last));
         }
     }
@@ -394,15 +447,14 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 pub(crate) fn ahead_now(start: usize, end: usize) -> Option<u64> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then_some(j.ahead_asked)
+    j.ahead.holds(first, last).then_some(j.ahead_asked)
 }
 
 fn asked_inner(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+        .holds(first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -442,7 +494,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if j.ahead.holds(first, last) {
         #[cfg(feature = "diagnostics")]
         let collecting = std::time::Instant::now();
         let written = j.written.range(first..last).map(|(&p, &w)| (p, w)).collect();
@@ -1954,7 +2006,7 @@ fn nothing_noted(start: usize, end: usize, base: usize, copied: &[u64]) -> bool 
     }
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     // The bits first, then the journal, both under its lock ([`published`]).
-    let by_bits = !j.ahead.iter().any(|&(a, b)| a <= first && last <= b);
+    let by_bits = !j.ahead.holds(first, last);
     if by_bits && !published(&j, first * PAGE, last * PAGE) {
         return false;
     }
@@ -2844,6 +2896,78 @@ fn writable(at: usize) -> bool {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+}
+
+#[cfg(test)]
+mod ahead_tests {
+    use super::Ahead;
+
+    /// What the journal asked before: one asked range that holds the range.
+    fn scanned(ranges: &[(usize, usize)], first: usize, last: usize) -> bool {
+        ranges.iter().any(|&(a, b)| a <= first && last <= b)
+    }
+
+    /// A xorshift, so the ranges are the same every run.
+    fn numbers(mut x: u64) -> impl FnMut(usize) -> usize {
+        move |below| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % below as u64) as usize
+        }
+    }
+
+    /// Ranges overlapping, nested, touching, repeated and empty, pushed one
+    /// by one (as [`super::ask_once`] does): the answer is the scan's for
+    /// every range, those that span two touching ranges among them (no
+    /// single range holds those, and none is merged). After ScarlettPort
+    /// 50a9f7c5's test.
+    #[test]
+    fn holds_answers_as_the_scan_did() {
+        let mut next = numbers(0x9e37_79b9_7f4a_7c15);
+        for round in 0..200 {
+            let count = next(40);
+            let ranges: Vec<(usize, usize)> = (0..count)
+                .map(|_| {
+                    let a = next(300);
+                    (a, a + next(60))
+                })
+                .collect();
+            let mut pushed = Ahead::new();
+            for (n, &range) in ranges.iter().enumerate() {
+                pushed.push(range);
+                for _ in 0..20 {
+                    let first = next(380);
+                    let last = first + next(80);
+                    assert_eq!(
+                        pushed.holds(first, last),
+                        scanned(&ranges[..=n], first, last),
+                        "round {round}: [{first}, {last}) after {:?}",
+                        &ranges[..=n]
+                    );
+                }
+            }
+            for first in 0..380 {
+                for last in first..first + 80 {
+                    assert_eq!(
+                        pushed.holds(first, last),
+                        scanned(&ranges, first, last),
+                        "round {round}: [{first}, {last}) in {ranges:?}"
+                    );
+                }
+            }
+        }
+        let mut touching = Ahead::new();
+        touching.push((20, 30));
+        touching.push((10, 20));
+        assert!(touching.holds(10, 20) && touching.holds(20, 30) && touching.holds(12, 12));
+        assert!(!touching.holds(15, 25), "two ranges hold it, one does not");
+        assert!(!Ahead::new().holds(0, 0));
+        let mut cleared = Ahead::new();
+        cleared.push((0, 100));
+        cleared.clear();
+        assert!(cleared.is_empty() && !cleared.holds(1, 2));
+    }
 }
 
 #[cfg(test)]
