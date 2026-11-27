@@ -24,6 +24,8 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+pub(crate) mod cardlist;
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -153,9 +155,21 @@ struct DirtyNotes {
     /// runs are left out of merges as `ranges` are, until they are sent
     /// ([`card_dirty`]: then noted in [`Card::sent`] with the send).
     patches: Vec<PatchPage>,
+    /// VIcky (`VICTORY_CARD_DIRTY_LIST`, [`cardlist`]): the copy, and
+    /// whether it is on the list of copies with changes.
+    listing: cardlist::Listing,
 }
 
 impl DirtyNotes {
+    /// Changes were noted ([`DirtyNotes::add`], a patch): with
+    /// `VICTORY_CARD_DIRTY_LIST` the copy goes on the list if it is not on
+    /// it ([`cardlist`]), in the lock that noted them.
+    fn listed(&mut self) {
+        if let Some(me) = self.listing.to_list() {
+            cardlist::list(me);
+        }
+    }
+
     /// Offsets `[from, to)` (`from < to`) changed: joined with the last
     /// range if they overlap or touch it, else a range of their own, as
     /// before.
@@ -926,30 +940,71 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// send (their runs); a copy with patches and no ranges is in the result
 /// with no ranges.
 pub(crate) fn card_dirty(sent_as: u64, patches: &mut Vec<(Arc<Shadow>, Vec<PatchPage>)>) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+    // VIcky: from the list of copies with changes instead
+    // (`VICTORY_CARD_DIRTY_LIST`, [`cardlist`]).
+    if cardlist::kept() {
+        return cardlist::card_dirty(sent_as, patches);
+    }
     let mut out = Vec::new();
+    card_dirty_walk(sent_as, patches, &mut out, |_: &mut DirtyNotes| true);
+    out
+}
+
+/// [`card_dirty`]'s walk over every copy in the card's memory: the notes of
+/// each copy `take` says yes to (given them, under their lock) are taken
+/// onto `out` and `patches`. The copies looked at.
+fn card_dirty_walk(
+    sent_as: u64,
+    patches: &mut Vec<(Arc<Shadow>, Vec<PatchPage>)>,
+    out: &mut Vec<(Arc<Shadow>, Vec<(usize, usize)>)>,
+    mut take: impl FnMut(&mut DirtyNotes) -> bool,
+) -> u64 {
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+    let mut looked = 0;
     carded.retain(|weak| {
         let Some(shadow) = weak.upgrade() else {
             return false;
         };
-        let (ranges, patched) = shadow.card.as_ref().map(|c| c.take_dirty(sent_as, fetched)).unwrap_or_default();
-        if !patched.is_empty() {
-            patches.push((shadow.clone(), patched));
-            out.push((shadow, ranges));
-        } else if !ranges.is_empty() {
-            out.push((shadow, ranges));
-        }
+        looked += 1;
+        let (ranges, patched) = shadow.card.as_ref().map(|c| c.take_dirty(sent_as, fetched, &mut take)).unwrap_or_default();
+        card_taken(shadow, ranges, patched, patches, out);
         true
     });
-    out
+    looked
+}
+
+/// One copy's notes taken by [`card_dirty`]: onto `out` (and `patches`)
+/// if there are any.
+fn card_taken(
+    shadow: Arc<Shadow>,
+    ranges: Vec<(usize, usize)>,
+    patched: Vec<PatchPage>,
+    patches: &mut Vec<(Arc<Shadow>, Vec<PatchPage>)>,
+    out: &mut Vec<(Arc<Shadow>, Vec<(usize, usize)>)>,
+) {
+    if !patched.is_empty() {
+        patches.push((shadow.clone(), patched));
+        out.push((shadow, ranges));
+    } else if !ranges.is_empty() {
+        out.push((shadow, ranges));
+    }
 }
 
 impl Card {
     /// [`card_dirty`] for one copy: its ranges and patches, noted as sent
-    /// with send `sent_as` with [`relay`], in the lock that took them.
-    fn take_dirty(&self, sent_as: u64, fetched: u64) -> (Vec<(usize, usize)>, Vec<PatchPage>) {
+    /// with send `sent_as` with [`relay`], in the lock that took them;
+    /// nothing if `take`, given the notes in that lock, says no.
+    fn take_dirty(
+        &self,
+        sent_as: u64,
+        fetched: u64,
+        take: &mut impl FnMut(&mut DirtyNotes) -> bool,
+    ) -> (Vec<(usize, usize)>, Vec<PatchPage>) {
         let mut dirty = self.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        if !take(&mut dirty) {
+            return Default::default();
+        }
         if relay() {
             let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
             dirty.take_with(Some(&mut *sent), sent_as, fetched)
@@ -5179,7 +5234,9 @@ impl Shadow {
         if from >= to {
             return;
         }
-        card.dirty.lock().unwrap_or_else(|e| e.into_inner()).add(from, to);
+        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        dirty.add(from, to);
+        dirty.listed();
     }
 
     /// VIcky ([`dense_patch`]): the page's part at offset `at` of the copy,
@@ -5196,7 +5253,9 @@ impl Shadow {
         PATCH[PATCH_RUNS].fetch_add(runs.len() as u64, Ordering::Relaxed);
         PATCH[PATCH_BYTES].fetch_add(page.masked() as u64, Ordering::Relaxed);
         PATCH_NOTED_ALL.fetch_add(1, Ordering::Relaxed);
-        card.dirty.lock().unwrap_or_else(|e| e.into_inner()).patches.push(page);
+        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        dirty.patches.push(page);
+        dirty.listed();
     }
 
     /// A landing found piece `piece` of the copy (numbered as the compare
@@ -5785,7 +5844,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            cardlist::carded(&shadow);
         }
         entry.shadow = Some(shadow);
     }
@@ -5995,7 +6054,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        cardlist::carded(&shadow);
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
