@@ -658,7 +658,7 @@ Each says one line with the frame log's reading (every five seconds), per frame 
 | P4 lazy page placement | `lot4 probe P4:` | simulated beside the real table: each physical page gets its place at its first mapping (its address; a page whose address another took first goes elsewhere, and keeps its place when mapped again). For the live windows over view memory and the title buffers of the constants heap's size (64 MB, `VICTORY_INPLACE_CONSTANTS_MIN_MB`) and more: bytes one run today / scattered / with holes, and of the bytes not one run today those the simulated places make one run; the three largest buffers listed. Behaviour unchanged | **under half of the bytes not one run today: idea 4 is dead** (the constants heap alone becoming one run keeps a narrow one alive) |
 | P5 alias census | `lot4 probe P5:` (two lines) | physical pages mapped now by how many addresses show them (1, 2, 3, 4+), over all and over the blocks under live copies, with the bytes shown at more than one address; sections of physical pages; the title's reservations (`XMemVirtualAlloc` at an address of its choice) by page size, write-combining and uncached, since the start | context |
 | P6 lazy write-back | `lot4 probe P6:` | one frame in 64 (half way between P8's samples, on the same frame count, never while P8 records), each block a landing writes into title memory (buffers' write-back, texture copy-back) is made no-access right after the write and kept so through the next frame; faults open it again and are counted (read or write, by the title's code or the runtime's image); the runtime's own kernel reads and writes (`copy_mapped`, `read_into`, `write_mapped`, `watch::writing`) open their range first and are counted apart; handler µs a fault, and an estimate with a 64 KiB fetch each. Only committed read-write private memory at console addresses that no view shows is sampled. `VICTORY_LOT4_PROBE_FAULTS=0` leaves P6 out | context (over ~300 blocks read a sampled frame: lazy read-back is dead) |
-| P7 locks | `lot4 probe P7:` | per lock, per frame: taken, taken after a wait, ms waited, % taken on the other CCD than the lock's last taker, tries that found it held: `made` alone / shared (the pass's threads) / its pieces (`VICTORY_PARALLEL_MIRROR`), the table of views (read, written), `BUFFERS`, `placed`, `kept`, the heap's buffer slots, `changed`, `textures`, `next` (dynamic slots), the guards, the made views' cache; the CCDs found and the placement's state | every lock under 10^4 a frame or under 20 % cross-CCD: lock bouncing is not a cost |
+| P7 locks | `lot4 probe P7:` | per lock, per frame: taken, taken after a wait, ms waited, % taken on the other CCD than the lock's last taker, tries that found it held: `made` alone / shared (the pass's threads) / its pieces (`VICTORY_PARALLEL_MIRROR`), the table of views (read, written), `BUFFERS`, `placed`, `kept`, the heap's buffer slots, `changed`, `textures`, `next` (dynamic slots), the guards, the made views' cache; the CCDs found and the placement's state. Since `fx-main-locks` also `BUFFERS` read on stripes and written (changes no longer count in `BUFFERS`), the windows (`LOOSE`: alone, on stripes, written), `made` handed over between a chunk's slots, and who reads the tables of copies (section "Lock contention" below) | every lock under 10^4 a frame or under 20 % cross-CCD: lock bouncing is not a cost |
 
 How P7 counts: a lock is tried first and only one held elsewhere is timed, so an acquisition that does not wait reads no clock. The last taker's CCD is one word per kind of lock (all heaps' `made` share one), written only when it changes.
 
@@ -673,6 +673,96 @@ A thread the title pinned to processors of the other CCD only keeps its pinning 
 ### What to grep in the probe run
 
 `lot4 probe P` (seven kinds of line), `lot 4 probes on` at the start, `threads placed by CCD` with the switch. Read them in this order: P1 and P2 together (does the mirror pay?), P3 (idea 3), P4 (idea 4), P7 and the `=alt` phases (CCD placement), P5 and P6 for context.
+
+## Lock contention: `VICTORY_BUFFERS_STRIPES` and `VICTORY_MADE_TURNS` (roadmap A1 and A2, 2026-11-27, `fx-main-locks`; opt-in, not measured in the game yet)
+
+P7 (`VICTORY_LOT4_PROBE=1`, prologue, RTX 4080 + Ryzen 9 9900X, per frame summed over threads): `made` 7,758 taken, 982 after a wait, 165 ms waited; `BUFFERS` 289,420 taken, 72,824 after a wait, 72.3 ms waited; `kept` 136,402 / 10,841 / 8.9 ms. Only 5-16 % of the takes cross CCDs: the cost is the contention. Both switches are off by default, take `1` or `alt` (twenty seconds as before, twenty with the switch, from the first asking; each change logged as `... (<NAME>=alt): ON` / `: off, as usual`, which `xcl-notes\alt-fps.sh` reads), and change no result, only who waits for whom.
+
+### Who takes `BUFFERS`, and why
+
+`BUFFERS` (`crate::shadow`) is the table of title buffers by (start, resource), each with its host copy once made. Every lookup of a host copy takes it (`shadow::find`, `find_any`): the walk to the innermost buffer holding the asked range (a `BTreeMap` range, back over at most 64 entries), the copy made on first use, a reference count taken. A lookup the table does not answer (memory outside buffer objects) then takes `LOOSE`, the table of windows, which P7 did not count before. The table changes only when the title makes or releases a buffer (`register` / `unregister`, from `resource.rs`), with `VICTORY_COPY_AHEAD` and, for copies in place, `in_place_let_go`.
+
+The takes of the probe run, by caller (from the same run's lines):
+- **The pass over buffer views** (`victory-heap-pass`, beside the submission): ~58,000 a frame (`57683 host copies looked up` on its parts line), through `descriptor::host::Lookups` (`make_slot`, `shown_copy`, `buffer_copy_with`), each under `made` in the pass's chunks of 64: the lookups are the largest part of the pass's held time (`host copies looked up 14.8` ms of the chunk's parts).
+- **The title's recording threads**, the rest, ~230,000 a frame over ~41,000 list calls: the draws' and dispatches' root views (`draw.rs` `root_view`, `root_uav`, `root_srv_table`, and `host_word`'s view bias, which looks the same address up again), vertex and index buffers (`prepare_for`, `find_any`), indirect arguments and counts (`execute_indirect`), shader pointers' pages (`memory.rs` `map`) and the builder's inputs (`bvh_input`, `bvh_copy`).
+- **The heap sync** takes none: it makes no buffer view (a view not for a draw is left to the draw that reads it).
+
+What a lookup holds the lock for: the walk and an `Arc` clone, about 0.1-0.2 us on 6,000 buffers (the bench below, one thread). It waited about 1 us each time it waited (72.3 ms / 72,824): many short holds on one line, from a dozen threads on both CCDs. What it writes: nothing of the table, except the copy made on first use; the reference count it takes is on the copy, not the table.
+
+### `VICTORY_BUFFERS_STRIPES=1|alt` (A1): the tables of host copies read on striped locks
+
+`crate::stripes::Striped`: a table behind a whole lock and 32 read locks (stripes), each on two cache lines of its own.
+- A lookup with the switch on reads the table on its thread's stripe (`crate::perthread::slot() % 32`, the block the per-thread counters already give each thread): readers on different stripes touch no line in common, and none waits for another.
+- With the switch off (unset, or the off phases of `alt`) a lookup takes the whole lock alone, as the one mutex was taken.
+- A change of the table takes the whole lock, then (whenever the switch is set at all) the 32 stripes' write locks in order: it waits for the readers of each stripe, and none comes in until it is done. With the switch unset no reader takes a stripe and changes take the whole lock only, as before.
+- The copy made on first use is no longer made with the table held alone: the entry's copy is a `OnceLock`, set under a lock of its own (`MAKING`, one making at a time, as before) with the table read. On a stripe, a first use holds up only the other first uses and the writers, not the other lookups (alone, it holds up every lookup alone, as before). `VICTORY_INPLACE_CONSTANTS`' look at the other buffers' copies (`constants_fresh`) is made under `MAKING` too, so it sees no copy made meanwhile, and no buffer comes or goes while the table is read.
+- `LOOSE` (the windows) goes the same way: found with the table read; a window to make is made with it written, the window chosen again (on a stripe another thread may have made it meanwhile; alone, the whole lock is kept, as before). `let_go_idle` writes it, so no window is handed out between its look at a window's reference count and the removal.
+- Same tables, same walks, same answers; only the locks differ. Lock order: whole, then stripes in rising order; a reader holds one of them and never takes another of the same table.
+- The `alt` helper (`crate::alt`, every `=alt` switch) now looks at the phase it last said before it swaps it: asked on every lookup, the swap wrote one shared line from every thread each time, the very sharing this takes away. Same lines said.
+
+Grep: `(VICTORY_BUFFERS_STRIPES=1)` at the start (`the tables of host copies are read on striped locks`), or the `=alt` lines `the tables of host copies are read on striped locks from now (VICTORY_BUFFERS_STRIPES=alt): ON` / `: off, as usual`.
+
+P7 (`lot4 probe P7:`) now counts:
+- `BUFFERS` (held alone: the lookups with the switch off and the rare walks over the whole table), `BUFFERS (read, striped)`, `BUFFERS (written)` (changes; before this branch they counted in `BUFFERS`);
+- `windows (LOOSE)`, `windows (LOOSE, read, striped)`, `windows (LOOSE, written)` (not counted before);
+- `BUFFERS read by the title's threads N, the heap sync N, the pass over buffer views N, the submitting thread N, other threads of ours N` and the same for `windows`, whatever the lock taken (by thread name: `victory-heap-sync*`/`victory-mirror-*`, `victory-heap-pass*`, `victory-submit*`, other `victory*`, the rest the title's).
+
+What must move in a probe run with the switch on: `BUFFERS (read, striped)` with ~0 after a wait in place of `BUFFERS`' 72 ms, `BUFFERS (written)` small (its count is the title's buffer makings and releases), and the pass's `host copies looked up` and held time on its parts line; then the recording threads' share of the frame.
+
+### `VICTORY_MADE_TURNS=1|alt` (A2): `made` handed to a waiting thread between a chunk's slots
+
+The heap sync makes the slots it finds written in chunks of 64 (`mirror_due`, some 25-45 us held) and the pass over buffer views in chunks of 64 (some 35 us held: 43 ms over 1,245 chunks a pass in the probe run); between two chunks each lets `made` go and takes it again at once. The title's recording threads take `made` for one slot at a time (each view the title makes or descriptor it copies, `HostHeap::mirror`). The standard lock lets nobody in line first: a thread that waits sleeps, and the chunk maker, still running, takes the lock back before the sleeper wakes. So a waiter can wait through several chunks: P7's 982 waits a frame averaged 168 us, and the pass's own waits 188 us (33.2 ms over 177 waits a pass), four to five chunks' worth.
+
+With the switch on:
+- a thread that takes `made` for one slot or a few (`HostHeap::made_alone`: `mirror`, the texture slot looks and remakes, the diagnostics' looks) and finds it held says so (a per-heap count, on lines of its own) and spins for up to 30 us before it sleeps;
+- a chunk maker (the sync's `mirror_due` and lean chunks, the pass's chunks made alone) looks at that count before each slot. When someone waits, its chunk ends there (its keeps and marks made, as at a chunk's end), it lets `made` go, waits up to 100 us for a waiting thread to have taken it, spins for it back, then sleeps for it.
+- The chunk makers do not say when they wait for each other: the sync and the pass would otherwise hand `made` to each other slot by slot.
+
+What each slot's making does is the same; the chunks are cut where a waiting thread comes in, as if they were smaller there. Not applied to the pass's threads holding `made` together (`VICTORY_HEAP_PASS_THREADS`), to `VICTORY_PARALLEL_MIRROR`'s rounds, or to `make_room`.
+
+Grep: `(VICTORY_MADE_TURNS=1)` at the start (`the heap's slot state goes to a thread waiting for it between a chunk's slots`), or the `=alt` lines. P7: `made (alone)`'s waits (now also the one-slot takers' spins) and `made handed to a waiting thread between a chunk's slots N taken (N after a wait, X ms waited ...)`: N turns a frame and the ms the chunk makers spent letting the waiters in. What must move: `made (alone)`'s ms waited (165 a frame) and its waits' average, then the recording threads' time; watch the heap sync's own ms (`heap sync by place in the burst`) and the join (`ms waited` there) for the cost.
+
+### Tests and micro-benchmarks
+
+Unit tests (`cargo test -p victory-gpu --lib stripes turns`, on the host device):
+- `stripes::tests`: `writers_exclude_striped_readers` (a write waits for a reader on a stripe; readers alone and on stripes read together; an upgrade from alone keeps the whole lock), `same_lookups_alone_and_striped` (the lookup's walk over random tables, 40,000 asks: the same key both ways), `twelve_threads_mixed_modes` (10 readers on stripes and alone, 2 writers by `write` and by `upgrade`: no write ever seen half done, the final table the writes').
+- `shadow::stripes_tests` (equivalence and stress on the real tables): `lookups_on_stripes_give_what_they_give_alone` (nested, side by side and overlapping buffers and windows: the same copy alone and on stripes, whichever way made it first; copies made ahead made once; a released buffer's range then takes a window), `a_copy_asked_for_by_twelve_threads_at_once_is_made_once` (12 threads, 16 buffers without a copy yet, a barrier: one copy each, every thread gets it), `twelve_threads_look_up_change_and_walk_together` (8 lookup threads changing ways every 512 asks must always get the copies found at the start, 2 threads register, look up and release their own buffers, 1 walks both tables whole, 1 writes both; 1.5 s, a deadlock fails the test after 30 s).
+- `descriptor::host::fast_tests` (A2): `turns_leave_every_slot_as_without_them` (three frames of records copied in as bytes, the sync's chunks and the pass's, with four threads taking `made` all along: every slot's record, held resource, notes and the pass's copies and ranges are the same as without the turns, and `made` was handed over), `twelve_threads_take_turns_on_one_heap` (the sync's chunks on one thread, the pass's on one, ten one-slot makers, 12 rounds each over slots of its own, turns on: no deadlock, and every slot ends as the same rounds made one after the other on one thread leave it).
+- `lot4::locks::tests::readers_by_thread_name`.
+
+Micro-benchmarks (Ryzen 9 9900X, `--profile diag`, two other agents building beside, so the absolute numbers are a little noisy; 12 threads span both CCDs):
+
+`cargo test -p victory-gpu --profile diag --lib stripes::tests::bench_lookups -- --ignored --nocapture`: a table of 6,000 buffers of the title buffers' shape, each thread 400,000 lookups (the walk to the innermost buffer and a reference count), one write in 1,000 (two runs each, ns a lookup per thread, wall; in brackets the part spent taking the lock):
+
+| threads | one mutex (before) | on stripes | |
+|---|---|---|---|
+| 1 | 124 (27) | 124 (27) | 1.0x |
+| 4 | 857-866 (664-672) | 136-140 (29-31) | 6.2x |
+| 8 | 3,228-3,232 (2,838-2,844) | 261-265 (94-96) | 12.3x |
+| 12 | 5,286-5,289 (4,845-4,853) | 426-429 (225-226) | 12.4x |
+
+The 12-thread stripes figure is mostly the writes: one in 1,000 lookups here is some 28,000 writes a second, each taking the 33 locks; the title's buffer makings and releases are far rarer (P7's `BUFFERS (written)` will say).
+
+`cargo test -p victory-gpu --profile diag --lib descriptor::host::fast_tests::bench_turns -- --ignored --nocapture`: one thread makes 8,192 slots in the sync's chunks over and over (records rewritten each round), eleven threads each make one slot of their own every 50 us through `HostHeap::mirror` (the title's views and copies); 2 s each, two runs each way:
+
+| | the one-slot makers' time in `mirror` | the sync |
+|---|---|---|
+| turns off | 26,497-27,641 calls; mean 747-781 us, median 2.5-2.6, p99 3,439-3,500, max 6,016-7,854 | 2.55-2.56 M slots/s |
+| turns on | 422,228-423,955 calls; mean 1.7-1.9 us, median 1.5-1.6, p99 5.3-6.5, max 226-242 | 1.69-1.74 M slots/s |
+
+Off, the one-slot makers wait through whole runs of the sync's chunks (the starvation the probe run shows, worse here because this sync never pauses); on, they wait about one slot. The sync pays about 1.5 us a turn (0.19 us more a slot, 0.33 s a second over some 211,000 one-slot calls a second, each at most one turn; the eleven makers at one call every 4.7 us are some four times the title's rate of takes of `made`, and most of the title's takes find it free and need no turn): at P7's ~1,000 waits a frame, about 1.5 ms a frame of the sync's and the pass's time.
+
+### Risks
+
+- **A1, the writes cost more.** With the switch set, a change of a table takes 33 locks (whole and 32 stripes) and waits for the readers of each stripe; `let_go_idle` writes `LOOSE` before every submission. Fine at the title's rate of buffer makings and releases if it is what it seems (P7's `BUFFERS (written)` and `windows (LOOSE, written)` will show it); a title that made and released thousands of buffers a frame would pay a few us each.
+- **A1, a first use still holds a stripe.** A copy made on first use is made with the reader's stripe held (and `MAKING`): a writer that waits for that stripe holds the whole lock and the lower stripes meanwhile, so the readers on those stripes and every reader alone wait for the making, as every lookup waited for it before. Making the copy with no lock of the table held would mean throwing away a copy made twice, and its in-place and card bookkeeping; not done.
+- **A1, no lookup inside a lookup.** A thread that held a stripe and asked the same table again would deadlock behind a waiting writer (the standard read-write lock lets a waiting writer go first). Nothing does today (the one mutex would have deadlocked at once); new code must not look a copy up while it holds a table.
+- **A1, what stays shared.** The reference count of a popular copy (the constants heap's) is still one line every lookup of it writes, and a window's `used`/`asked` notes too; those are not lock waits but they remain.
+- **A2, the chunk makers pay for the turns.** About 1.5 us a turn in the bench, up to 100 us when a waiting thread is slow to take `made` (it slept); the heap sync's join can grow by what the sync loses. Watch the sync's own ms (`heap sync by place in the burst`) and the join with the `=alt` run.
+- **A2, the waiters spin.** A one-slot taker spins up to 30 us before it sleeps (a recording thread's core is busy meanwhile); when the holder makes no turns (`VICTORY_PARALLEL_MIRROR`'s rounds, the pass's threads holding `made` together, `make_room`) that is 30 us of spinning for nothing before the usual sleep.
+- **A2, only one-slot takers are let in.** The sync and the pass do not hand `made` to each other (they would take turns slot by slot); their waits for each other are as before (the pass waited 33 ms a frame in the probe run).
+- **A2 with `VICTORY_MIRROR_TRY=2`.** With it the title's copies and views do not wait for `made` at all (left to the next sync when it is held), so the turns help only the other one-slot takers; the turns are the way without `MIRROR_TRY`'s risk (records the title rewrote before the sync).
+- **Neither is measured in the game yet.** Both change only who waits for whom; the micro-benchmarks show the mechanism, not the frame. The probe run with each `=alt` decides.
 
 ## `VICTORY_COMPOSITE_GRADE_EDGE=1` (off by default; port of Cuebert 818c5a9)
 
