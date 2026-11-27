@@ -306,6 +306,25 @@ fn jump_window(remembered: Option<(u64, u32, u32, u32)>, (copy, kind, stride): (
 #[cfg(feature = "diagnostics")]
 pub(crate) static WINDOW_WHY: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
 
+/// Of the draws that miss their window ([`WINDOW_WHY`] 6 to 8), one in how
+/// many gets a line of its own: one in 65,536; `VICTORY_WINDOW_MISS_LOG=1`,
+/// one in 256 as before. At one in 256 the world said 28 such lines a
+/// second, which cost the recording threads some 27 ms a frame, half of it
+/// waiting for the log's lock (profile PF3); the counts stay on the line of
+/// [`window_line`].
+#[cfg(feature = "diagnostics")]
+fn window_miss_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        if std::env::var_os("VICTORY_WINDOW_MISS_LOG").is_some_and(|v| v == "1") {
+            tracing::info!("draws that miss their window are said one in 256 (VICTORY_WINDOW_MISS_LOG=1)");
+            256
+        } else {
+            65_536
+        }
+    })
+}
+
 /// The line of [`WINDOW_WHY`], per frame over `frames` frames.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_line(frames: f64) {
@@ -3446,15 +3465,17 @@ impl State {
                 if why_not < WINDOW_WHY.len() {
                     WINDOW_WHY[why_not].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     WINDOW_WHY[9].fetch_add(u64::from(records), std::sync::atomic::Ordering::Relaxed);
-                    // One in 256 of the draws that miss their window, said:
-                    // where the record lies against the window and against
-                    // the record drawn before it.
+                    // One in 65,536 of the draws that miss their window
+                    // (`window_miss_every`), said: where the record lies
+                    // against the window and against the record drawn
+                    // before it.
                     if (6..=8).contains(&why_not) {
                         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 256 == 0 {
+                        let every = window_miss_every();
+                        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(every) {
                             let (last_copy, last_offset) = self.last_indirect;
                             tracing::info!(
-                                "a window miss (one in 256): cause {why_not}, kind {kind}, stride {stride}, buffer {} offset {offset:#x} ({} left); the command before it on the list: buffer {last_copy} offset \
+                                "a window miss (one in {every}): cause {why_not}, kind {kind}, stride {stride}, buffer {} offset {offset:#x} ({} left); the command before it on the list: buffer {last_copy} offset \
                                  {last_offset:#x} (this one is {} bytes on); the window it missed: {}; clamped now: {records} records at step {step}",
                                 args.id(),
                                 args.left(arguments),
