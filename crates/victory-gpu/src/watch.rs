@@ -155,11 +155,16 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
-pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+pub(crate) fn ask_ahead(ranges: impl Iterator<Item = (usize, usize)>) {
+    // The submission's one asking stands ([`ask_once`]): what it does not
+    // hold is left to `writes`, and no plan is made (nor any range Vec
+    // built: the ranges are not consumed). After ScarlettPort 23870346.
+    if JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).kept {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
-        .iter()
         .filter(|r| r.0 < r.1)
-        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .map(|(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
         return;
@@ -167,8 +172,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     pieces.sort_unstable();
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
+    // Asked for while the first look was being made.
     if j.kept {
         return;
     }
@@ -280,7 +284,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)], mut view: impl FnMut(usize)) {
         look_at_holes(HOLES_A_LOOK);
     }
     ask_once_end();
-    ask_ahead(ranges);
+    ask_ahead(ranges.iter().copied());
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if j.ahead.is_empty() {
@@ -3401,6 +3405,25 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// The submission's one asking stands: a further asking ahead makes no
+    /// plan and consumes no range (ScarlettPort 23870346).
+    #[test]
+    fn a_kept_asking_consumes_no_other_range_plan() {
+        let _one = one_at_a_time();
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        forget_written(p, p + 4 * PAGE);
+        ask_once(&[(p, p + 2 * PAGE), (p + 2 * PAGE, p + 4 * PAGE)], |_| {});
+        assert!(JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).kept);
+        ask_ahead(std::iter::from_fn(|| panic!("a kept asking must not consume another range plan")));
+        ask_once_end();
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     /// A guard made between a view's mapping and the runtime's word about it
