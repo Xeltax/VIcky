@@ -8,10 +8,10 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{
@@ -385,7 +385,19 @@ fn pages_per_section(mb: Option<&str>) -> usize {
         .map_or(0, |mb| mb.saturating_mul(MIB / PAGE))
 }
 
-struct Section(HANDLE);
+struct Section {
+    handle: HANDLE,
+    /// A section of placement ([`place_on`]): the title address its first
+    /// byte stands for (its window's first address). `None`: an
+    /// allocation's own section.
+    window: Option<usize>,
+    /// Whether the GPU side is told when it closes: sections that come and
+    /// go with the title's allocations (`VICTORY_SECTION_MB`), and with the
+    /// placement on (an allocation's section closes as soon as all its
+    /// pages are placed elsewhere; a section of placement when no page or
+    /// view is left in it).
+    told: bool,
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -399,12 +411,304 @@ impl Drop for Section {
         // with small sections is common: the GPU side lets its own view of
         // this one go first. One section per allocation leaves it as it
         // was.
-        if section_pages() > 0 {
-            victory_gpu::title_memory_section_closed(self.0 as usize);
+        if self.told {
+            victory_gpu::title_memory_section_closed(self.handle as usize);
         }
         // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        unsafe { CloseHandle(self.handle) };
     }
+}
+
+// VIcky: physical pages placed at their first mapping (`VICTORY_PAGE_PLACE`,
+// roadmap B2; lot 4's probe P4 simulated it, `victory_gpu::inplace::lot4`).
+
+/// `VICTORY_PAGE_PLACE=1` (off by default): each physical page gets its
+/// place in a section when the title maps it for the first time, at the
+/// offset its address names, instead of the place its allocation gave it.
+///
+/// Why: a page's place is fixed today when the title allocates it
+/// ([`make_pages`]), and the title maps its pages in an order of its own,
+/// so a buffer it maps at consecutive addresses shows pages from scattered
+/// places. One host heap can only be opened on one run of one section (a
+/// heap over two views side by side is refused, `E_INVALIDARG`, measured on
+/// the software adapter), so `VICTORY_INPLACE_CONSTANTS` turns down the
+/// constants heap as "view memory from several places" (174 MB in 88 runs
+/// in the boat save's probe run with `VICTORY_SECTION_MB=2`). P4 simulated
+/// this placement: 113,446 pages placed at their address and none
+/// elsewhere, and both title buffers of 64 MB or more (238 MB) one run.
+///
+/// How: the title's address space is cut into windows, each a section of
+/// its own made when a page is first placed in it ([`window_of`]): below
+/// 4 GiB one window of 4 GiB, so that everything the title maps there (its
+/// 32-bit graphics memory, where `VICTORY_INPLACE_CONSTANTS` looks for the
+/// constants heap) is one section and a buffer mapped in order one run of
+/// it; above, windows of `VICTORY_SECTION_MB` MiB if set (its loading gain
+/// kept: Windows' large-page worker holds a section's lock while it walks
+/// that section's views), else 4 GiB. A page first mapped at `at` takes the
+/// place `at` of its window's section, and keeps it wherever and however
+/// often it is mapped afterwards (a second address is an alias of that
+/// place, as before of its allocation's).
+///
+/// - A place is one page's: if another page has the place first (mapped
+///   there before, still allocated or still shown), the page keeps the
+///   place its allocation gave it, as without the switch (counted).
+/// - A page written before its first mapping (a DirectStorage destination
+///   not mapped yet) keeps its allocation's place too, with its bytes
+///   (counted).
+/// - A freed page's place is given back when no view shows it any more; a
+///   page placed there later reads zero at its first mapping (zeroed then,
+///   as a page of a new section reads).
+///
+/// What it costs: off, a look at whether any page waits for its place, in
+/// the mapping and freeing calls. On, a few table lookups per page at its
+/// first mapping, a section made per window used (some thousands of 2 MiB
+/// ones with `VICTORY_SECTION_MB=2`, each a `CreateFileMapping` of a
+/// reserved section: no memory until mapped and committed, as now), and a
+/// zeroing of 64 KiB for a place given again. An allocation's own sections
+/// are still made: they hold the pages that are not placed. The GPU side
+/// says the line [`placement_line`] (`victory_gpu::title_memory_placement`)
+/// every ten seconds with the constants heap's state in place.
+fn place_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = place_mode(std::env::var("VICTORY_PAGE_PLACE").ok().as_deref());
+        if on {
+            tracing::info!(
+                high_mb = place_high() / MIB,
+                "physical pages are placed at their first mapping (VICTORY_PAGE_PLACE=1): each takes the place its address names in a \
+                 section of placement (below 4 GiB one of 4096 MB; above, windows of high_mb MB), so pages mapped at consecutive \
+                 addresses are one run of a section"
+            );
+            victory_gpu::title_memory_placement(placement_line);
+        }
+        on
+    })
+}
+
+/// [`place_on`] for a value of `VICTORY_PAGE_PLACE`: only `1` is on.
+fn place_mode(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+/// Title addresses below this are its 32-bit memory: one window.
+const LOW_WINDOW: usize = 1 << 32;
+
+/// The bytes of a window of placement above 4 GiB: `VICTORY_SECTION_MB`'s
+/// sections if set, else 4 GiB.
+fn place_high() -> usize {
+    match section_pages() {
+        0 => LOW_WINDOW,
+        per => per * PAGE,
+    }
+}
+
+/// The window of placement that holds title address `at`, as (first
+/// address, bytes): below 4 GiB `[0, 4 GiB)`, above it windows of `high`
+/// bytes (a multiple of [`PAGE`]) from 0 on.
+fn window_of(at: usize, high: usize) -> (usize, usize) {
+    if at < LOW_WINDOW {
+        (0, LOW_WINDOW)
+    } else {
+        (at / high * high, high)
+    }
+}
+
+/// The placement's state, in the page table ([`Physical`]).
+#[derive(Default)]
+struct Place {
+    /// Pages that may still be placed (allocated with the switch on, never
+    /// mapped nor written yet), with the bytes of their windows above
+    /// 4 GiB ([`place_high`]; tests give smaller ones).
+    unplaced: HashMap<usize, usize>,
+    /// Sections of placement by window (first address, bytes).
+    windows: HashMap<(usize, usize), Window>,
+    /// Places taken, by address: the page that has it, or `None` once that
+    /// page is freed while a view still shows it (the place is given back
+    /// when the last such view goes).
+    taken: BTreeMap<usize, Option<usize>>,
+    /// Places given again whose page has not been mapped since: zeroed at
+    /// its first mapping, whichever view it is.
+    zero: HashSet<usize>,
+}
+
+/// A window's section, held weakly (it goes when no page or view holds
+/// it), and the places of it ever given (a bit each).
+struct Window {
+    section: Weak<Section>,
+    given: Vec<u64>,
+}
+
+/// The placement's counts since the start ([`placement_line`]): pages placed
+/// at their address; pages kept at their allocation's place because their
+/// address's place was taken first, because they were written before their
+/// first mapping, because no section of placement could be made; places
+/// given back, given again (zeroed); sections of placement made, their
+/// bytes.
+static PLACED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// The pages of `pages` mapped at `base` for the first time take the
+/// places their addresses name ([`place_on`]). Before the call's views are
+/// mapped, after what was there was unmapped (a place given back by that
+/// can be taken again here).
+fn place_first(physical: &mut Physical, base: usize, pages: &[usize]) {
+    for (i, page) in pages.iter().enumerate() {
+        let Some(high) = physical.place.unplaced.remove(page) else {
+            continue;
+        };
+        let at = base + i * PAGE;
+        if physical.place.taken.contains_key(&at) {
+            PLACED[1].fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let (first, bytes) = window_of(at, high);
+        let index = (at - first) / PAGE;
+        let Some((section, again)) = window_section(&mut physical.place, first, bytes, index)
+        else {
+            PLACED[3].fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        if again {
+            physical.place.zero.insert(at);
+            PLACED[5].fetch_add(1, Ordering::Relaxed);
+        }
+        physical.place.taken.insert(at, Some(*page));
+        // The allocation's place goes: never mapped nor written, it holds
+        // nothing (its section closes once all its pages have gone).
+        physical.pages.insert(*page, Slice { section, index });
+        PLACED[0].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The section of the window `[first, first + bytes)`, made if it has none
+/// (or its last went), and whether its place `index` was given before
+/// (now marked given). `None` if the host refuses the section.
+fn window_section(
+    place: &mut Place,
+    first: usize,
+    bytes: usize,
+    index: usize,
+) -> Option<(Arc<Section>, bool)> {
+    let key = (first, bytes);
+    let section = match place.windows.get(&key).and_then(|w| w.section.upgrade()) {
+        Some(section) => section,
+        None => {
+            // As an allocation's ([`make_pages`]): reserved, its pages
+            // committed when mapped.
+            // SAFETY: plain section creation.
+            let handle = unsafe {
+                CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+                    (bytes as u64 >> 32) as u32,
+                    bytes as u32,
+                    std::ptr::null(),
+                )
+            };
+            if handle.is_null() {
+                if PLACED[3].load(Ordering::Relaxed) < 8 {
+                    tracing::warn!(
+                        first = format_args!("{first:#x}"),
+                        mb = bytes / MIB,
+                        error = %std::io::Error::last_os_error(),
+                        "no section of placement: the page keeps its allocation's place (VICTORY_PAGE_PLACE)"
+                    );
+                }
+                return None;
+            }
+            PLACED[6].fetch_add(1, Ordering::Relaxed);
+            PLACED[7].fetch_add(bytes as u64, Ordering::Relaxed);
+            MADE[0].fetch_add(1, Ordering::Relaxed);
+            MADE[1].fetch_add(bytes as u64, Ordering::Relaxed);
+            victory_gpu::title_memory_section(handle as usize, bytes as u64, on_wine());
+            let section = Arc::new(Section {
+                handle,
+                window: Some(first),
+                told: true,
+            });
+            // A new section's pages read zero: no place of it given yet.
+            let given = vec![0; (bytes / PAGE).div_ceil(64)];
+            place.windows.insert(
+                key,
+                Window {
+                    section: Arc::downgrade(&section),
+                    given,
+                },
+            );
+            section
+        }
+    };
+    let given = &mut place.windows.get_mut(&key)?.given;
+    let bit = 1u64 << (index % 64);
+    let again = given[index / 64] & bit != 0;
+    given[index / 64] |= bit;
+    Some((section, again))
+}
+
+/// A placed page's place `at` lost a holder: the page was freed (`freed`),
+/// or the last view that showed it went. Given back when both are so.
+fn place_released(place: &mut Place, at: usize, freed: bool, shown: bool) {
+    match place.taken.get_mut(&at) {
+        Some(owner) if freed && shown => *owner = None,
+        Some(owner) if (freed || owner.is_none()) && !shown => {
+            place.taken.remove(&at);
+            place.zero.remove(&at);
+            PLACED[4].fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+/// The placement's line: what is placed now (bytes, in how many runs of
+/// consecutive addresses, the largest), and the counts since the start.
+/// The GPU side says it with the constants heap's state in place, from its
+/// submitting thread: `None` (said next time) while a mapping call holds
+/// the page table, which that thread does not wait for.
+fn placement_line() -> Option<String> {
+    let (mut live, mut freed, mut runs) = (0u64, 0u64, 0u64);
+    let (mut largest, mut run, mut next) = ((0usize, 0usize), (0usize, 0usize), usize::MAX);
+    {
+        let physical = match PHYSICAL.try_lock() {
+            Ok(held) => held,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        for (&at, owner) in &physical.place.taken {
+            if owner.is_none() {
+                freed += 1;
+                continue;
+            }
+            live += 1;
+            if at != next {
+                runs += 1;
+                run = (at, 0);
+            }
+            run.1 += PAGE;
+            largest = largest.max((run.1, run.0));
+            next = at + PAGE;
+        }
+    }
+    let count = |i: usize| PLACED[i].load(Ordering::Relaxed);
+    Some(format!(
+        "physical pages placed at their first mapping (VICTORY_PAGE_PLACE=1): {} MB placed now in {runs} runs of consecutive \
+         addresses (the largest {} MB at {:#x}), {freed} places of freed pages still shown; since the start {} pages placed at \
+         their address, {} kept at their allocation's place ({} their place taken first, {} written before their first mapping, \
+         {} no section of placement), {} places given back, {} given again (zeroed); {} sections of placement made, {} MB \
+         (below 4 GiB one of 4096 MB, above windows of {} MB)",
+        (live * PAGE as u64) >> 20,
+        largest.0 >> 20,
+        largest.1,
+        count(0),
+        count(1) + count(2) + count(3),
+        count(1),
+        count(2),
+        count(3),
+        count(4),
+        count(5),
+        count(6),
+        count(7) >> 20,
+        place_high() / MIB,
+    ))
 }
 
 /// What the title's mapping calls cost, since the start (for
@@ -532,6 +836,14 @@ impl Slice {
     fn key(&self, k: usize) -> (usize, usize) {
         (Arc::as_ptr(&self.section) as usize, self.index + k)
     }
+
+    /// The place ([`place_on`]) of the page `k` pages after this one: the
+    /// title address it stands for, if it is a section of placement's.
+    fn place(&self, k: usize) -> Option<usize> {
+        self.section
+            .window
+            .map(|first| first + (self.index + k) * PAGE)
+    }
 }
 
 #[derive(Default)]
@@ -546,6 +858,8 @@ struct Physical {
     /// card reads them and has them filled afterwards by DirectStorage,
     /// which writes through views of our own.
     shown: HashMap<(usize, usize), Vec<usize>>,
+    /// Pages placed at their first mapping ([`place_on`]).
+    place: Place,
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -574,7 +888,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     if n.checked_mul(PAGE).is_none_or(|size| size == 0) {
         return 0;
     }
-    let numbers = match make_pages(n, section_pages()) {
+    let numbers = match make_pages(n, section_pages(), place_on().then(place_high)) {
         Ok(numbers) => numbers,
         Err(error) => {
             tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
@@ -602,8 +916,11 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 /// Makes `n` pages (`n` > 0, `n * PAGE` in range) in sections of `per`
 /// pages at most (0: all in one), and enters them in the page table: their
 /// numbers, in order, as one allocation's. The host's error, with nothing
-/// made, if it refuses a section.
-fn make_pages(n: usize, per: usize) -> std::io::Result<Vec<usize>> {
+/// made, if it refuses a section. With `place` (the bytes of a window of
+/// placement above 4 GiB, [`place_on`]) the pages take their places at
+/// their first mapping; the sections made here hold them until then, and
+/// for good those that are not placed.
+fn make_pages(n: usize, per: usize, place: Option<usize>) -> std::io::Result<Vec<usize>> {
     let per = if per == 0 { n } else { per };
     let mut sections: Vec<(Arc<Section>, usize)> = Vec::with_capacity(n.div_ceil(per));
     let mut made = 0;
@@ -633,7 +950,14 @@ fn make_pages(n: usize, per: usize) -> std::io::Result<Vec<usize>> {
             // `sections` goes).
             return Err(std::io::Error::last_os_error());
         }
-        sections.push((Arc::new(Section(handle)), here));
+        sections.push((
+            Arc::new(Section {
+                handle,
+                window: None,
+                told: section_pages() > 0 || place.is_some(),
+            }),
+            here,
+        ));
         made += here;
     }
     for (section, here) in &sections {
@@ -641,7 +965,7 @@ fn make_pages(n: usize, per: usize) -> std::io::Result<Vec<usize>> {
         MADE[1].fetch_add((here * PAGE) as u64, Ordering::Relaxed);
         // For the GPU side's in-place census: only a committed section can
         // be opened as a host heap.
-        victory_gpu::title_memory_section(section.0 as usize, (here * PAGE) as u64, on_wine());
+        victory_gpu::title_memory_section(section.handle as usize, (here * PAGE) as u64, on_wine());
     }
     let mut physical = physical();
     let first = physical.next_page;
@@ -655,6 +979,9 @@ fn make_pages(n: usize, per: usize) -> std::io::Result<Vec<usize>> {
                 index,
             };
             physical.pages.insert(number, slice);
+            if let Some(high) = place {
+                physical.place.unplaced.insert(number, high);
+            }
             numbers.push(number);
         }
     }
@@ -674,7 +1001,20 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let mut physical = physical();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        let page = unsafe { *pages.add(i) };
+        let Some(slice) = physical.pages.remove(&page) else {
+            continue;
+        };
+        // The placement's (`place_on`; nothing to do without it): a page
+        // never mapped is placed no more; a placed page's place is given
+        // back, now or when the last view that shows it goes.
+        if !physical.place.unplaced.is_empty() {
+            physical.place.unplaced.remove(&page);
+        }
+        if let Some(at) = slice.place(0) {
+            let shown = physical.shown.contains_key(&slice.key(0));
+            place_released(&mut physical.place, at, true, shown);
+        }
     }
     1
 }
@@ -694,7 +1034,7 @@ impl View {
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -728,11 +1068,32 @@ impl Drop for View {
 /// each), as runs of consecutive slices of one section: each run's first
 /// slice and its length in pages. One look at the page table, which the
 /// title's own mapping calls share with every DirectStorage worker. `None`
-/// if a page is unknown or `pages` ends early.
-fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)>> {
+/// if a page is unknown or `pages` ends early. `write`: the caller writes
+/// the bytes, so pages not mapped yet keep the places they have
+/// ([`place_on`]: their bytes are there).
+fn runs(pages: &[usize], offset: usize, len: usize, write: bool) -> Option<Vec<(Slice, usize)>> {
     let end = offset.checked_add(len)?;
     let pages = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
-    let physical = physical();
+    let mut physical = physical();
+    if write && !physical.place.unplaced.is_empty() {
+        for page in pages {
+            if physical.place.unplaced.remove(page).is_some() {
+                PLACED[2].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    // A place given again whose first mapping failed is zeroed before it
+    // is written, not after (by `map`), which would wipe the bytes.
+    if write && !physical.place.zero.is_empty() {
+        for page in pages {
+            let Some(slice) = physical.pages.get(page).cloned() else {
+                continue;
+            };
+            if slice.place(0).is_some_and(|at| physical.place.zero.remove(&at)) {
+                View::map(&slice, 1)?.bytes().fill(0);
+            }
+        }
+    }
     let mut runs: Vec<(Slice, usize)> = Vec::new();
     for page in pages {
         let slice = physical.pages.get(page)?;
@@ -752,7 +1113,7 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
 /// Whether every page under `[offset, offset + len)` is known (a write that
 /// fails with them known is a host failure).
 pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
-    runs(pages, offset, len).is_some()
+    runs(pages, offset, len, false).is_some()
 }
 
 /// Copies `data` into physical pages, from `offset` bytes into the first,
@@ -761,7 +1122,7 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
 /// costs a map, a commit and an unmap (which flushes every core's TLB).
 /// False if a page is unknown or the host fails.
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
-    let Some(runs) = runs(pages, offset, data.len()) else {
+    let Some(runs) = runs(pages, offset, data.len(), true) else {
         return false;
     };
     let (mut within, mut done) = (offset % PAGE, 0);
@@ -799,7 +1160,7 @@ impl PageWindow {
 /// unknown, or a host failure), which `write_physical` then handles or
 /// reports.
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
-    let runs = runs(pages, offset, len)?;
+    let runs = runs(pages, offset, len, true)?;
     let [(slice, n)] = runs.as_slice() else {
         if runs.len() > 1 {
             BUFFERED[0].fetch_add(1, Ordering::Relaxed);
@@ -887,6 +1248,11 @@ pub extern "system" fn XMemMapPhysicalPages(
     }
     // SAFETY: the title passes `n` page numbers.
     let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+    // Pages mapped for the first time take their places (`place_on`; none
+    // wait for one without it).
+    if !physical.place.unplaced.is_empty() {
+        place_first(&mut physical, base, pages);
+    }
     let mut i = 0;
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
@@ -990,7 +1356,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -1015,10 +1381,30 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
+    // A place given again ([`place_on`]) reads zero at its page's first
+    // mapping, as a page of a new section does; nothing has seen the view
+    // yet.
+    if !physical.place.zero.is_empty() {
+        for k in 0..len.div_ceil(PAGE) {
+            if slice
+                .place(k)
+                .is_some_and(|at| physical.place.zero.remove(&at))
+            {
+                // SAFETY: a committed read-write page of the view just
+                // mapped.
+                unsafe { ((base + k * PAGE) as *mut u8).write_bytes(0, PAGE) };
+            }
+        }
+    }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view(
+        base,
+        len,
+        slice.section.handle as usize,
+        (slice.index * PAGE) as u64,
+    );
     for k in 0..len.div_ceil(PAGE) {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
     }
@@ -1096,6 +1482,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .into_iter()
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
+    // Places ([`place_on`]) whose last view went here: the place and the
+    // page's key in `shown`.
+    let mut unshown: Vec<(usize, (usize, usize))> = Vec::new();
     for at in hit {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
@@ -1106,6 +1495,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 addresses.retain(|&a| a != at + k * PAGE);
                 if addresses.is_empty() {
                     physical.shown.remove(&key);
+                    if let Some(place) = slice.place(k) {
+                        unshown.push((place, key));
+                    }
                 }
             }
         }
@@ -1126,6 +1518,13 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         if at + size > end {
             let index = slice.index + (end - at) / PAGE;
             map(physical, end, at + size - end, Slice { index, ..slice });
+        }
+    }
+    // A freed page's place is given back when no view shows it any more,
+    // the parts of views mapped again above included.
+    for (place, key) in unshown {
+        if !physical.shown.contains_key(&key) {
+            place_released(&mut physical.place, place, false, false);
         }
     }
 }
@@ -1547,7 +1946,7 @@ mod tests {
     fn runs_group_consecutive_pages_of_one_allocation() {
         let (a, b) = (allocate(3), allocate(1));
         let lengths = |pages: &[usize], offset, len| {
-            runs(pages, offset, len).map(|r| r.iter().map(|&(_, n)| n).collect::<Vec<_>>())
+            runs(pages, offset, len, false).map(|r| r.iter().map(|&(_, n)| n).collect::<Vec<_>>())
         };
         assert_eq!(lengths(&a, 0, 3 * PAGE), Some(vec![3]));
         // Only the pages the bytes reach.
@@ -1673,8 +2072,8 @@ mod tests {
         assert_eq!(pages_per_section(Some("1")), 16);
         assert_eq!(pages_per_section(Some(" 2 ")), 32);
         for per in [0, 7, 9] {
-            let pages = make_pages(7, per).expect("a section");
-            let groups = runs(&pages, 0, 7 * PAGE).expect("known pages");
+            let pages = make_pages(7, per, None).expect("a section");
+            let groups = runs(&pages, 0, 7 * PAGE, false).expect("known pages");
             assert_eq!(groups.len(), 1, "sections of {per} pages");
             assert_eq!((groups[0].0.index, groups[0].1), (0, 7));
             assert_eq!(XMemFreePhysicalPages(7, pages.as_ptr()), 1);
@@ -1689,13 +2088,13 @@ mod tests {
     /// section's pages.
     #[test]
     fn an_allocation_in_several_sections_is_mapped_and_written_across_their_bounds() {
-        let pages = make_pages(5, 2).expect("sections");
+        let pages = make_pages(5, 2, None).expect("sections");
         assert!(pages.windows(2).all(|w| w[1] == w[0] + FRAMES), "numbered as one allocation");
-        let groups = runs(&pages, 0, 5 * PAGE).expect("known pages");
+        let groups = runs(&pages, 0, 5 * PAGE, false).expect("known pages");
         assert_eq!(groups.iter().map(|&(_, n)| n).collect::<Vec<_>>(), [2, 2, 1]);
         assert!(groups.iter().all(|(slice, _)| slice.index == 0), "each run from its section's start");
         let sections: std::collections::HashSet<usize> =
-            groups.iter().map(|(slice, _)| slice.section.0 as usize).collect();
+            groups.iter().map(|(slice, _)| slice.section.handle as usize).collect();
         assert_eq!(sections.len(), 3);
         // Inside one section in place; over a bound through a buffer.
         assert!(page_window(&pages, 2 * PAGE + 7, PAGE).is_some());
@@ -1770,7 +2169,7 @@ mod tests {
             per => per,
         };
         let expected: Vec<usize> = (0..33).step_by(per).map(|first| per.min(33 - first)).collect();
-        let groups = runs(&pages, 0, 33 * PAGE).expect("known pages");
+        let groups = runs(&pages, 0, 33 * PAGE, false).expect("known pages");
         assert_eq!(groups.iter().map(|&(_, n)| n).collect::<Vec<_>>(), expected);
         // The last byte of one section and the first of the next (or of
         // the same one).
@@ -1796,7 +2195,7 @@ mod tests {
         let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
         let calls: Vec<u64> = CALLS.iter().map(|c| load(&c[0])).collect();
         let (made, system) = (load(&MADE[0]), load(&SYSTEM[0]));
-        let pages = make_pages(3, 2).expect("sections");
+        let pages = make_pages(3, 2, None).expect("sections");
         assert!(load(&MADE[0]) >= made + 2);
         let a = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
         assert!(!a.is_null());
@@ -1815,6 +2214,386 @@ mod tests {
         for part in ["maps ", "; unmaps ", "; page-mapping copies ", " sections made, ", how] {
             assert!(line.contains(part), "{line}");
         }
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    // VIcky: physical pages placed at their first mapping (`place_on`). The
+    // tests make placeable pages themselves (`make_pages` with a window
+    // size), so the switch itself stays off and other tests see nothing.
+
+    /// Pages placeable in windows of `window` pages above 4 GiB.
+    fn placeable(n: usize, window: usize) -> Vec<usize> {
+        make_pages(n, 0, Some(window * PAGE)).expect("pages")
+    }
+
+    /// A placeholder of `n` pages above 4 GiB whose first address is a
+    /// multiple of `align` pages (a window's first address).
+    fn reserve_aligned(n: usize, align: usize) -> *mut c_void {
+        let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: LOW_WINDOW as *mut c_void,
+            HighestEndingAddress: ((1usize << 40) - 1) as *mut c_void,
+            Alignment: align * PAGE,
+        };
+        let mut parameter = MEM_EXTENDED_PARAMETER::default();
+        parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+        // SAFETY: a reservation of the test's own; the parameter lives
+        // through the call.
+        let at = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null_mut(),
+                n * PAGE,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                &mut parameter,
+                1,
+            )
+        };
+        assert!(!at.is_null(), "{}", std::io::Error::last_os_error());
+        assert_eq!(at as usize % (align * PAGE), 0);
+        at
+    }
+
+    /// A placeholder of `n` pages anywhere, as titles reserve them.
+    fn reserve(n: usize) -> *mut c_void {
+        let at = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            n * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!at.is_null());
+        at
+    }
+
+    /// The views in `[p, p + n pages)`, by their pages.
+    fn views_in(p: *mut c_void, n: usize) -> Vec<usize> {
+        let start = p as usize;
+        physical()
+            .views
+            .range(start..start + n * PAGE)
+            .map(|(_, (len, _))| len / PAGE)
+            .collect()
+    }
+
+    /// Where a page lives now: its section's window (if a section of
+    /// placement's) and its index there.
+    fn place_of(page: usize) -> (Option<usize>, usize) {
+        let physical = physical();
+        let slice = physical.pages.get(&page).expect("known page");
+        (slice.section.window, slice.index)
+    }
+
+    fn placed_count(i: usize) -> u64 {
+        PLACED[i].load(Ordering::Relaxed)
+    }
+
+    /// The places taken in `[p, p + n pages)`.
+    fn held(p: *mut c_void, n: usize) -> usize {
+        physical()
+            .place
+            .taken
+            .range(p as usize..p as usize + n * PAGE)
+            .count()
+    }
+
+    /// The switch, and the windows: below 4 GiB one of 4 GiB, above windows
+    /// of the size given from 0 on.
+    #[test]
+    fn placement_switch_and_windows() {
+        assert!(!place_mode(None));
+        assert!(!place_mode(Some("0")));
+        assert!(!place_mode(Some("yes")));
+        assert!(place_mode(Some("1")));
+        assert!(place_mode(Some(" 1 ")));
+        let two = 2 * MIB;
+        assert_eq!(window_of(0x3de0_0000, two), (0, 1 << 32));
+        assert_eq!(window_of(0, two), (0, 1 << 32));
+        assert_eq!(window_of((1 << 32) - PAGE, two), (0, 1 << 32));
+        assert_eq!(window_of(1 << 32, two), (1 << 32, two));
+        assert_eq!(window_of((1 << 32) + 3 * MIB, two), ((1 << 32) + two, two));
+        assert_eq!(window_of((5 << 32) + 7, 1 << 32), (5 << 32, 1 << 32));
+        assert_eq!(
+            window_of(0x2_85c2_0000, two),
+            (0x2_85c2_0000 / two * two, two)
+        );
+    }
+
+    /// Pages of one allocation mapped in another order at consecutive
+    /// addresses: without placement one view each (scattered places), with
+    /// it one view of one run of their window's section, at the offsets
+    /// their addresses name. Mapped at a second address in the same order,
+    /// one view again (an alias of the same places); a page keeps its place
+    /// wherever it is mapped later; freed and unmapped, the places are given
+    /// back.
+    #[test]
+    fn pages_first_mapped_at_consecutive_addresses_are_one_run() {
+        let order = |p: &[usize]| [p[2], p[0], p[3], p[1]];
+        // Without (the title's call, the switch off): four views.
+        if !place_on() {
+            let plain = allocate(4);
+            let c = reserve(4);
+            assert_eq!(XMemMapPhysicalPages(c, 4, order(&plain).as_ptr()), c);
+            assert_eq!(views_in(c, 4), [1, 1, 1, 1]);
+            assert_eq!(XMemMapPhysicalPages(c, 4, std::ptr::null()), c);
+            assert_eq!(XMemFreePhysicalPages(4, plain.as_ptr()), 1);
+        }
+
+        let pages = placeable(4, 4);
+        let placed = placed_count(0);
+        let (a, b) = (reserve_aligned(4, 4), reserve(4));
+        let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE);
+        let mapped = order(&pages);
+        assert_eq!(XMemMapPhysicalPages(a, 4, mapped.as_ptr()), a);
+        assert_eq!(views_in(a, 4), [4], "one view: one run of one section");
+        assert!(placed_count(0) >= placed + 4);
+        for (k, &page) in mapped.iter().enumerate() {
+            assert_eq!(
+                place_of(page),
+                (Some(a as usize), k),
+                "page {k} at its address"
+            );
+        }
+        let groups = runs(&mapped, 0, 4 * PAGE, false).expect("known pages");
+        assert_eq!(groups.len(), 1);
+        // The title's bytes are the pages': through our own view of them.
+        // SAFETY: mapped read-write.
+        unsafe { at(a, 1).cast::<u8>().write(0x5c) };
+        assert_eq!(page_bytes(pages[0])[0], 0x5c);
+        // The same pages at a second address, in the same order: one view.
+        assert_eq!(XMemMapPhysicalPages(b, 4, mapped.as_ptr()), b);
+        assert_eq!(views_in(b, 4), [4]);
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(b, 1).cast::<u8>().read() }, 0x5c);
+        // Unmapped and mapped elsewhere alone: the place stays.
+        assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
+        assert_eq!(
+            XMemMapPhysicalPages(at(a, 3), 1, [pages[0]].as_ptr()),
+            at(a, 3)
+        );
+        assert_eq!(place_of(pages[0]), (Some(a as usize), 1));
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { at(a, 3).cast::<u8>().read() }, 0x5c);
+        // Freed while shown: the places are held, then given back.
+        let back = placed_count(4);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+        assert_eq!(held(a, 4), 4, "still shown at b (and a + 3 pages)");
+        for (p, n) in [(at(a, 3), 1), (b, 4)] {
+            assert_eq!(XMemMapPhysicalPages(p, n, std::ptr::null()), p);
+        }
+        assert_eq!(held(a, 4), 0, "no view left: given back");
+        assert!(placed_count(4) >= back + 4);
+    }
+
+    /// A place another page took first: the page keeps its allocation's
+    /// place, as without the switch, and is counted; the first page keeps
+    /// its place while it lives, mapped or not.
+    #[test]
+    fn a_place_taken_first_keeps_the_allocations_place() {
+        let pages = placeable(2, 4);
+        let a = reserve_aligned(4, 4);
+        let second = a.wrapping_byte_add(PAGE);
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
+        assert_eq!(place_of(pages[0]), (Some(a as usize), 0));
+        // Unmapped: still its place (the page lives).
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        let taken = placed_count(1);
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages[1..].as_ptr()), a);
+        assert_eq!(place_of(pages[1]), (None, 1), "its allocation's place");
+        assert!(placed_count(1) > taken);
+        // SAFETY: mapped read-write.
+        unsafe { a.cast::<u8>().write(3) };
+        assert_eq!(page_bytes(pages[1])[0], 3);
+        // The first page mapped next to it shows its own place.
+        assert_eq!(XMemMapPhysicalPages(second, 1, pages.as_ptr()), second);
+        assert_eq!(place_of(pages[0]), (Some(a as usize), 0));
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { second.cast::<u8>().read() }, 0);
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        assert_eq!(held(a, 4), 0, "freed, shown nowhere: given back");
+    }
+
+    /// A freed page's place is given back when its last view goes; a page
+    /// placed there later reads zero, though the section kept the bytes
+    /// (another page holds it), and the place is counted as given again.
+    #[test]
+    fn freed_places_are_given_back_and_read_zero_when_given_again() {
+        let pages = placeable(2, 4);
+        let a = reserve_aligned(4, 4);
+        let alias = reserve(1);
+        let second = a.wrapping_byte_add(PAGE);
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(alias, 1, pages.as_ptr()), alias);
+        // SAFETY: both mapped read-write.
+        unsafe {
+            a.cast::<u8>().write_bytes(0xab, PAGE);
+            second.cast::<u8>().write(0x11);
+        }
+        // Freed while shown at two addresses: held.
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        assert_eq!(physical().place.taken.get(&(a as usize)), Some(&None));
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(
+            physical().place.taken.get(&(a as usize)),
+            Some(&None),
+            "still shown at the alias"
+        );
+        // SAFETY: still mapped.
+        assert_eq!(unsafe { alias.cast::<u8>().read() }, 0xab);
+        assert_eq!(XMemMapPhysicalPages(alias, 1, std::ptr::null()), alias);
+        assert!(
+            !physical().place.taken.contains_key(&(a as usize)),
+            "given back"
+        );
+        // A new page first mapped there takes the place, zeroed.
+        let again = placed_count(5);
+        let newer = placeable(1, 4);
+        assert_eq!(XMemMapPhysicalPages(a, 1, newer.as_ptr()), a);
+        assert_eq!(place_of(newer[0]), (Some(a as usize), 0));
+        assert!(placed_count(5) > again);
+        // SAFETY: mapped read-write.
+        unsafe {
+            assert!(
+                std::slice::from_raw_parts(a.cast::<u8>(), PAGE)
+                    .iter()
+                    .all(|&b| b == 0),
+                "a fresh page reads zero"
+            );
+            assert_eq!(second.cast::<u8>().read(), 0x11, "its neighbour untouched");
+        }
+        // Freed while shown nowhere: given back at once.
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(1, newer.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, pages[1..].as_ptr()), 1);
+        assert_eq!(held(a, 4), 0);
+    }
+
+    /// A place given again whose first mapping failed (simulated: placed,
+    /// not mapped) is zeroed before a DirectStorage write lands in it, not
+    /// after: the write's bytes stay, and the old page's do not show.
+    #[test]
+    fn a_place_given_again_and_written_before_its_mapping_keeps_the_bytes() {
+        let pages = placeable(2, 4);
+        let a = reserve_aligned(4, 4);
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        // SAFETY: mapped read-write.
+        unsafe { a.cast::<u8>().write_bytes(0xab, PAGE) };
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        let newer = placeable(1, 4);
+        place_first(&mut physical(), a as usize, &newer);
+        assert!(physical().place.zero.contains(&(a as usize)), "given again, to be zeroed");
+        assert!(write_physical(&newer, 1, &[5]));
+        let bytes = page_bytes(newer[0]);
+        assert_eq!(bytes[1], 5);
+        assert!(bytes.iter().enumerate().all(|(i, &b)| i == 1 || b == 0), "zeroed first");
+        assert_eq!(XMemMapPhysicalPages(a, 1, newer.as_ptr()), a);
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { a.cast::<u8>().add(1).read() }, 5, "not zeroed again");
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(1, newer.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, pages[1..].as_ptr()), 1);
+    }
+
+    /// A page written before its first mapping (a DirectStorage destination
+    /// not mapped yet) keeps its allocation's place and its bytes; the
+    /// page beside it that was not written is placed.
+    #[test]
+    fn pages_written_before_their_first_mapping_keep_their_place() {
+        let pages = placeable(2, 4);
+        let written = placed_count(2);
+        assert!(write_physical(&pages[..1], 5, &[7]));
+        assert!(placed_count(2) > written);
+        let a = reserve_aligned(4, 4);
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        assert_eq!(place_of(pages[0]), (None, 0));
+        assert_eq!(place_of(pages[1]), (Some(a as usize), 1));
+        assert_eq!(views_in(a, 2), [1, 1]);
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { a.cast::<u8>().add(5).read() }, 7);
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// Windows of two pages: four pages mapped over two windows are one run
+    /// of each window's section, two views; DirectStorage writes over the
+    /// bound land in both.
+    #[test]
+    fn a_run_over_a_window_bound_is_one_run_per_window() {
+        let pages = placeable(4, 2);
+        let a = reserve_aligned(4, 2);
+        let mapped = [pages[3], pages[2], pages[1], pages[0]];
+        assert_eq!(XMemMapPhysicalPages(a, 4, mapped.as_ptr()), a);
+        assert_eq!(views_in(a, 4), [2, 2]);
+        assert_eq!(place_of(pages[3]), (Some(a as usize), 0));
+        assert_eq!(place_of(pages[0]), (Some(a as usize + 2 * PAGE), 1));
+        assert!(write_physical(&mapped, 2 * PAGE - 1, &[0x21, 0x22]));
+        // SAFETY: mapped read-write.
+        unsafe {
+            assert_eq!(a.cast::<u8>().add(2 * PAGE - 1).read(), 0x21);
+            assert_eq!(a.cast::<u8>().add(2 * PAGE).read(), 0x22);
+        }
+        assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    /// Below 4 GiB everything is one section: two pages mapped apart, in
+    /// two calls, are views of the same section at the offsets their
+    /// addresses name, so a buffer mapped there in order is one run of it.
+    #[test]
+    fn the_32_bit_memory_is_one_section_of_placement() {
+        let pages = placeable(2, 4);
+        let low = || {
+            let p = XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                PAGE,
+                MEM_RESERVE | PAGES_64K,
+                GRAPHICS | ADDRESS_32BIT,
+                PAGE_READWRITE,
+            );
+            assert!(!p.is_null() && (p as usize) + PAGE <= LOW_WINDOW, "{p:p}");
+            p
+        };
+        let (a, b) = (low(), low());
+        assert_eq!(XMemMapPhysicalPages(b, 1, pages[1..].as_ptr()), b);
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
+        assert_eq!(place_of(pages[0]), (Some(0), a as usize / PAGE));
+        assert_eq!(place_of(pages[1]), (Some(0), b as usize / PAGE));
+        let same = {
+            let physical = physical();
+            Arc::ptr_eq(
+                &physical.pages[&pages[0]].section,
+                &physical.pages[&pages[1]].section,
+            )
+        };
+        assert!(same, "one section below 4 GiB");
+        for p in [a, b] {
+            assert_eq!(XMemMapPhysicalPages(p, 1, std::ptr::null()), p);
+        }
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// The placement's line names what is placed now and the counts.
+    #[test]
+    fn the_placement_line_says_what_is_placed() {
+        let pages = placeable(3, 4);
+        let a = reserve_aligned(4, 4);
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        let line = (0..1000)
+            .find_map(|_| placement_line())
+            .expect("the page table free once");
+        for part in [
+            "MB placed now in ",
+            " runs of consecutive addresses (the largest ",
+            " pages placed at their address, ",
+            " sections of placement made, ",
+        ] {
+            assert!(line.contains(part), "{line}");
+        }
+        assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 }

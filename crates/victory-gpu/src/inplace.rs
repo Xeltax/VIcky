@@ -357,6 +357,10 @@ static ALIVE: AtomicU64 = AtomicU64::new(0);
 /// other pages there.
 static CSTATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
+/// The last big title buffer turned down, and why (the placement's line,
+/// [`title_memory_placement`]).
+static LAST_WHY: Mutex<String> = Mutex::new(String::new());
+
 /// Whether the 64 KiB pages `[at, at + bytes)` can open a region: below
 /// 4 GiB and view memory that is one run of a section; else why not.
 fn constants_wanted(at: u64, bytes: u64) -> Result<(), String> {
@@ -369,7 +373,7 @@ fn constants_wanted(at: u64, bytes: u64) -> Result<(), String> {
         Cover::Holes => Err("view memory with holes".to_owned()),
         Cover::Scattered => Err(
             "view memory from several places or sections, not one run of a section (VICTORY_SECTION_MB cuts the title's allocations into \
-             sections of that many MiB)"
+             sections of that many MiB; VICTORY_PAGE_PLACE=1 places each page at its address when first mapped)"
                 .to_owned(),
         ),
     }
@@ -399,6 +403,9 @@ pub(crate) fn place_constants(start: u64, len: u64, fresh: bool) -> Option<Place
         }
         Ok(None) => None,
         Err((stat, why)) => {
+            if let Ok(mut last) = LAST_WHY.lock() {
+                *last = format!("{start:#x}+{} MB: {why}", len >> 20);
+            }
             if CSTATS[stat].fetch_add(1, Ordering::Relaxed) < 8 {
                 tracing::warn!(
                     start = format_args!("{start:#x}"),
@@ -540,6 +547,70 @@ fn constants_say() {
         s[6],
         s[7]
     );
+}
+
+/// VIcky: the runtime places physical pages at their first mapping
+/// (`VICTORY_PAGE_PLACE=1`, `victory_hle`'s `xmem`), and `text` says what
+/// is placed (`None` while the page table is busy: asked again at the
+/// next tick). From then on [`tick`] says it every ten seconds, on one line
+/// with the constants heap's state in place ([`constants_result`]): the
+/// placement is there to make that heap one run of a section.
+pub fn title_memory_placement(text: fn() -> Option<String>) {
+    let _ = PLACEMENT.set(text);
+}
+
+static PLACEMENT: std::sync::OnceLock<fn() -> Option<String>> = std::sync::OnceLock::new();
+
+/// The placement's line ([`title_memory_placement`]), every ten seconds.
+fn placement_say(text: fn() -> Option<String>) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 10_000 {
+        return;
+    }
+    // One lock after the other, never both: the page table's (only if
+    // free), then the regions'.
+    let Some(placed) = text() else {
+        return;
+    };
+    if LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        tracing::info!("{placed}; the constants heap: {}", constants_result());
+    }
+}
+
+/// The constants heap's state in place, in words: a copy (the switch off
+/// or turned down at start), in place (the regions, the title buffers
+/// placed in them), or not yet (the refusals by cause, and the last).
+fn constants_result() -> String {
+    if !constants_on() {
+        return match mode_of(std::env::var("VICTORY_INPLACE_CONSTANTS").ok().as_deref()) {
+            0 => "a copy (VICTORY_INPLACE_CONSTANTS off)".to_owned(),
+            1 => "a copy (VICTORY_INPLACE_CONSTANTS=1 turned down at start: VICTORY_FENCE_SENT=1 with submissions sent ahead)".to_owned(),
+            _ => "a copy (VICTORY_INPLACE_CONSTANTS=alt turned down at start)".to_owned(),
+        };
+    }
+    let s: Vec<u64> = CSTATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    let regions: Vec<String> = REGIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|r| format!("{:#x}+{} MB", r.start, (r.end - r.start) >> 20))
+        .collect();
+    let last = LAST_WHY.lock().map(|w| w.clone()).unwrap_or_default();
+    format!(
+        "{} (VICTORY_INPLACE_CONSTANTS=1), {} title buffers placed in regions so far; turned down {} ({} not one run of a section below \
+         4 GiB, {} no view of ours, {} refused by the host, {} a copy first){}; {} regions forgotten",
+        if regions.is_empty() { "NOT in place".to_owned() } else { format!("IN PLACE: {}", regions.join(", ")) },
+        s[2],
+        s[3] + s[4] + s[5] + s[6],
+        s[3],
+        s[4],
+        s[5],
+        s[6],
+        if last.is_empty() { String::new() } else { format!(", the last {last}") },
+        s[7],
+    )
 }
 
 // What our copies spend on the big title buffers (diagnostics, always on):
@@ -1827,6 +1898,9 @@ pub(crate) fn tick() {
     if constants_on() {
         constants_say();
     }
+    if let Some(&text) = PLACEMENT.get() {
+        placement_say(text);
+    }
     if probe_level() == 0 {
         return;
     }
@@ -2070,6 +2144,9 @@ mod tests {
         hole
     }
 
+    /// The tests that count the constants heap's regions, one at a time.
+    static CONSTANTS_TESTS: Mutex<()> = Mutex::new(());
+
     /// The constants heap's own call on the software adapter: a reserved
     /// section below 4 GiB, mapped as `xmem` maps physical pages (two views
     /// of consecutive pages in turn, committed), and a title buffer in it
@@ -2082,6 +2159,7 @@ mod tests {
     /// private memory opens nothing; a remap forgets the region.
     #[test]
     fn warp_the_constants_heap_is_read_and_written_in_place_through_a_view_of_ours() {
+        let _alone = CONSTANTS_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(device) = warp() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             return;
@@ -2158,6 +2236,116 @@ mod tests {
             mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE);
             mem::VirtualFree(hole.add(3 * K64).cast(), 0, mem::MEM_RELEASE);
             windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+    }
+
+    /// VIcky: the constants heap as `VICTORY_PAGE_PLACE=1` lays it out, on
+    /// the software adapter. The title maps a buffer's pages one call each,
+    /// in an order of its own. As allocated (`xmem`'s `make_pages`), the
+    /// pages' places in their section follow the allocation, not the
+    /// addresses: scattered, turned down. Placed at their first mapping,
+    /// each page lies in the one section of placement below 4 GiB at the
+    /// offset its address names: whatever the order of the calls, the
+    /// buffer is one run of that section, its region opens on a view of
+    /// ours, and the card reads and writes the title's bytes in place.
+    #[test]
+    fn warp_the_constants_heap_placed_at_its_addresses_is_one_run_in_place() {
+        let _alone = CONSTANTS_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(device) = warp() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            return;
+        }
+        const N: usize = 8;
+        // The order of the title's calls, and the allocation's places.
+        let order = [5usize, 2, 7, 0, 3, 6, 1, 4];
+        // SAFETY (the whole test): the sections, placeholders and views made
+        // here.
+        unsafe {
+            let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            // `xmem`'s section of placement below 4 GiB: 4 GiB, reserved.
+            let low = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_RESERVE, 1, 0, std::ptr::null());
+            assert!(!low.is_null(), "{}", std::io::Error::last_os_error());
+            // An allocation's own section, as without the placement.
+            let allocated = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_RESERVE, 0, (N * K64) as u32, std::ptr::null());
+            assert!(!allocated.is_null());
+            // One page a call, as `xmem`'s `map`: split the placeholder,
+            // map the page's section there, commit, tell the census.
+            let map = |hole: *mut u8, k: usize, section: windows_sys::Win32::Foundation::HANDLE, offset: usize| {
+                let at = hole.add(k * K64);
+                mem::VirtualFree(at.cast(), K64, mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER);
+                let view = mem::MapViewOfFile3(section, process, at.cast(), offset as u64, K64, mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
+                assert_eq!(view.Value, at.cast(), "{}", std::io::Error::last_os_error());
+                assert!(!mem::VirtualAlloc(view.Value, K64, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+                title_memory_view(at as usize, K64, section as usize, offset as u64);
+                view
+            };
+            let regions = || REGIONS.lock().unwrap().len();
+            let before = regions();
+
+            // As allocated: page k of the buffer is the allocation's page
+            // `order[k]`, mapped in the calls' order.
+            let scattered = reserve_low(N * K64, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER);
+            let mut views = Vec::new();
+            for &k in &order {
+                views.push(map(scattered, k, allocated, order[k] * K64));
+            }
+            assert_eq!(cover(scattered as usize, N * K64), Cover::Scattered);
+            let refused = constants_place(&device, scattered as u64, (N * K64) as u64, K64 as u64, true).err();
+            assert_eq!(refused.as_ref().map(|e| e.0), Some(3));
+            assert!(refused.unwrap().1.contains("several places"), "turned down as scattered");
+            assert_eq!(regions(), before);
+
+            // Placed: the same calls, each page at the offset its address
+            // names in the section below 4 GiB.
+            let hole = reserve_low(N * K64, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER);
+            for &k in &order {
+                views.push(map(hole, k, low, hole as usize + k * K64));
+            }
+            let base = hole as u64;
+            assert_eq!(cover(hole as usize, N * K64), Cover::Run(low as usize, base), "one run of the section");
+            let (start, len) = (base + 0x100, (N * K64) as u64 - 0x100);
+            let placed = constants_place(&device, start, len, K64 as u64, true).unwrap_or_else(|e| panic!("not placed: {e:?}")).expect("placed");
+            assert_eq!(regions(), before + 1);
+            assert_eq!(placed.bias, 0x100);
+            let mut rig = Rig::new(&device).unwrap();
+            fill(start as *mut u8, len as usize, 23);
+            let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
+            assert!(same(start as *const u8, &got), "the card reads the title's bytes across the eight calls' views");
+            rig.store(&placed.buffer, placed.bias + 5 * K64 as u64 - 64, &[0x3c; 128]).unwrap();
+            assert!(same((start + 5 * K64 as u64 - 64) as *const u8, &[0x3c; 128]), "the card's copy over two views lands at the title's address");
+            (start as *mut [u32; 3]).write_unaligned([40, 2, 0]);
+            rig.shade(placed.gpu).unwrap();
+            assert_eq!((start as *const [u32; 3]).read_unaligned()[2], 42, "a shader's store lands at the title's address");
+            // A title buffer inside it: the same region.
+            let inside = constants_place(&device, base + 3 * K64 as u64, 4096, u64::MAX, false).unwrap().expect("placed in the region");
+            assert_eq!(regions(), before + 1);
+
+            // The title maps other pages there: the region is forgotten.
+            drop(rig);
+            constants_forget(base, (N * K64) as u64);
+            assert_eq!(regions(), before);
+            drop((placed, inside));
+            for view in views {
+                mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER);
+            }
+            for hole in [scattered, hole] {
+                views_gone(hole as usize, N * K64);
+                for k in 0..N {
+                    mem::VirtualFree(hole.add(k * K64).cast(), 0, mem::MEM_RELEASE);
+                }
+            }
+            windows_sys::Win32::Foundation::CloseHandle(allocated);
+            windows_sys::Win32::Foundation::CloseHandle(low);
+        }
+    }
+
+    /// The placement's line names the constants heap's state: a copy with
+    /// the switch off.
+    #[test]
+    fn the_placement_line_names_the_constants_heap() {
+        if std::env::var_os("VICTORY_INPLACE_CONSTANTS").is_none() {
+            assert_eq!(constants_result(), "a copy (VICTORY_INPLACE_CONSTANTS off)");
         }
     }
 
