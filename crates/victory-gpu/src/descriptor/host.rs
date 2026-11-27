@@ -2865,12 +2865,12 @@ impl HostHeap {
     /// no longer be read (the title unmapped its page) is not made. With
     /// `check`, the slots whose record is not the one made at the call are
     /// counted. `by_sync`: drained by the heap sync, else by a pass over
-    /// the heap (for the counts).
-    pub(crate) fn drain_deferred(&self, by_sync: bool) {
+    /// the heap (for the counts). Returns how many were made.
+    pub(crate) fn drain_deferred(&self, by_sync: bool) -> usize {
         use super::mirror_try::{Count, Mode, count, mode, readable, record_key};
         let slots = self.deferred.take();
         if slots.is_empty() {
-            return;
+            return 0;
         }
         let check = mode() == Mode::Check;
         let (mut due, mut gone, mut differing) = (Vec::with_capacity(slots.len()), 0, 0);
@@ -2897,6 +2897,7 @@ impl HostHeap {
             count(Count::Compared, due.len() as u64);
             count(Count::Differing, differing);
         }
+        due.len()
     }
 
     /// Tests: `f` run with `made` held alone by this thread.

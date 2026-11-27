@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod beside;
+#[cfg(all(windows, any(test, feature = "diagnostics")))]
+pub(crate) mod burst;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
@@ -240,8 +242,9 @@ fn sync_held(asked: Option<&dyn Fn()>, started: std::time::Instant) {
     // VIcky (`VICTORY_MIRROR_TRY`): the slots copied while the heap's lock
     // was held, ahead of the walk (with `asked`, once the pages are asked
     // for, below).
+    let mut drained = 0;
     if asked.is_none() {
-        drain_deferred(&heaps);
+        drained += drain_deferred(&heaps);
     }
     // With `asked`: each heap's changed pages, walked once all are asked for.
     let mut later: Vec<(&host::HostHeap, Vec<(usize, usize)>, (u64, u64), u32)> = Vec::new();
@@ -271,7 +274,7 @@ fn sync_held(asked: Option<&dyn Fn()>, started: std::time::Instant) {
     }
     if let Some(asked) = asked {
         asked();
-        drain_deferred(&heaps);
+        drained += drain_deferred(&heaps);
     }
     for (host, ranges, at, mirrored_count) in later {
         let done = walk_heap(host, &ranges, at, mirrored_count, &mut page_bytes);
@@ -281,24 +284,32 @@ fn sync_held(asked: Option<&dyn Fn()>, started: std::time::Instant) {
     }
     drop(heaps);
     let [pages, looked, mirrored] = counts;
-    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
+    let us = started.elapsed().as_micros() as u64;
+    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, us]) {
         count.fetch_add(n, Relaxed);
     }
+    // VIcky: for the line by place in the burst.
+    #[cfg(feature = "diagnostics")]
+    burst::synced(us, mirrored + drained);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = drained;
 }
 
 /// VIcky (`VICTORY_MIRROR_TRY`, [`mirror_try`]): for every heap, the
 /// copied slots its mirror left to the sync, made now
 /// (`host::HostHeap::drain_deferred`). Whatever the mode: a heap with
-/// nothing left costs a load.
+/// nothing left costs a load. Returns how many were made.
 #[cfg(windows)]
-fn drain_deferred(heaps: &[(u64, u64, usize)]) {
+fn drain_deferred(heaps: &[(u64, u64, usize)]) -> u64 {
+    let mut made = 0;
     for &(_, _, at) in heaps {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
         if let Some(Some(host)) = heap.host.get() {
-            host.drain_deferred(true);
+            made += host.drain_deferred(true) as u64;
         }
     }
+    made
 }
 
 /// [`sync_heaps`]' walk over one heap's changed `ranges` (title slot `i`
@@ -492,21 +503,24 @@ pub(crate) fn sync_line(frames: f64) {
     // (VIcky, `VICTORY_MIRROR_TRY`: said with the switch on even when no
     // heap page changed.)
     let tried = mirror_try::part(frames);
-    if pages == 0 && tried.is_empty() {
-        return;
+    if pages > 0 || !tried.is_empty() {
+        tracing::info!(
+            "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
+             {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms{}{}{}",
+            pages as f64 / frames,
+            looked as f64 / frames,
+            mirrored as f64 / frames,
+            host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
+            micros as f64 / 1000.0 / frames,
+            wide_part(frames),
+            beside,
+            tried,
+        );
     }
-    tracing::info!(
-        "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
-         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms{}{}{}",
-        pages as f64 / frames,
-        looked as f64 / frames,
-        mirrored as f64 / frames,
-        host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
-        micros as f64 / 1000.0 / frames,
-        wide_part(frames),
-        beside,
-        tried,
-    );
+    // VIcky (diagnostics): the sync and its join by the submission's place
+    // in the burst, next to it.
+    #[cfg(feature = "diagnostics")]
+    burst::line(frames);
 }
 
 /// The sync line's part for `VICTORY_HEAP_SYNC_THREADS` (empty without it).

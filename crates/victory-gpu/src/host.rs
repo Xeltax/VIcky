@@ -6519,6 +6519,8 @@ impl Host {
             joined = beside.join();
             crate::descriptor::make_waiting();
         }
+        #[cfg(feature = "diagnostics")]
+        crate::descriptor::burst::submitted(crate::descriptor::beside::on(), joined);
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
@@ -9725,6 +9727,10 @@ impl Host {
             }
             let _ = drawn;
             copy.close();
+            // (The present's own submission, for the heap sync's line by
+            // place in the burst.)
+            #[cfg(feature = "diagnostics")]
+            let own = crate::descriptor::burst::present_own();
             match slot {
                 Some(i) => {
                     let flown = self.execute_own(copy);
@@ -9732,6 +9738,8 @@ impl Host {
                 }
                 None => self.execute(&[copy]),
             }
+            #[cfg(feature = "diagnostics")]
+            drop(own);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
