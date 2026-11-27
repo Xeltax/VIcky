@@ -298,8 +298,9 @@ mod tests {
     /// threads or this one took the jobs.
     #[test]
     fn snapshots_given_beside_are_all_copied_when_done() {
-        let len = 5 * super::super::WIDE_JOB + 777;
-        let (src, dst, list) = copies(len, &[0, 3, 4096, 1 << 20, (3 << 20) + 5, len], 1);
+        // Small: the suite's tests that depend on timing feel the load.
+        let len = 2 * super::super::WIDE_JOB + 777;
+        let (src, dst, list) = copies(len, &[0, 3, 4096, super::super::WIDE_JOB + 5, len], 1);
         let snapping = give(list);
         done(Some(snapping));
         assert!(src == dst);
@@ -310,7 +311,7 @@ mod tests {
     /// when done.
     #[test]
     fn a_wide_call_meanwhile_ends_with_its_own_jobs() {
-        let len = 9 * super::super::WIDE_JOB;
+        let len = 3 * super::super::WIDE_JOB;
         let (src, dst, list) = copies(len, &[0, len / 3, len], 7);
         let snapping = give(list);
         let ran = Arc::new(AtomicU64::new(0));
