@@ -1024,6 +1024,47 @@ pub(crate) const CHECK_EVERY: u64 = 16;
 pub(crate) struct Pending {
     state: Mutex<Ended>,
     moved: Condvar,
+    /// VIcky (PF5b's meter, [`chain_part`]): when the pass ended
+    /// ([`now_us`]), and whether a submission waited for it yet.
+    ended_us: AtomicU64,
+    asked: AtomicBool,
+}
+
+/// VIcky (PF5b's meter of the pass's chain, [`chain_part`]): microseconds
+/// since the first asking, for the moments compared across threads.
+fn now_us() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64 + 1
+}
+
+/// When the title's last present returned ([`now_us`]; 0: none yet).
+static PRESENT_RETURNED: AtomicU64 = AtomicU64::new(0);
+
+/// The title's present returns (`crate::queue`'s present), for the chain
+/// of the pass beside ([`chain_part`]).
+pub(crate) fn present_returned() {
+    if beside() {
+        PRESENT_RETURNED.store(now_us(), Relaxed);
+    }
+}
+
+/// The submission being prepared: its place since the last present (1
+/// the first), and the presents so far at the submission before.
+static PLACE: Mutex<(u64, u64)> = Mutex::new((u64::MAX, 0));
+
+/// A submission begins (`Host::submit`, with the pass beside): its place
+/// in the burst, for the pass's chain ([`chain_part`]).
+pub(crate) fn submission_begins() {
+    let frame = crate::queue::presented();
+    let mut place = PLACE.lock().unwrap_or_else(|e| e.into_inner());
+    if place.0 != frame {
+        *place = (frame, 0);
+    }
+    place.1 += 1;
+}
+
+fn place() -> u64 {
+    PLACE.lock().unwrap_or_else(|e| e.into_inner()).1
 }
 
 /// What a pass beside left.
@@ -1053,12 +1094,26 @@ impl Pending {
     /// found it running, and how long).
     pub(crate) fn wait(&self) {
         let began = Instant::now();
+        let asked = now_us();
         let running = !self.state.lock().unwrap_or_else(|e| e.into_inner()).done;
         drop(self.ended());
         count(C::Waits, 1);
         if running {
             count(C::Late, 1);
             count(C::WaitedUs, began.elapsed().as_micros() as u64);
+            // VIcky (`VICTORY_MADE_PASS_FIRST`): by that switch's phase.
+            crate::descriptor::host::made_first::pass_waited(began.elapsed());
+        }
+        // VIcky (PF5b's meter): the first submission that asked for it.
+        if !self.asked.swap(true, Relaxed) {
+            count(C::Firsts, 1);
+            count(C::FirstPlaces, place());
+            if running {
+                count(C::FirstLate, 1);
+                count(C::FirstLateUs, began.elapsed().as_micros() as u64);
+            } else {
+                count(C::FirstSlackUs, asked.saturating_sub(self.ended_us.load(Relaxed)));
+            }
         }
     }
 
@@ -1080,6 +1135,8 @@ impl Pending {
         // the stride table; write-combined) leaves this thread's buffers
         // before a waiting thread goes on, as `descriptor::beside` does.
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        // (VIcky, PF5b's meter: read by a waiter once `done` is seen.)
+        self.ended_us.store(now_us(), Relaxed);
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = Ended { done: true, refreshes, panic, checked };
         self.moved.notify_all();
     }
@@ -1236,6 +1293,12 @@ pub(crate) fn start(list: &HostList, heap: &Heap, host: &HostHeap, frame: u64, r
     give(lane.map(|lane| &**lane), call, filler);
     count(C::Passes, 1);
     count(C::CallUs, called.elapsed().as_micros() as u64);
+    // VIcky (PF5b's meter): from the present's return to this call.
+    let presented = PRESENT_RETURNED.load(Relaxed);
+    if presented != 0 {
+        count(C::SincePresents, 1);
+        count(C::SincePresentUs, now_us().saturating_sub(presented));
+    }
     if let (Some(records), Some(answer)) = (records, answer) {
         let began = Instant::now();
         // (A pass that ended without its heap no longer listens.)
@@ -1459,9 +1522,22 @@ enum C {
     Waits,
     Late,
     WaitedUs,
+    /// VIcky (PF5b's meter, [`chain_part`]): calls with a present returned
+    /// before, and the microseconds from that present's return to them.
+    SincePresents,
+    SincePresentUs,
+    /// The first waits of a submission for each pass: their count, the sum
+    /// of their submissions' places in the burst, those that found the pass
+    /// running and the microseconds they waited, and for the others the
+    /// microseconds from the pass's end to them.
+    Firsts,
+    FirstPlaces,
+    FirstLate,
+    FirstLateUs,
+    FirstSlackUs,
 }
 
-static COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static COUNTS: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
 
 fn count(what: C, n: u64) {
     COUNTS[what as usize].fetch_add(n, Relaxed);
@@ -1489,6 +1565,8 @@ pub(crate) fn line(frames: f64) {
     spread_line();
     parts::line();
     threads::line();
+    // VIcky (`VICTORY_MADE_PASS_FIRST`): its line, with the pass's.
+    crate::descriptor::host::made_first::line(frames);
     if !beside() {
         return;
     }
@@ -1519,7 +1597,7 @@ pub(crate) fn line(frames: f64) {
         "the pass over buffer views beside (VICTORY_HEAP_PASS_BESIDE=1) per frame: {:.1} passes; {:.2} ms on the title's \
          recording thread to take the slots and hand the pass over (the frame line's \"heap buffers ... ms\" is that and the \
          pass over textures); {:.1} ms on our thread for {:.0} slots, each pass starting {:.1} ms after its call; the \
-         submitting thread waited {:.2} ms for them ({} of {} waits of lists found the pass running){check}",
+         submitting thread waited {:.2} ms for them ({} of {} waits of lists found the pass running){check}{}",
         passes as f64 / frames,
         ms(get(C::CallUs)),
         ms(get(C::OwnUs)),
@@ -1528,7 +1606,36 @@ pub(crate) fn line(frames: f64) {
         ms(get(C::WaitedUs)),
         get(C::Late),
         waits,
+        chain_part(&c),
     );
+}
+
+/// VIcky (fable-2026-11-27-pf5b.md, section E): the pass's chain, for the
+/// "+42 ms" of the model frame = max(S + 5, P + 42). Per pass: the ms from
+/// the title's present's return to the pass's call (the title's recording
+/// up to the list that runs it), and for the first submission that asked
+/// for each pass, the ms from the pass's end to it (or, found running, how
+/// long it waited) and its place in the burst (1: the first submission
+/// after the present). Empty while no call followed a present and no pass
+/// was asked for.
+fn chain_part(c: &[u64; 15]) -> String {
+    let get = |what: C| c[what as usize];
+    let (calls, firsts, late) = (get(C::SincePresents), get(C::Firsts), get(C::FirstLate));
+    if calls == 0 && firsts == 0 {
+        return String::new();
+    }
+    let ms = |us: u64, n: u64| us as f64 / 1000.0 / n.max(1) as f64;
+    format!(
+        "; the pass's chain (PF5b's +42 ms): {:.1} ms from the present's return to the pass's call; the first submission \
+         that asked for a pass came {:.1} ms after its end ({} of {} found it running and waited {:.1} ms), at place {:.1} \
+         in the burst (1 = the first after the present)",
+        ms(get(C::SincePresentUs), calls),
+        ms(get(C::FirstSlackUs), firsts.saturating_sub(late)),
+        late,
+        firsts,
+        ms(get(C::FirstLateUs), late),
+        get(C::FirstPlaces) as f64 / firsts.max(1) as f64,
+    )
 }
 
 /// Tests: sets the switches of the passes over records

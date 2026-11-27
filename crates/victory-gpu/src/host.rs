@@ -6491,6 +6491,8 @@ impl Host {
         // stand in their lists' steps, before anything below reads those
         // steps or sends the lists (`crate::draw::heap_pass`).
         if crate::draw::heap_pass::beside() {
+            // (VIcky, PF5b's meter: this submission's place in the burst.)
+            crate::draw::heap_pass::submission_begins();
             for list in runs {
                 list.join_heap_passes();
             }

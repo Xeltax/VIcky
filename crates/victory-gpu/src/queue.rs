@@ -1407,6 +1407,9 @@ extern "system" fn present(
     let hr = present_now(this, planes, plane_parameters);
     // VIcky: the next signal may begin the next frame (`crate::fence::sent`).
     crate::fence::sent::presented();
+    // VIcky (PF5b's meter): the pass's chain counts from here.
+    #[cfg(windows)]
+    crate::draw::heap_pass::present_returned();
     #[cfg(windows)]
     {
         crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);

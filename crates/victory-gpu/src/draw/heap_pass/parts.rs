@@ -361,6 +361,9 @@ pub(crate) fn add(took: &[Took], wall: Duration, ordered: Duration) {
     if took.is_empty() {
         return;
     }
+    // VIcky (`VICTORY_MADE_PASS_FIRST`): the pass's wait for the lock and
+    // its time, by that switch's phase.
+    crate::descriptor::host::made_first::pass_ended(took.iter().map(|t| t.waited_ns).sum(), wall);
     let longest = took.iter().map(|t| t.us).max().unwrap_or(0);
     for (i, n) in [
         1,

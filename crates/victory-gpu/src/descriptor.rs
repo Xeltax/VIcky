@@ -306,6 +306,8 @@ fn sync_held(asked: Option<&dyn Fn()>, started: std::time::Instant) {
     host::note_kind::synced(us, mirrored + drained);
     host::sync_lean::synced(us, mirrored + drained);
     host::par_mirror::synced(us, mirrored + drained);
+    // VIcky (`VICTORY_MADE_PASS_FIRST`): the sync's own time by its phase.
+    host::made_first::synced(us);
     // VIcky: for the line by place in the burst.
     #[cfg(feature = "diagnostics")]
     burst::synced(us, mirrored + drained);

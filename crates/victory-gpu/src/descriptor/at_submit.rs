@@ -500,6 +500,8 @@ impl Started {
         if let Some(on) = self.phase {
             note(on, waited, self.before);
         }
+        // VIcky (`VICTORY_MADE_PASS_FIRST`): the join by that switch's phase.
+        super::host::made_first::joined(waited);
         (waited, covered)
     }
 }

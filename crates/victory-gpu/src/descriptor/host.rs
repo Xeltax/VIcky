@@ -18,6 +18,7 @@ use super::slot_map::SlotMap;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+pub(crate) mod made_first;
 pub(crate) mod note_kind;
 pub(crate) mod par_mirror;
 pub(crate) mod sync_lean;
@@ -396,6 +397,12 @@ struct Turns {
     waiting: std::sync::atomic::AtomicU32,
     /// Waiting threads that got it, since the start.
     served: std::sync::atomic::AtomicU32,
+    /// VIcky (`VICTORY_MADE_PASS_FIRST`, [`made_first`]): the pass over
+    /// buffer views waiting for `made` now (its chunks made alone,
+    /// [`HostHeap::made_pass_first`]), and its waits that got it, since the
+    /// start. Only the heap sync's chunks look at these.
+    pass_waiting: std::sync::atomic::AtomicU32,
+    pass_served: std::sync::atomic::AtomicU32,
 }
 
 /// Tests: `made` handed over between a chunk's slots, since the start.
@@ -3021,6 +3028,9 @@ impl HostHeap {
     pub(crate) fn mirror_due(&self, due: &[(u32, u64)]) {
         // VIcky (`VICTORY_MADE_TURNS`): asked once a call.
         let turns = turns_now();
+        // VIcky (`VICTORY_MADE_PASS_FIRST`, [`made_first`]): asked once a
+        // call (never on the pass's own thread).
+        let hand = made_first::hand_now();
         for chunk in due.chunks(MIRROR_CHUNK) {
             RETIRE_LATER.set(Some(Vec::new()));
             {
@@ -3032,8 +3042,14 @@ impl HostHeap {
                 for &(index, handle) in chunk {
                     // VIcky (`VICTORY_MADE_TURNS`): a thread waits for
                     // `made`: the chunk ends here (its keeps and marks
-                    // made) and goes on once that thread had it.
-                    if self.turn_wanted(turns) {
+                    // made) and goes on once that thread had it. VIcky
+                    // (`VICTORY_MADE_PASS_FIRST`): the pass over buffer
+                    // views first, if it waits.
+                    if self.pass_wanted(hand) {
+                        drop(later);
+                        made = self.pass_turn_over(made);
+                        later = KeptLater::begin(self);
+                    } else if self.turn_wanted(turns) {
                         drop(later);
                         made = self.turn_over(made);
                         later = KeptLater::begin(self);
@@ -3179,7 +3195,14 @@ impl HostHeap {
                 let _wait = parts::enter(parts::Part::Wait);
                 let began = std::time::Instant::now();
                 let made = if alone {
-                    MadeHeld::Alone(self.made.write().unwrap_or_else(|e| e.into_inner()))
+                    // VIcky (`VICTORY_MADE_PASS_FIRST`, [`made_first`]): on
+                    // the pass's thread, it says it waits and spins for
+                    // `made` before it sleeps (the sync's chunks let it in).
+                    if parts::counting() && made_first::spin_now() {
+                        MadeHeld::Alone(self.made_pass_first(began))
+                    } else {
+                        MadeHeld::Alone(self.made.write().unwrap_or_else(|e| e.into_inner()))
+                    }
                 } else {
                     MadeHeld::Shared(self.made.read().unwrap_or_else(|e| e.into_inner()))
                 };
@@ -7240,6 +7263,182 @@ mod fast_tests {
         }
         assert_eq!(release(title), 0);
         assert_eq!(release(one_title), 0);
+    }
+
+    /// VIcky (`VICTORY_MADE_PASS_FIRST`, [`made_first`]): one thread's rounds
+    /// over slots of its own: the heap sync's chunks (`who` 0), or the pass
+    /// over buffer views' chunks made alone, on a thread counted as a
+    /// pass's (`who` 1), with the pass-first switch as `pass_first` (on,
+    /// hand-over) for this thread.
+    fn pass_first_rounds(
+        heap: &HostHeap,
+        start: u64,
+        views: &[View],
+        who: u32,
+        slots: std::ops::Range<u32>,
+        rounds: std::ops::Range<u32>,
+        pass_first: Option<(bool, bool)>,
+    ) {
+        made_first::TEST_PASS_FIRST.set(pass_first);
+        let handle = |i: u32| start + u64::from(i) * TITLE_SLOT_BYTES;
+        for round in rounds {
+            for s in slots.clone() {
+                write_record(start, s, &views[((s * 7 + round * 13) % views.len() as u32) as usize]);
+            }
+            if who == 0 {
+                heap.mirror_due(&slots.clone().map(|s| (s, handle(s))).collect::<Vec<_>>());
+                continue;
+            }
+            let taking = crate::draw::heap_pass::parts::Taking::begin();
+            let all: Vec<u32> = slots.clone().collect();
+            for chunk in all.chunks(PASS_CHUNK) {
+                let ahead: Vec<(u32, u64)> = chunk.iter().map(|&i| (i, handle(i))).collect();
+                let mut lookups: Vec<Lookups> = ahead.iter().map(|_| Lookups::kept()).collect();
+                let _ = heap.mirror_chunk(&ahead, &mut lookups, true);
+            }
+            let _ = taking.end();
+        }
+        made_first::TEST_PASS_FIRST.set(None);
+    }
+
+    /// VIcky (`VICTORY_MADE_PASS_FIRST`): the heap sync's chunks on one
+    /// thread and the pass's on another, at once, with the pass going first
+    /// (it spins, and the sync's chunks hand `made` to it): every slot ends
+    /// as the same rounds made one after the other with the switch off leave
+    /// it (records, held resources); the pass said it waited, and the sync
+    /// handed `made` over. No deadlock.
+    #[test]
+    fn the_pass_first_leaves_every_slot_as_without_it() {
+        if host().is_none() {
+            return;
+        }
+        const SLOTS: u32 = 4096;
+        const ROUNDS: u32 = 24;
+        const SYNC: std::ops::Range<u32> = 0..3072;
+        const PASS: std::ops::Range<u32> = 3072..4096;
+        let base = 0x4c_0000_0000u64;
+        let views = std::sync::Arc::new(turn_views(base));
+        let fast = (1 << 12, true, false);
+        let (waits, turns) = (
+            made_first::PASS_WAITS.load(std::sync::atomic::Ordering::Relaxed),
+            made_first::PASS_TURNS.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        // Both at once, the pass first.
+        let (title, start, heap) = heap_with(SLOTS, fast).unwrap();
+        let threads: Vec<_> = [(0u32, SYNC), (1, PASS)]
+            .into_iter()
+            .map(|(who, slots)| {
+                let views = views.clone();
+                std::thread::spawn(move || {
+                    TEST_FAST.set(Some(fast));
+                    pass_first_rounds(heap, start, &views, who, slots, 0..ROUNDS, Some((true, true)));
+                })
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        for (t, thread) in threads.into_iter().enumerate() {
+            while !thread.is_finished() {
+                assert!(std::time::Instant::now() < deadline, "thread {t} still running: a deadlock");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            thread.join().unwrap();
+        }
+        let together = keys_and_kept(heap, 0..SLOTS);
+        assert_eq!(heap.turns.pass_waiting.load(std::sync::atomic::Ordering::SeqCst), 0, "a wait left said");
+        // (A host view heap is about a million slots: one at a time.)
+        assert_eq!(release(title), 0);
+        // The same rounds one after the other, switch off.
+        let (one_title, one_start, one) = heap_with(SLOTS, fast).unwrap();
+        for round in 0..ROUNDS {
+            pass_first_rounds(one, one_start, &views, 0, SYNC, round..round + 1, Some((false, false)));
+            pass_first_rounds(one, one_start, &views, 1, PASS, round..round + 1, Some((false, false)));
+        }
+        let alone = keys_and_kept(one, 0..SLOTS);
+        TEST_FAST.set(None);
+        for (slot, (a, b)) in alone.iter().zip(&together).enumerate() {
+            assert_eq!(a, b, "slot {slot}");
+        }
+        assert!(made_first::PASS_WAITS.load(std::sync::atomic::Ordering::Relaxed) > waits, "the pass never said it waited");
+        assert!(made_first::PASS_TURNS.load(std::sync::atomic::Ordering::Relaxed) > turns, "the sync never handed made over");
+        assert_eq!(release(one_title), 0);
+    }
+
+    /// Micro-benchmark (`VICTORY_MADE_PASS_FIRST`): one thread makes 8,192
+    /// slots in the heap sync's chunks over and over (records rewritten each
+    /// round) while another, counted as the pass's, makes 2,048 slots of its
+    /// own in the pass's chunks over and over; the pass's wait for `made` a
+    /// chunk and the sync's slots a second, off, spinning only, and
+    /// spinning with the sync's hand-over:
+    /// `cargo test -p victory-gpu --profile diag --lib descriptor::host::fast_tests::bench_pass_first -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a benchmark: run alone, with --nocapture"]
+    fn bench_pass_first() {
+        if host().is_none() {
+            return;
+        }
+        const SLOTS: u32 = 1 << 14;
+        const SYNC: u32 = 8192;
+        const PASS: u32 = 2048;
+        let base = 0x4d_0000_0000u64;
+        let views = std::sync::Arc::new(turn_views(base));
+        let fast = (1 << 12, true, false);
+        let (title, start, heap) = heap_with(SLOTS, fast).unwrap();
+        for (name, mode) in [("off", (false, false)), ("spin", (true, false)), ("spin + hand", (true, true)), ("off", (false, false)), ("spin", (true, false)), ("spin + hand", (true, true))] {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let sync = {
+                let (stop, views) = (stop.clone(), views.clone());
+                std::thread::spawn(move || {
+                    TEST_FAST.set(Some(fast));
+                    let (mut slots, mut round) = (0u64, 0u32);
+                    let began = std::time::Instant::now();
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        pass_first_rounds(heap, start, &views, 0, 0..SYNC, round..round + 1, Some(mode));
+                        slots += u64::from(SYNC);
+                        round += 1;
+                    }
+                    slots as f64 / began.elapsed().as_secs_f64()
+                })
+            };
+            let pass = {
+                let (stop, views) = (stop.clone(), views.clone());
+                std::thread::spawn(move || {
+                    TEST_FAST.set(Some(fast));
+                    made_first::TEST_PASS_FIRST.set(Some(mode));
+                    let handle = |i: u32| start + u64::from(i) * TITLE_SLOT_BYTES;
+                    let (mut chunks, mut waited_ns, mut round) = (0u64, 0u64, 0u32);
+                    let began = std::time::Instant::now();
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        for s in SYNC..SYNC + PASS {
+                            write_record(start, s, &views[((s * 7 + round * 13) % views.len() as u32) as usize]);
+                        }
+                        let taking = crate::draw::heap_pass::parts::Taking::begin();
+                        let all: Vec<u32> = (SYNC..SYNC + PASS).collect();
+                        for chunk in all.chunks(PASS_CHUNK) {
+                            let ahead: Vec<(u32, u64)> = chunk.iter().map(|&i| (i, handle(i))).collect();
+                            let mut lookups: Vec<Lookups> = ahead.iter().map(|_| Lookups::kept()).collect();
+                            let _ = heap.mirror_chunk(&ahead, &mut lookups, true);
+                            chunks += 1;
+                        }
+                        waited_ns += taking.end().waited_ns;
+                        round += 1;
+                    }
+                    made_first::TEST_PASS_FIRST.set(None);
+                    (chunks, waited_ns, began.elapsed())
+                })
+            };
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let rate = sync.join().unwrap();
+            let (chunks, waited_ns, took) = pass.join().unwrap();
+            println!(
+                "pass-first bench, {name:<11}: sync {rate:.0} slots/s; the pass {chunks} chunks in {:.2} s, {:.1} us waited for made a chunk, {:.1} % of its time",
+                took.as_secs_f64(),
+                waited_ns as f64 / 1e3 / chunks.max(1) as f64,
+                waited_ns as f64 / 1e9 / took.as_secs_f64() * 100.0,
+            );
+        }
+        TEST_FAST.set(None);
+        assert_eq!(release(title), 0);
     }
 
     /// Micro-benchmark (`VICTORY_MADE_TURNS`): one thread makes 8,192
