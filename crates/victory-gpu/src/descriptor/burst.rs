@@ -128,7 +128,10 @@ fn place_name(i: usize) -> String {
 static STATE: Mutex<State> = Mutex::new(State::new());
 
 /// The last sync's microseconds and slots mirrored ([`synced`]), taken by
-/// its submission ([`submitted`]).
+/// its submission ([`submitted`]). VIcky (`VICTORY_HEAP_SYNC_AT_SUBMIT`,
+/// `super::at_submit`): summed, as a submission may take a sync started
+/// ahead for it and one of its own (a sync that ends just before the
+/// submission before it is counted counts with that one).
 #[cfg(feature = "diagnostics")]
 static LAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
@@ -142,8 +145,8 @@ thread_local! {
 /// and mirrored `slots`.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn synced(us: u64, slots: u64) {
-    LAST[0].store(us, Relaxed);
-    LAST[1].store(slots, Relaxed);
+    LAST[0].fetch_add(us, Relaxed);
+    LAST[1].fetch_add(slots, Relaxed);
 }
 
 /// A submission's sync is over: joined after the submitting thread waited
