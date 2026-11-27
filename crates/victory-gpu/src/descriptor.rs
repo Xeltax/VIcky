@@ -230,6 +230,7 @@ pub(crate) fn sync_heaps_told(asked: Option<&dyn Fn()>) {
     // VIcky: the phases of the `alt` switches of the heap sync's slots.
     host::note_kind::tick();
     host::sync_lean::tick();
+    host::par_mirror::tick();
     #[cfg(feature = "diagnostics")]
     host::note_kind::syncing(true);
     sync_held(asked, started);
@@ -297,6 +298,7 @@ fn sync_held(asked: Option<&dyn Fn()>, started: std::time::Instant) {
     }
     host::note_kind::synced(us, mirrored + drained);
     host::sync_lean::synced(us, mirrored + drained);
+    host::par_mirror::synced(us, mirrored + drained);
     // VIcky: for the line by place in the burst.
     #[cfg(feature = "diagnostics")]
     burst::synced(us, mirrored + drained);
@@ -334,8 +336,11 @@ fn walk_heap(
     page_bytes: &mut Vec<u8>,
 ) -> [u64; 3] {
     let threads = sync_threads();
-    if threads > 0 {
-        return sync_wide(host, ranges, (start, step), mirrored_count, threads);
+    // VIcky (`VICTORY_PARALLEL_MIRROR`, `host::par_mirror`): the pages read
+    // first (here on this thread alone without `VICTORY_HEAP_SYNC_THREADS`),
+    // then their slots made together.
+    if threads > 0 || host::par_mirror::now() {
+        return sync_wide(host, ranges, (start, step), mirrored_count, threads.max(1));
     }
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     for &(range_from, range_end) in ranges {
@@ -493,6 +498,10 @@ fn sync_wide(
     }
     let read = started.elapsed();
     let (mut pages_read, mut looked, mut mirrored) = (0, 0, 0);
+    // VIcky (`VICTORY_PARALLEL_MIRROR`, `host::par_mirror`): every page's
+    // slots, in the same order, made together on several threads.
+    let wide = host::par_mirror::now();
+    let (mut all_due, mut all_records) = (Vec::new(), Vec::new());
     for page in found.iter() {
         let Some((seen, due, records)) = page.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             continue;
@@ -500,10 +509,18 @@ fn sync_wide(
         pages_read += 1;
         looked += seen;
         mirrored += due.len() as u64;
+        if wide {
+            all_due.extend(due);
+            all_records.extend(records);
+            continue;
+        }
         match lean {
             Some(check) => host.mirror_due_lean(&due, &records, check),
             None => host.mirror_due(&due),
         }
+    }
+    if wide {
+        host.mirror_due_par(&all_due, &all_records, lean);
     }
     WIDE[0].fetch_add(read.as_micros() as u64, Relaxed);
     WIDE[1].fetch_add((started.elapsed() - read).as_micros() as u64, Relaxed);
@@ -523,7 +540,7 @@ pub(crate) fn sync_line(frames: f64) {
     // heap page changed.)
     let tried = mirror_try::part(frames);
     // (VIcky: the sync's slots by kind, and the switches of its notes.)
-    let kinds = host::note_kind::part(frames) + &host::sync_lean::part(frames);
+    let kinds = host::note_kind::part(frames) + &host::sync_lean::part(frames) + &host::par_mirror::part(frames);
     if pages > 0 || !tried.is_empty() {
         tracing::info!(
             "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \

@@ -19,6 +19,7 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 pub(crate) mod note_kind;
+pub(crate) mod par_mirror;
 pub(crate) mod sync_lean;
 
 pub(crate) struct HostHeap {
@@ -138,6 +139,10 @@ pub(crate) struct HostHeap {
     /// VIcky (`VICTORY_MIRROR_TRY`, [`super::mirror_try`]): the copied
     /// slots [`HostHeap::mirror_copy`] left to the next drain.
     deferred: super::mirror_try::Deferred,
+    /// VIcky (`VICTORY_PARALLEL_MIRROR`, [`par_mirror`]): `made` in pieces
+    /// for the threads that make slots together, slot `i` made with piece
+    /// `i % par_mirror::PIECES` locked.
+    pieces: par_mirror::Pieces,
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -1375,6 +1380,7 @@ impl HostHeap {
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
             deferred: Default::default(),
+            pieces: par_mirror::Pieces::new(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1999,6 +2005,12 @@ impl HostHeap {
     /// Makes title slot `index`'s host slot null again, as it is before its
     /// view is made: a null view of the kind it held.
     fn unmake(&self, made: &Made, index: u32) {
+        // VIcky (`VICTORY_PARALLEL_MIRROR`): on a thread that makes slots
+        // with others, a slot of another piece than the one being made is
+        // unmade once that piece is let go of.
+        if self.par_stale(index) {
+            return;
+        }
         let Some(host) = made.host(index) else {
             return;
         };
@@ -2411,6 +2423,13 @@ impl HostHeap {
         if !self.kept.split() || (matches!(what, Later::Keep(_)) && !self.kept.low(index)) {
             return Err(what);
         }
+        // VIcky (`VICTORY_PARALLEL_MIRROR`, [`par_mirror`]): on a thread that
+        // makes slots with others, a slot that comes to hold nothing lets go
+        // at once (another thread may make it again, and keep that, before
+        // this chunk ends).
+        if matches!(what, Later::Keep(None)) && par_mirror::in_job(self) {
+            return Err(what);
+        }
         let me = std::ptr::from_ref(self) as usize;
         KEPT_LATER.with_borrow_mut(|later| match later {
             Some(later) if later.heap == me => {
@@ -2780,6 +2799,11 @@ impl HostHeap {
     /// pass's other threads.
     fn mirror_held(&self, alone: bool, slots: &[(u32, u64)], lookups: &mut [Lookups], marks: bool) -> Vec<Option<View>> {
         use crate::draw::heap_pass::parts::{Part, enter};
+        if !alone {
+            // VIcky (`VICTORY_PARALLEL_MIRROR`, [`par_mirror`]): each slot
+            // made with its piece locked.
+            return self.pass_job(|pieces| self.mirror_shared_in(pieces, slots, lookups, marks));
+        }
         let made = self.made_counted(alone);
         slots
             .iter()
@@ -2791,6 +2815,27 @@ impl HostHeap {
                 };
                 let _decide = enter(Part::Decide);
                 self.mirror_made(&made, alone, (index, handle, true, marks), record, lookups)
+            })
+            .collect()
+    }
+
+    /// [`HostHeap::mirror_held`] with `made` held with the pass's other
+    /// threads; with `pieces`, each slot made with its piece locked
+    /// ([`HostHeap::in_piece`]).
+    fn mirror_shared_in(&self, pieces: bool, slots: &[(u32, u64)], lookups: &mut [Lookups], marks: bool) -> Vec<Option<View>> {
+        use crate::draw::heap_pass::parts::{Part, enter};
+        let made = self.made_counted(false);
+        slots
+            .iter()
+            .zip(lookups)
+            .map(|(&(index, handle), lookups)| {
+                let record = {
+                    let _read = enter(Part::Read);
+                    self.record_at(index, handle, true)?
+                };
+                let _decide = enter(Part::Decide);
+                let mut make = || self.mirror_made(&made, false, (index, handle, true, marks), record, lookups);
+                if pieces { self.in_piece(&made, index, make) } else { make() }
             })
             .collect()
     }

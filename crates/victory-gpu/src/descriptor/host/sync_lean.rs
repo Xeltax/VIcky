@@ -161,10 +161,15 @@ pub(crate) fn part(frames: f64) -> String {
 }
 
 /// What a lean chunk leaves for its end, and what it reads once.
-struct Chunk {
+pub(super) struct Chunk {
     /// `VICTORY_HEAP_KEPT_SPLIT`: the keeps of mirrored slots and the
     /// marks are gathered here, as `KeptLater` gathers them.
     split: bool,
+    /// `made` held alone (false: by the round of `VICTORY_PARALLEL_MIRROR`
+    /// for this chunk and the round's others, [`super::par_mirror`]: no
+    /// pool slot of another slot is given back, and a slot that comes to
+    /// hold nothing lets go at once).
+    alone: bool,
     keeps: Vec<(u32, Option<ID3D12Resource>)>,
     marks: Vec<u32>,
     /// Heap map entries to write (entry, value), in order.
@@ -180,10 +185,27 @@ struct Chunk {
 }
 
 impl Chunk {
+    /// A chunk of `heap`'s, `made` held `alone` or for the round's chunks.
+    pub(super) fn new(heap: &HostHeap, alone: bool) -> Self {
+        let split = heap.kept.split();
+        Chunk {
+            split,
+            alone,
+            keeps: Vec::with_capacity(if split { MIRROR_CHUNK } else { 0 }),
+            marks: Vec::with_capacity(if split { MIRROR_CHUNK } else { 0 }),
+            entries: Vec::new(),
+            given: Vec::new(),
+            finished: None,
+            taken: false,
+            keep_views: keep_views(),
+            skip_same: skip_same(),
+        }
+    }
+
     /// [`HostHeap::keep`] of host slot `index`.
     fn keep(&mut self, heap: &HostHeap, index: u32, resource: Option<ID3D12Resource>) {
         let _keep = crate::draw::heap_pass::parts::enter(crate::draw::heap_pass::parts::Part::Keep);
-        if self.split && heap.kept.low(index) {
+        if self.split && heap.kept.low(index) && (self.alone || resource.is_some()) {
             self.keeps.push((index, resource));
         } else {
             heap.kept.replace(index, resource, retire_held);
@@ -227,7 +249,7 @@ impl Chunk {
     }
 
     /// The chunk's end, `made` still held.
-    fn end(&mut self, heap: &HostHeap, made: &Made) {
+    pub(super) fn end(&mut self, heap: &HostHeap, made: &Made) {
         self.flush_map(heap, made);
         self.flush_keeps(heap);
         if !self.marks.is_empty() {
@@ -247,18 +269,7 @@ impl HostHeap {
     /// its record in `records` as the page's copy held it (or, with
     /// `check`, as it is in place now, the ones that differ counted).
     pub(crate) fn mirror_due_lean(&self, due: &[(u32, u64)], records: &[[u32; 3]], check: bool) {
-        let split = self.kept.split();
-        let mut chunk = Chunk {
-            split,
-            keeps: Vec::with_capacity(if split { MIRROR_CHUNK } else { 0 }),
-            marks: Vec::with_capacity(if split { MIRROR_CHUNK } else { 0 }),
-            entries: Vec::new(),
-            given: Vec::new(),
-            finished: None,
-            taken: false,
-            keep_views: keep_views(),
-            skip_same: skip_same(),
-        };
+        let mut chunk = Chunk::new(self, true);
         let mirrored = self.mirrored();
         for (slots, words) in due.chunks(MIRROR_CHUNK).zip(records.chunks(MIRROR_CHUNK)) {
             RETIRE_LATER.set(Some(Vec::new()));
@@ -274,10 +285,7 @@ impl HostHeap {
                     let record = if check { compared(handle, record) } else { record };
                     self.mirror_lean(&made, (index, handle), record, &mut chunk);
                 }
-                COUNTS[0].fetch_add(slots.len() as u64, Relaxed);
-                if mode() == Mode::Alt {
-                    ALT[3].fetch_add(slots.len() as u64, Relaxed);
-                }
+                counted(slots.len());
                 chunk.end(self, &made);
                 drop(made);
             }
@@ -290,7 +298,7 @@ impl HostHeap {
     /// Where the title's descriptors start, for `reclaim`, as
     /// [`HostHeap::record_at`] notes it: from the chunk's first slot past
     /// the identity window (every slot gives the same).
-    fn note_title_start(&self, slots: &[(u32, u64)]) {
+    pub(super) fn note_title_start(&self, slots: &[(u32, u64)]) {
         if self.map.is_none() || self.title_start.load(Relaxed) != 0 {
             return;
         }
@@ -304,7 +312,7 @@ impl HostHeap {
     /// [`HostHeap::mirror_made`] of the heap sync (`made` held alone, not
     /// for a draw, marking) for title slot `index` at `handle`, which held
     /// `record`; with the chunk's ways.
-    fn mirror_lean(&self, made: &Made, (index, handle): (u32, u64), [tag, i, generation]: [u32; 3], chunk: &mut Chunk) {
+    pub(super) fn mirror_lean(&self, made: &Made, (index, handle): (u32, u64), [tag, i, generation]: [u32; 3], chunk: &mut Chunk) {
         use crate::draw::heap_pass::parts::{Count, Part, count, enter};
         let key = u64::from(generation) << 32 | u64::from(i);
         let view = {
@@ -402,6 +410,12 @@ impl HostHeap {
         if let Some(host) = map.assign(title, finished) {
             return Some((host, true));
         }
+        // VIcky (`VICTORY_PARALLEL_MIRROR`): no other slot's pool slot given
+        // back on a round's thread; made once the round's threads are done.
+        if !chunk.alone {
+            ROOM_WANTED.with_borrow_mut(|wanted| wanted.push(title));
+            return None;
+        }
         // `reclaim` makes its changes at once: the chunk's so far first.
         chunk.flush_keeps(self);
         if self.reclaim(made) > 0
@@ -469,6 +483,10 @@ impl HostHeap {
 
     /// [`HostHeap::unmake`], the keep the chunk's.
     fn unmake_lean(&self, made: &Made, index: u32, chunk: &mut Chunk) {
+        // VIcky (`VICTORY_PARALLEL_MIRROR`): as `HostHeap::unmake`.
+        if self.par_stale(index) {
+            return;
+        }
         let Some(host) = made.host(index) else {
             return;
         };
@@ -487,9 +505,18 @@ impl HostHeap {
     }
 }
 
+/// `n` slots mirrored in lean chunks (also by `VICTORY_PARALLEL_MIRROR`'s
+/// rounds, [`super::par_mirror`]).
+pub(super) fn counted(n: usize) {
+    COUNTS[0].fetch_add(n as u64, Relaxed);
+    if mode() == Mode::Alt {
+        ALT[3].fetch_add(n as u64, Relaxed);
+    }
+}
+
 /// `check`: the record at `handle` now, read in place as before; counted
 /// if it is not `copied`, the one the page's copy held.
-fn compared(handle: u64, copied: [u32; 3]) -> [u32; 3] {
+pub(super) fn compared(handle: u64, copied: [u32; 3]) -> [u32; 3] {
     // SAFETY: the handle is a descriptor slot in title memory (as
     // `HostHeap::record_at` reads it).
     let here = unsafe { (handle as *const [u32; 3]).read_unaligned() };

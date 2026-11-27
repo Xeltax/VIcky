@@ -290,6 +290,12 @@ pub(crate) fn syncing(on: bool) {
     SYNCING.set(on);
 }
 
+/// Diagnostics: whether this thread is in a heap sync now ([`syncing`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn syncing_now() -> bool {
+    SYNCING.get()
+}
+
 /// Diagnostics, by the slot's kind before and after: the heap sync's
 /// notes (`was * 3 + now`), then its slots made from the record they hold
 /// already, and those whose record is no view of ours.
