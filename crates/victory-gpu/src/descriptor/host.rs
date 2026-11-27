@@ -18,6 +18,9 @@ use super::slot_map::SlotMap;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+pub(crate) mod note_kind;
+pub(crate) mod sync_lean;
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -122,6 +125,11 @@ pub(crate) struct HostHeap {
     /// was of a plain buffer view ([`plain_buffer`]). Read and written
     /// under `made`'s lock, as every call of `note_buffer` is.
     noted: Vec<std::sync::atomic::AtomicBool>,
+    /// VIcky ([`note_kind`]; empty in sampler heaps): per title slot, what
+    /// its last note left it as: a plain buffer view's, bare (in none of
+    /// the sets: no view, or a view neither of a buffer nor of a texture),
+    /// or another. Read and written under `made`'s lock, as `noted`.
+    kinds: Vec<std::sync::atomic::AtomicU8>,
     /// VIcky (with `noted`): what `strides` holds for each slot, so that a
     /// stride that is already there is not written again. `strides` is
     /// write-combined memory: a write there, followed by the next lock
@@ -1354,6 +1362,10 @@ impl HostHeap {
             noted: (0..if sampler || !skip_same() { 0 } else { titled })
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
                 .collect(),
+            // (A slot never noted is in none of the sets: bare.)
+            kinds: (0..if sampler { 0 } else { titled })
+                .map(|_| std::sync::atomic::AtomicU8::new(note_kind::BARE))
+                .collect(),
             // (The table starts zeroed.)
             strides_held: (0..if sampler || !skip_same() {
                 0
@@ -2124,9 +2136,28 @@ impl HostHeap {
     /// slot as before (its note is the sync's, `marks` set), and so does a
     /// draw's making.
     fn note_buffer_marking(&self, index: u32, view: Option<&View>, seen: bool, marks: bool) -> Vec<u32> {
+        self.note_buffer_into(index, view, seen, marks, None)
+    }
+
+    /// [`HostHeap::note_buffer_marking`]; with `sink` (VIcky,
+    /// `VICTORY_HEAP_SYNC_LEAN`, [`sync_lean`]) its marks go there, for the
+    /// end of the chunk the caller is at, as [`KeptLater`] takes them.
+    fn note_buffer_into(
+        &self,
+        index: u32,
+        view: Option<&View>,
+        seen: bool,
+        marks: bool,
+        mut sink: Option<&mut Vec<u32>>,
+    ) -> Vec<u32> {
         if self.sampler {
             return Vec::new();
         }
+        // VIcky ([`note_kind`]): what the slot's last note left it as, and
+        // what this one makes it.
+        let (was, now) = (self.kind(index), note_kind::of(view));
+        #[cfg(feature = "diagnostics")]
+        note_kind::noted(was, now);
         // VIcky (`VICTORY_HEAP_BUFFERS_SKIP_SAME=1`): the slot's last note
         // was of a plain buffer view and this one is too. That note took
         // the slot out of the queue of textures and out of the spans of
@@ -2135,14 +2166,19 @@ impl HostHeap {
         // takes it out of the third. What is left to do is what differs:
         // the stride, and the mark that the slot was written since the
         // pass over buffer views last looked.
-        let plain = !self.noted.is_empty() && view.is_some_and(plain_buffer);
+        let plain = !self.noted.is_empty() && now == note_kind::PLAIN;
         if plain && self.noted_plain(index) {
             self.note_stride(index, view.and_then(view_stride));
-            self.mark_changed(index, marks);
+            self.mark_into(index, marks, sink);
             FAST[Fast::NotesSkipped as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if check_now() {
                 self.check_noted(index);
             }
+            return Vec::new();
+        }
+        // VIcky (`VICTORY_HEAP_NOTE_KIND`): from and to a plain buffer
+        // view's or a bare slot, what differs alone.
+        if self.note_by_kind(index, view, (was, now), marks, sink.as_deref_mut()) {
             return Vec::new();
         }
         // Measured for the texture side of the same gap (textures a shader
@@ -2214,13 +2250,23 @@ impl HostHeap {
             buffers.remove(&index)
         };
         if was {
-            self.mark_changed(index, marks);
+            self.mark_into(index, marks, sink);
         }
         drop(buffers);
         // (A note of any other kind, or of none, makes the next one a full
         // one again.)
         self.set_noted(index, plain);
+        self.set_kind(index, now);
         stale
+    }
+
+    /// [`HostHeap::mark_changed`], or with `sink` (and `marks`) the mark
+    /// left there ([`HostHeap::note_buffer_into`]).
+    fn mark_into(&self, index: u32, marks: bool, sink: Option<&mut Vec<u32>>) {
+        match sink {
+            Some(sink) if marks => sink.push(index),
+            _ => self.mark_changed(index, marks),
+        }
     }
 
     /// Marks title slot `index` as written since the pass over buffer views
@@ -2608,9 +2654,23 @@ impl HostHeap {
     pub(crate) fn copied_due(
         &self,
         slots: std::ops::Range<u64>,
+        at: (u64, u64),
+        from: usize,
+        page: &[u8],
+    ) -> (u64, Vec<(u32, u64)>) {
+        self.copied_due_with(slots, at, from, page, None)
+    }
+
+    /// [`HostHeap::copied_due`]; with `records` (VIcky,
+    /// `VICTORY_HEAP_SYNC_LEAN`, [`sync_lean`]) also each due slot's record
+    /// (its first three words) as the page held it, in the same order.
+    pub(crate) fn copied_due_with(
+        &self,
+        slots: std::ops::Range<u64>,
         (start, step): (u64, u64),
         from: usize,
         page: &[u8],
+        mut records: Option<&mut Vec<[u32; 3]>>,
     ) -> (u64, Vec<(u32, u64)>) {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
@@ -2650,6 +2710,10 @@ impl HostHeap {
                 }
                 *last = print;
                 due.push((index as u32, handle));
+                if let Some(records) = records.as_deref_mut() {
+                    let word = |w: usize| u32::from_le_bytes([0, 1, 2, 3].map(|b| record.get(w * 4 + b).copied().unwrap_or(0)));
+                    records.push([word(0), word(1), word(2)]);
+                }
             }
         }
         (looked, due)
@@ -2983,6 +3047,8 @@ impl HostHeap {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             count(Count::NotOurs);
+            #[cfg(feature = "diagnostics")]
+            note_kind::slot(note_kind::Slot::NotOurs);
             self.empty_slot(made, index, for_draw, marks);
             return None;
         };
@@ -3071,6 +3137,8 @@ impl HostHeap {
             }
         } else {
             count(Count::Same);
+            #[cfg(feature = "diagnostics")]
+            note_kind::slot(note_kind::Slot::Same);
         }
         Some(view)
     }
@@ -3790,7 +3858,9 @@ fn placed_texture_view(view: &View) -> bool {
 
 /// Whether `view` is a buffer view, with a stride, that [`HostHeap::note_buffer`]
 /// does not take for a texture's: what it notes of such a view is the same
-/// for all of them but the stride.
+/// for all of them but the stride. (Tests: the note tells it by
+/// [`note_kind::of`], [`note_kind::PLAIN`].)
+#[cfg(test)]
 fn plain_buffer(view: &View) -> bool {
     view_stride(view).is_some()
         && !matches!(view, View::Shader(r, _) if crate::resource::buffer_bytes(*r as crate::object::This).is_none())
