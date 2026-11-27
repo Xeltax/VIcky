@@ -241,6 +241,15 @@ pub(crate) enum C {
     FillUs,
     CopyStepUs,
     AskAheadUs,
+    /// The light refresh (`VICTORY_LIGHT_REFRESH`, `crate::watch::light`):
+    /// askings of view memory answered by the bits of their blocks, askings
+    /// that went to the guards, holes known by their bits found filled with
+    /// nobody telling, and updates of host copies that found nothing new
+    /// with nothing asked.
+    LightBits,
+    LightGuards,
+    LightFilled,
+    LightNothingNew,
 }
 const COUNTERS: usize = 128;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1216,11 +1225,24 @@ fn split_clause(c: &[f64]) -> String {
     } else {
         String::new()
     };
+    let light = if crate::watch::light_kept() {
+        format!(
+            "; light refresh (VICTORY_LIGHT_REFRESH): {:.0} updates found nothing new with nothing asked, \
+             {:.0} askings of view memory answered by the bits of their blocks, {:.0} went to the guards, \
+             {:.2} holes found filled with nobody telling",
+            c[C::LightNothingNew as usize],
+            c[C::LightBits as usize],
+            c[C::LightGuards as usize],
+            c[C::LightFilled as usize],
+        )
+    } else {
+        String::new()
+    };
     format!(
         "copies split: fills {:.2} ms, title copies {:.2} ms, askings ahead {:.2} ms, {:.0} updates of host copies \
          {:.2} ms ({:.0} before a shader write {:.2} ms{front}; inside them {:.0} askings of the journal or the guards \
          {:.2} ms, pages found written copied {:.2} ms); of all askings (textures' too) {:.0} answered by the journal, \
-         collecting its pages {:.2} ms",
+         collecting its pages {:.2} ms{light}",
         ms(c[C::FillUs as usize]),
         ms(c[C::CopyStepUs as usize]),
         ms(c[C::AskAheadUs as usize]),
