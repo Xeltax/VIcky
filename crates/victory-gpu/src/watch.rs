@@ -2736,18 +2736,18 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
-    let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
+    let absent: Vec<usize> = g.absent.range(range).copied().collect();
     for block in absent {
         g.absent.remove(&block);
         forget_hole(&mut g, block);
     }
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
-    for block in blocks {
-        g.protected.remove(&block);
-        g.clean.remove(block);
-        // What it shows is new ([`PUBLISHED`]).
-        PUBLISHED.clear(block);
-    }
+    // Back to read-write before the guard is forgotten: the title can write
+    // its view as soon as the runtime has given it the word, and a block left
+    // read-only with no guard to open it would fault into no handler (the
+    // same window `look_at_holes` avoids by taking the mapping lock). What it
+    // shows is new ([`PUBLISHED`], cleared there too). After
+    // fxceless/victory-fork#1447.
+    open_here(&mut g, at, at.saturating_add(len));
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
@@ -3277,6 +3277,28 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// A guard made between a view's mapping and the runtime's word about it
+    /// is forgotten by that word; the page must get its write access back in
+    /// the same step, or the title's next plain write to its own view faults
+    /// with no guard to open it (fxceless/victory-fork#1447).
+    #[test]
+    fn a_guard_forgotten_by_the_remap_gives_its_page_back() {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        const SIZE: usize = BLOCK;
+        let (section, view, other) = two_views(SIZE);
+        assert_eq!(guard(view, view + SIZE), Some(vec![view / PAGE]));
+        // The runtime mapped the pages and only now tells the guard.
+        title_memory_remapped(view, SIZE);
+        crate::inplace::title_memory_view(view, SIZE, section, 0);
+        // SAFETY: plain data, filled in by the query about the mapped view.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(view as *const _, &mut info, size_of_val(&info)) };
+        assert_eq!(n, size_of_val(&info));
+        assert_eq!(info.Protect, PAGE_READWRITE);
+        drop_views(section, &[view, other], SIZE);
     }
 
     /// A write of the runtime's own, told at one view of the pages
