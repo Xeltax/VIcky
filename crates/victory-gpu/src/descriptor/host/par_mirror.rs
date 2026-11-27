@@ -541,9 +541,13 @@ impl HostHeap {
             return;
         }
         let started = std::time::Instant::now();
-        let chunks = crew_size() + 1;
+        // VIcky (`VICTORY_SYNC_FINE`, `super::super::SYNC_FINE`): chunks of
+        // `SYNC_SLOTS_FINE` slots, which the crew shares, not one a thread.
+        let fine = crate::descriptor::SYNC_FINE.on();
         for (n, round) in due.chunks(ROUND).enumerate() {
             let words = lean.map(|_| &records[n * ROUND..n * ROUND + round.len()]);
+            let chunks =
+                if fine { round.len().div_ceil(crate::descriptor::SYNC_SLOTS_FINE) } else { crew_size() + 1 };
             self.mirror_round(round, words, lean, chunks);
         }
         if mode() == Mode::Alt {

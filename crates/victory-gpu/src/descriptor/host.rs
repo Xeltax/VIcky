@@ -131,6 +131,13 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// VIcky (`VICTORY_SPANS_QUICK`, [`spans_quick`]; empty without it): a
+    /// bit per title slot that may be in `placed` (put there under its lock
+    /// when the slot is noted there, taken out when it is forgotten there;
+    /// a slot another's view made stale keeps its bit, which says only
+    /// "may"). A write of no placed texture view to a slot without its bit
+    /// needs nothing of `placed`.
+    spanned: Vec<std::sync::atomic::AtomicU64>,
     /// VIcky (`VICTORY_HEAP_BUFFERS_SKIP_SAME=1`; empty without it): per
     /// title slot, whether the last [`HostHeap::note_buffer`] of the slot
     /// was of a plain buffer view ([`plain_buffer`]). Read and written
@@ -713,6 +720,27 @@ static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
 /// memory outside is none of the texture pass's business.
+/// VIcky: whether a slot's write of no placed texture view leaves the
+/// spans of placed textures (`HostHeap::placed`) and their lock alone when
+/// the slot is not in them (`VICTORY_SPANS_QUICK=1|alt`; off by default,
+/// every write takes the lock, as before). Port of Belobug a284ca74, where
+/// it is on by default: every record the heap sync mirrors went by that
+/// one lock of the heap, from all its threads, with the title's own threads
+/// and the texture passes (4 of 16 ms of the sync's wait there, run
+/// city4). What is done is the same: forgetting a slot that is not there
+/// does nothing. Here `VICTORY_HEAP_NOTE_KIND` already spares the lock for
+/// notes from and to plain buffer views and bare slots; this spares it for
+/// the other writes of slots that hold no placed texture view (views of
+/// texture objects, constant views, typed and structured buffer views).
+pub(crate) static SPANS_QUICK: crate::alt::Alt = crate::alt::Alt::new(
+    "VICTORY_SPANS_QUICK",
+    "writes of heap slots of no placed texture view leave the spans' lock alone when the slot is not in them",
+);
+
+/// Since the last sync line, with [`SPANS_QUICK`] set: writes that left the
+/// spans alone, writes that took their lock.
+pub(crate) static SPANS_QUICK_COUNTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(u64::MAX),
     std::sync::atomic::AtomicU64::new(0),
@@ -1377,6 +1405,9 @@ impl HostHeap {
             },
             noted: (0..if sampler || !skip_same() { 0 } else { titled })
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
+            spanned: (0..if sampler || !(SPANS_QUICK.set() || cfg!(test)) { 0 } else { (titled as usize).div_ceil(64) })
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect(),
             // (A slot never noted is in none of the sets: bare.)
             kinds: (0..if sampler { 0 } else { titled })
@@ -2235,8 +2266,21 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        // VIcky (`VICTORY_SPANS_QUICK`, port of Belobug a284ca74): a write of
+        // no placed texture view to a slot that is not in the spans leaves
+        // their lock alone (forgetting a slot that is not there does
+        // nothing). Whether the slot's bit is set changes only here, under
+        // the slot's own lock (`made`, or its piece with
+        // `VICTORY_PARALLEL_MIRROR`), as every write of the slot.
+        let quick = !self.spanned.is_empty() && placed_view.is_none() && !self.in_spans(index) && SPANS_QUICK.on();
+        let stale = if quick {
+            SPANS_QUICK_COUNTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Vec::new()
+        } else {
             use std::sync::atomic::Ordering::Relaxed;
+            if !self.spanned.is_empty() {
+                SPANS_QUICK_COUNTS[1].fetch_add(1, Relaxed);
+            }
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let span = placed_view.and_then(|(resource, start, first)| {
                 Some((start, start.saturating_add(placed.bytes(resource)?), first))
@@ -2246,12 +2290,14 @@ impl HostHeap {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
                     placed.rule = stale_rule();
+                    self.set_spanned(index, true);
                     let stale = placed.note(index, start, end, !seen);
                     placed.shows(index, first);
                     stale
                 }
                 None => {
                     placed.forget(index);
+                    self.set_spanned(index, false);
                     Vec::new()
                 }
             }
@@ -2281,6 +2327,29 @@ impl HostHeap {
         self.set_noted(index, plain);
         self.set_kind(index, now);
         stale
+    }
+
+    /// VIcky (`VICTORY_SPANS_QUICK`): whether title slot `index` may be in
+    /// the spans of placed textures ([`HostHeap::spanned`]; a slot past
+    /// the set may).
+    fn in_spans(&self, index: u32) -> bool {
+        let bit = 1u64 << (index % 64);
+        self.spanned
+            .get(index as usize / 64)
+            .is_none_or(|w| w.load(std::sync::atomic::Ordering::Acquire) & bit != 0)
+    }
+
+    /// VIcky (`VICTORY_SPANS_QUICK`): title slot `index` is (`true`) or is
+    /// no longer in the spans; under the lock of `placed`.
+    fn set_spanned(&self, index: u32, there: bool) {
+        let bit = 1u64 << (index % 64);
+        if let Some(w) = self.spanned.get(index as usize / 64) {
+            if there {
+                w.fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
+            } else {
+                w.fetch_and(!bit, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
     }
 
     /// [`HostHeap::mark_changed`], or with `sink` (and `marks`) the mark
@@ -6148,6 +6217,34 @@ mod fast_tests {
 
     fn release(object: crate::object::This) -> u32 {
         crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(object, 0x10)(object)
+    }
+
+    /// VIcky (`VICTORY_SPANS_QUICK`, after Belobug a284ca74's test): every
+    /// slot in the spans of placed textures has its bit (what makes the
+    /// quick way safe: a slot without one is not there); a slot forgotten
+    /// there loses it; one another's view made stale keeps it ("may").
+    #[test]
+    fn the_spanned_bits_hold_every_slot_in_the_spans() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let holds = |heap: &HostHeap| heap.placed.lock().unwrap().by_slot.keys().all(|&slot| heap.in_spans(slot));
+        let at = 0x7fec_0000_0000u64;
+        assert!(heap.note_buffer(1, Some(&texture_view(at)), false).is_empty());
+        assert!(heap.in_spans(1) && !heap.in_spans(2) && holds(&heap));
+        // A texture starting in the first one's first 4 KiB: slot 1 is stale,
+        // out of the spans, and keeps its bit.
+        assert_eq!(heap.note_buffer(2, Some(&texture_view(at + 0x100)), false), [1]);
+        assert!(heap.in_spans(1) && heap.in_spans(2) && holds(&heap));
+        assert!(!heap.placed.lock().unwrap().by_slot.contains_key(&1));
+        // Written with no view, or with a buffer view: forgotten, bit cleared.
+        assert!(heap.note_buffer(2, None, false).is_empty());
+        assert!(heap.note_buffer(1, Some(&buffer_view(at + 0x10_0000, 0x1_0000, 0, 4)), false).is_empty());
+        assert!(!heap.in_spans(1) && !heap.in_spans(2) && holds(&heap));
+        assert!(heap.placed.lock().unwrap().by_slot.is_empty());
+        // A slot never in the spans stays without its bit.
+        assert!(heap.note_buffer(3, None, false).is_empty());
+        assert!(!heap.in_spans(3));
     }
 
     /// A placed structured buffer view of `width` bytes at `address`:

@@ -462,7 +462,11 @@ fn sync_wide(
     type Found = Option<(u64, Vec<(u32, u64)>, Vec<[u32; 3]>)>;
     let pages = Arc::new(pages);
     let found: Arc<Vec<Mutex<Found>>> = Arc::new((0..pages.len()).map(|_| Mutex::new(None)).collect());
-    let groups = threads.clamp(1, pages.len());
+    // VIcky (`VICTORY_SYNC_FINE`, [`SYNC_FINE`]): with the walk spread,
+    // jobs of [`SYNC_PAGES_FINE`] pages each, which the wide threads share,
+    // instead of one job per thread.
+    let fine = threads > 1 && SYNC_FINE.on();
+    let groups = if fine { pages.len().div_ceil(SYNC_PAGES_FINE) } else { threads.clamp(1, pages.len()) };
     let per = pages.len().div_ceil(groups);
     let heap_at = std::ptr::from_ref(host) as usize;
     let jobs: Vec<Box<dyn FnOnce() + Send>> = (0..groups)
@@ -528,6 +532,48 @@ fn sync_wide(
     [pages_read, looked, mirrored]
 }
 
+/// VIcky: finer jobs for the heap sync's threads (`VICTORY_SYNC_FINE=1|alt`;
+/// off by default). Port of Belobug a284ca74 (there 2 pages and 64 records
+/// a job, against 8 and 256): a round for a submission finds a dozen pages
+/// or so, and by eight a job that was two jobs on two of six threads while
+/// the submission waited for the round (2 to 3.4 ms at a time, run city4).
+/// Here, with the walk spread (`VICTORY_HEAP_SYNC_THREADS` of 2 or more),
+/// the pages are read in jobs of [`SYNC_PAGES_FINE`] that the wide threads
+/// share, not in one job per thread; and with `VICTORY_PARALLEL_MIRROR` a
+/// round's slots are made in chunks of [`SYNC_SLOTS_FINE`], not one chunk
+/// per thread (`host::par_mirror`). What is read and made is the same;
+/// only the cut differs.
+#[cfg(windows)]
+pub(crate) static SYNC_FINE: crate::alt::Alt =
+    crate::alt::Alt::new("VICTORY_SYNC_FINE", "the heap sync's threads take finer jobs (2 pages, 64 slots)");
+
+/// Pages a job of the spread walk with [`SYNC_FINE`].
+#[cfg(windows)]
+const SYNC_PAGES_FINE: usize = 2;
+
+/// Slots a chunk of the parallel mirroring with [`SYNC_FINE`].
+#[cfg(windows)]
+pub(crate) const SYNC_SLOTS_FINE: usize = 64;
+
+/// VIcky: the sync line's part for `VICTORY_SYNC_FINE` and
+/// `VICTORY_SPANS_QUICK` (empty while neither is set).
+#[cfg(windows)]
+fn fine_part(frames: f64) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [quick, locked] = [0, 1].map(|i| host::SPANS_QUICK_COUNTS[i].swap(0, Relaxed) as f64 / frames);
+    let mut out = String::new();
+    if SYNC_FINE.set() {
+        out += &format!(" (VICTORY_SYNC_FINE {}: jobs of {SYNC_PAGES_FINE} pages, chunks of {SYNC_SLOTS_FINE} slots)", SYNC_FINE.said());
+    }
+    if host::SPANS_QUICK.set() {
+        out += &format!(
+            " (VICTORY_SPANS_QUICK {}: per frame {quick:.0} writes of slots left the spans of placed textures alone,              {locked:.0} took their lock)",
+            host::SPANS_QUICK.said()
+        );
+    }
+    out
+}
+
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
 #[cfg(windows)]
@@ -553,7 +599,7 @@ pub(crate) fn sync_line(frames: f64) {
             wide_part(frames),
             beside,
             tried,
-            kinds,
+            kinds + &fine_part(frames),
         );
     }
     // VIcky (diagnostics): the sync and its join by the submission's place
