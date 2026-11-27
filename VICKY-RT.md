@@ -674,6 +674,10 @@ A thread the title pinned to processors of the other CCD only keeps its pinning 
 
 `lot4 probe P` (seven kinds of line), `lot 4 probes on` at the start, `threads placed by CCD` with the switch. Read them in this order: P1 and P2 together (does the mirror pay?), P3 (idea 3), P4 (idea 4), P7 and the `=alt` phases (CCD placement), P5 and P6 for context.
 
+## `VICTORY_COMPOSITE_GRADE_EDGE=1` (off by default; port of Cuebert 818c5a9)
+
+Black squares and specks in the water, such as the sun's glint with ray tracing on, come from the Composite pixel shader's first colour-grading lookup (a 33-cubed LUT, sampler constants `0x0092 0x00c00000 0x14500000 0`): coordinates near the cube's faces sample past the edge texels. With the switch at exactly `1`, the translator clamps that lookup's three coordinates to `[0.5/33, 32.5/33]` (the edge texel centres), so linear sampling stays inside the LUT. The ACES lookup after it is untouched. It applies to one pixel shader only (DXBC digest `348a8c9e...fc6a`, 4808-byte DXIL part, sample at machine offset `0xefc`); if that sample no longer has the reviewed clamp sampler the shader fails to translate rather than being changed silently. Code: `lower_with_grade_edge` and the image sample in `crates/victory-shader/src/emit/lower.rs`, the gate `grade_edge_enabled` in `emit/mod.rs`. The switch is part of the shader cache fingerprint (`build.rs` lists every `"VICTORY_..."` string), so **rewarm the shader cache** after changing it. Credit: Cuebert/VIctory `818c5a9` ("Publish F895 player source snapshot"); read only, nothing from that repo was run.
+
 ## Roadmap: from about 3.5 fps toward 15–20
 
 **Why it is possible.** The console runs this title at 30 fps on a 12-TFLOPS RDNA2 GPU. An RTX 4080 has about 49 TFLOPS, and the title's CPU code is x86-64 that runs natively. RT10's frame is about 280 ms against the console's 33 ms: the gap is our translation, not the hardware. shadPS4 (AMD GPU, unified memory, raw command buffers) shows that this class of runtime can reach playable speeds.

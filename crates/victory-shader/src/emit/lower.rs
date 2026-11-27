@@ -99,10 +99,18 @@ enum Stop {
     Fail(ShaderError),
 }
 
+#[cfg(test)]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with_grade_edge(parts, false)
+}
+
+pub(crate) fn lower_with_grade_edge(
+    parts: &Parts,
+    composite_grade_edge: bool,
+) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, composite_grade_edge).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -194,6 +202,7 @@ struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
+    composite_grade_edge: bool,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
@@ -1351,7 +1360,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, composite_grade_edge: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1614,6 +1623,7 @@ impl<'a> Lower<'a> {
             s,
             x,
             bad,
+            composite_grade_edge,
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
             floats: HashMap::new(),
@@ -10281,6 +10291,22 @@ impl<'a> Lower<'a> {
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
                 let x = addr_packed(self, coord_base, k)?;
                 *slot = to_float(self, x);
+            }
+            if self.composite_grade_edge && inst.machine.offset == 0xefc {
+                if name != "image_sample_lz" || kind != 4 || *unorm || *a16
+                    || !matches!(ss, Source::Constant(words)
+                        if words == &[0x0092, 0x00c00000, 0x14500000, 0])
+                {
+                    return Err("the Composite grading lookup no longer has the reviewed clamp sampler");
+                }
+                // Keep linear sampling between the edge texel centers of the
+                // first 33^3 grade LUT. The subsequent ACES lookup is separate.
+                let lo = self.s.m.f32((0.5f32 / 33.0).to_bits());
+                let hi = self.s.m.f32((32.5f32 / 33.0).to_bits());
+                for coord in &mut cs[..3] {
+                    let inside = self.binary(35, *coord, lo);
+                    *coord = self.binary(36, inside, hi);
+                }
             }
             if kind == 5 {
                 let dir = self.cube_direction(cs[0], cs[1], cs[2]);
