@@ -89,7 +89,7 @@ This work is for making the title's compute ray tracing (the BVH structure build
   - Not done from noaclr's commit: the draws, copies and texture passes still take `made` whole (here `made` also holds the heap map's pool, whose `reclaim` gives back other slots' pool slots, and the read lock of the pass's threads), so the pieces only part the threads that make slots together; noaclr's chunks run on its wide threads, ours on threads of their own (the sync's) and on the pass's own threads (`VICTORY_HEAP_PASS_THREADS`' machinery).
 - **The constants heap in place (2026-11-27; `VICTORY_INPLACE_CONSTANTS=1`, opt-in, not measured yet; port of fxceless/victory-fork bcc542151d).** The title's ~174 MB constants heap (one title buffer, at 0x3de00000 in fxceless' runs: the per-draw constants, which the skinning passes also write through one unordered view of all of it) is by default a copy in the card's memory: every submission refreshes it from title memory (write-watch askings, pages copied in), sends the changed ranges up, compares the declared shader-write ranges on the card by hash, and fetches and merges what differs. With the switch, a title buffer of `VICTORY_INPLACE_CONSTANTS_MIN_MB` (64) or more that lies below 4 GiB in view memory, as one run of a section, and every title buffer inside it, become buffers placed in a host heap opened (`OpenExistingHeapFromAddress1`) on a view of our own of the same section pages. The card then reads and writes the title's bytes where the title writes them, and nothing is refreshed, sent, hashed, compared, fetched or merged for it. The risk is the card's reads crossing the bus (fxceless, run 75: a skinning list took 4.5 ms in the card's memory and 50.5 ms over the bus), so the card's time can grow while the submitting thread's shrinks.
   - Preconditions (otherwise the heap stays a copy, and the log says why):
-    - `VICTORY_SECTION_MB` unset (one section for each allocation of physical pages, as in fxceless' runs). With `=2` (the "also recommended" loading switch) the heap's pages lie in some 90 sections of 2 MiB and it is turned down as view memory "from several places or sections"; a larger value holds it whole only if no section boundary falls inside it. The loading gain of `=2` is then lost for that run (steady fps was unchanged by it).
+    - The heap one run of one section. Without `VICTORY_PAGE_PLACE=1` that takes `VICTORY_SECTION_MB` unset (one section for each allocation of physical pages, as in fxceless' runs), and even then our runs found it scattered (the boat mission below). With `=2` (the "also recommended" loading switch) the heap's pages lie in some 90 sections of 2 MiB and it is turned down as view memory "from several places or sections"; a larger value holds it whole only if no section boundary falls inside it. **With `VICTORY_PAGE_PLACE=1`** ("Physical pages placed at their first mapping", below) the heap is one run of the one section below 4 GiB, with or without `VICTORY_SECTION_MB`.
     - Not with `VICTORY_FENCE_SENT=1` while submissions are sent ahead (the relay or `VICTORY_LATE_WAIT`). The title is then told a frame begins before the frame before's lists have run, and may rewrite constants those lists still read in place (a copy in the card's memory is refreshed behind them on the queue). The switch is turned down at start with a warning, so measure without `VICTORY_FENCE_SENT` on both sides of the A/B.
     - The heap is opened only while no title buffer in its pages has a copy yet: one memory, one form. If a buffer inside it was copied first, the log says `a title buffer in its pages has a copy already`.
     - `VICTORY_INPLACE=2` must still not be combined with late wait (unchanged; that is the private-memory stage, not this switch).
@@ -121,7 +121,7 @@ This work is for making the title's compute ray tracing (the BVH structure build
 
 **Also recommended:** `VICTORY_SECTION_MB=2` (loading) and `VICTORY_CARD_BUFFERS_MB=2048 VICTORY_CARD_BUFFERS_MIN_KB=64` (both above).
 
-**Chapter-1 boat mission with ray tracing (2026-11-27, verified on an RTX 4080, Series X, RT on):** with this main, a save in the boat mission loads, the boat floats and the mission plays, with no extra switch: the texture copy-back (`VICTORY_TEXTURE_BACK`, on by default) gives the title's physics the water it computes on the card, and the builder's box rehydration programs' parent-link stores are left out by default (`VICTORY_BVH_LINK_STORES=keep` keeps them; with them the title crashed on that save's loading screen). Add `VICTORY_LATE_WAIT=2` in water scenes (at the relay's default stage 3 testers elsewhere saw the water surface vanish for single frames); `VICTORY_LATE_WATER=1` at stage 3 is the narrower wait to try instead, not measured yet (water section below). Measured: 480 s on that save, RT on, the fps set below plus `VICTORY_LATE_WAIT=2 VICTORY_REAPER=1`: no crash, 7.34 fps true mean of the last 12 lines (lines 7.8-8.5, about 122-127 ms a frame: preparing ~68, copy-back ~23-27, a wait for the card of ~17 ms that is the copy-back's read-back). The prologue cell with the same build: 5.32 fps true (a slow stretch mid-run; last lines 6.3-7.5), about level with 6.91 before the batch. `VICTORY_INPLACE_CONSTANTS` does not place the constants heap here ("view memory from several places") even without `VICTORY_FENCE_SENT`/`VICTORY_SECTION_MB`: leave it off.
+**Chapter-1 boat mission with ray tracing (2026-11-27, verified on an RTX 4080, Series X, RT on):** with this main, a save in the boat mission loads, the boat floats and the mission plays, with no extra switch: the texture copy-back (`VICTORY_TEXTURE_BACK`, on by default) gives the title's physics the water it computes on the card, and the builder's box rehydration programs' parent-link stores are left out by default (`VICTORY_BVH_LINK_STORES=keep` keeps them; with them the title crashed on that save's loading screen). Add `VICTORY_LATE_WAIT=2` in water scenes (at the relay's default stage 3 testers elsewhere saw the water surface vanish for single frames); `VICTORY_LATE_WATER=1` at stage 3 is the narrower wait to try instead, not measured yet (water section below). Measured: 480 s on that save, RT on, the fps set below plus `VICTORY_LATE_WAIT=2 VICTORY_REAPER=1`: no crash, 7.34 fps true mean of the last 12 lines (lines 7.8-8.5, about 122-127 ms a frame: preparing ~68, copy-back ~23-27, a wait for the card of ~17 ms that is the copy-back's read-back). The prologue cell with the same build: 5.32 fps true (a slow stretch mid-run; last lines 6.3-7.5), about level with 6.91 before the batch. `VICTORY_INPLACE_CONSTANTS` does not place the constants heap here ("view memory from several places") even without `VICTORY_FENCE_SENT`/`VICTORY_SECTION_MB`: leave it off, or try it with `VICTORY_PAGE_PLACE=1` and without `VICTORY_FENCE_SENT` (roadmap B2, section "Physical pages placed at their first mapping").
 
 **Recommended since 2026-11-27 evening (lots 2-3 and the foxhound/trustno1/Belobug port batch; RTX 4080, Series X, RT on):** the fps set below plus `VICTORY_SYNC_FINE=1 VICTORY_CCD_PLACE=1`, and `VICTORY_COMPOSITE_GRADE_EDGE=1` for the picture. In water scenes, use no `VICTORY_LATE_WAIT` and no water set (`VICTORY_WAVE_PAIRS_ONLY`/`VICTORY_LDS_FLAGS` for the water programs).
 
@@ -673,6 +673,86 @@ A thread the title pinned to processors of the other CCD only keeps its pinning 
 ### What to grep in the probe run
 
 `lot4 probe P` (seven kinds of line), `lot 4 probes on` at the start, `threads placed by CCD` with the switch. Read them in this order: P1 and P2 together (does the mirror pay?), P3 (idea 3), P4 (idea 4), P7 and the `=alt` phases (CCD placement), P5 and P6 for context.
+
+## Physical pages placed at their first mapping (`VICTORY_PAGE_PLACE=1`, opt-in, not measured yet; roadmap B2)
+
+Branch `fx-main-pageplace`. P4 above, made real, so that `VICTORY_INPLACE_CONSTANTS` can open the constants heap.
+
+**Why.** Today a physical page's place in a section is fixed when the title allocates it (`make_pages` in `crates/victory-hle/src/modules/xmem.rs`), and the title maps its pages in an order of its own. A buffer it maps at consecutive addresses therefore shows pages from scattered places. `VICTORY_INPLACE_CONSTANTS` needs the heap to be one run of one section: a host heap over two views side by side is refused (`OpenExistingHeapFromAddress1`, `E_INVALIDARG`, tried on the software adapter). So it turned the heap down as "view memory from several places".
+- In the boat save's probe run (P2, `VICTORY_SECTION_MB=2`), P4 counted 113,446 pages placed at their address and none elsewhere.
+- The 174 MB constants heap at 0x25380000 was scattered in 88 runs today, and one run with the simulated places. So was the 64 MB buffer at 0x285c20000 (33 runs), but it lies above 4 GiB, where the in-place switch does not look.
+
+**What the switch does.** When the title maps a physical page for the first time (`XMemMapPhysicalPages`, its scatter form included), the page takes the place its address names in a section of placement, and keeps that place for good.
+- **Windows.** The address space is cut into windows, each a section of its own, made when the first page is placed in it (reserved, committed page by page when mapped, as today).
+  - Below 4 GiB there is one window of 4 GiB. Everything the title maps there (its 32-bit graphics memory, where the constants heap lies) is one section, and a buffer mapped there at consecutive addresses is one run of it, whatever the order of the calls.
+  - Above 4 GiB the windows are `VICTORY_SECTION_MB` MiB if that is set, so its loading gain is kept (Windows' large-page worker holds a section's lock while it walks that section's views). Without it they are 4 GiB.
+  - A reserved section costs no memory until it is mapped: eight sections of 4 GiB moved the kernel's paged pool by 0.0 MB on this PC.
+  - A page first mapped somewhere else (a pool view, say) takes its place there, in that address's window. A buffer whose pages were first mapped in order above 4 GiB with `VICTORY_SECTION_MB=2` is therefore one run per 2 MiB window only, and would still be turned down; the line's largest run and the constants heap's `the last ...: <why>` tell.
+- **Aliases.** A page mapped at a second address (or again after an unmap, or by the GPU's page-mapping copies) shows the same place: an alias, as before of its allocation's place. Pages mapped again in the same order at another address are one view again.
+- **Collisions.** If another page already has the place (it was mapped there first and is still allocated, or freed but still shown somewhere), the page keeps the place its allocation gave it, as without the switch. Counted.
+- **Written first.** A page written before its first mapping (a DirectStorage destination not mapped yet) keeps its allocation's place and its bytes. Counted.
+- **Freed and reused.** A freed page's place is given back when no view shows it any more. A page placed there later is zeroed at its first mapping, so a new page still reads zero, as a page of a new section does. Counted as "given again".
+- An allocation's own sections are still made (they hold the pages that are not placed). An allocation's section closes once all its pages are placed elsewhere or freed, and a window's section once no page or view is left in it; the GPU side is told of both, as with `VICTORY_SECTION_MB`.
+
+**With `VICTORY_INPLACE_CONSTANTS=1`.** The heap's pages are taken to be first mapped at the heap's own addresses: in P2, when its copy was made, P5 found all its 2,784 pages shown at one address only, and P4 found them one run. So the heap is one run of the section below 4 GiB, and the existing opening (a view of ours of that run, `OpenExistingHeapFromAddress1`) takes it with no other change. The order and fence rules of that switch's section stay as they are:
+- `VICTORY_SECTION_MB=2` no longer turns the heap down: with the placement it only cuts the windows above 4 GiB.
+- `VICTORY_FENCE_SENT=1` with submissions sent ahead (the relay or `VICTORY_LATE_WAIT`) still turns `VICTORY_INPLACE_CONSTANTS` down at start, on purpose. The title is then told a frame begins while the frame before's lists still run, and the title rewrites the heap's per-draw constants (9,100-9,800 ranges sent up a frame in C2-s2, which looks like constants kept at fixed places rather than a ring moving ahead). In place, those lists could read the new frame's constants; a copy in the card's memory is refreshed behind them on the queue. **So measure B2 without `VICTORY_FENCE_SENT` on both sides**: A = the run set without `VICTORY_FENCE_SENT`; B = A + `VICTORY_PAGE_PLACE=1 VICTORY_INPLACE_CONSTANTS=1`. Comparing B with the full run set (FENCE_SENT on) answers which of the two levers is worth more.
+- `VICTORY_INPLACE_CONSTANTS_ORDER` (indirect executions read in place clamped alone, on by default with the switch) comes with it as before.
+- There is no `=alt`: a buffer cannot change form while the title runs (the switch's section).
+
+**What to grep.**
+- At start: `physical pages are placed at their first mapping (VICTORY_PAGE_PLACE=1)`, with `high_mb` (the windows above 4 GiB).
+- Every ten seconds, one line: `physical pages placed at their first mapping (VICTORY_PAGE_PLACE=1): N MB placed now in N runs of consecutive addresses (the largest N MB at 0x...), N places of freed pages still shown; since the start N pages placed at their address, N kept at their allocation's place (N their place taken first, N written before their first mapping, N no section of placement), N places given back, N given again (zeroed); N sections of placement made, N MB (below 4 GiB one of 4096 MB, above windows of N MB); the constants heap: ...`.
+- The constants heap part reads one of:
+  - `a copy (VICTORY_INPLACE_CONSTANTS off)`;
+  - `a copy (VICTORY_INPLACE_CONSTANTS=1 turned down at start: VICTORY_FENCE_SENT=1 with submissions sent ahead)`;
+  - `IN PLACE: 0x...+174 MB (VICTORY_INPLACE_CONSTANTS=1), N title buffers placed in regions so far; turned down N (...)`;
+  - `NOT in place (...)`, with the refusals by cause and `the last 0x...+N MB: <why>`.
+- Read "kept at their allocation's place" first: P4 predicts about 0. The largest run should cover the heap (174 MB at its address).
+- If no section of placement can be made, a warning says `no section of placement: the page keeps its allocation's place (VICTORY_PAGE_PLACE)` (eight at most).
+- The mapping costs stay on `physical pages, since the start:` (maps, unmaps, ms in Windows' calls, sections made, now counting the sections of placement too).
+
+**What the CPU should save per frame (to measure).** The heap's work today is on the copy lines. C2-s2 (boat save, 9.4 fps, 105.8 ms a frame, switch off) said for `0x33f60000+174 MB a copy in the card's memory`, per frame:
+
+| Work | The heap's share | Where it is counted on the copy lines |
+|---|---|---|
+| Refreshes from title memory | 12-13 refreshes, 1.1-1.2 ms, 9.1-9.6 MB copied in | fps line `copies X ms Y MB` (of 10.7 ms, 94.2 MB); `copies per frame:` `refreshes`, `runs`, and `updates of host copies` on the split |
+| Sends to the card | 11.0-11.2 MB in 9,100-9,800 ranges | `host copies in the card's memory:` `MB sent up in N ranges` (of 48.8 MB in 13,691 ranges) |
+| Compares on the card | 3,400-3,600 pieces of 64 KiB | the same line's `pieces compared on the card` (of 19,138); `our passes over copies in the card's memory` (hash and compare passes) |
+| Fetches and merges | 3.0-3.1 MB fetched back, 2.2 MB merged into title memory | the same line's `fetched (MB)` (of 54.5 MB) and `more waits for the card`; fps line `copying back X ms` (27.3 ms) |
+| Guards | the title's writes to the heap's guarded blocks | recording line `guards X ms` and `copies per frame:` `guard faults` |
+
+The big buffers' line (`the big title buffers per frame`) gives the heap's own row. With the heap in place, that row's form should read `in place`, with 0 refreshes, sends, compares, fetches and merges.
+- What leaves the submitting thread: the refreshes (about 1.2 ms), the recording of some 9,500 range copies a frame, the heap's share of the card copies' hash and compare passes, and about 3 MB of the copy-back.
+- Expected: a few ms of the ~106 ms frame, perhaps 5 %. It is not measured.
+- Against it: the card reads the heap over the bus. In fxceless' run 75, one skinning list took 4.5 ms in the card's memory and 50.5 ms over the bus. Watch `on the GPU` and the card's time by what ran. The heap also stays locked in the PC's memory while it stands.
+
+**Risks.**
+- **Loading and mapping cost.**
+  - All the title's mappings below 4 GiB share one section's lock again, which is what `VICTORY_SECTION_MB=2` removed for the 7 GB pool. Above 4 GiB nothing changes. Compare the `physical pages, since the start:` line (maps, unmaps, in Windows' calls, calls of 1 ms or more) with a run without the switch over the same loading.
+  - A first mapping costs a few table lookups per page, plus one `CreateFileMapping` per window first used (some thousands of 2 MiB windows with `VICTORY_SECTION_MB=2`, about as many as the allocations' sections, which are still made too).
+  - A place given again costs a 64 KiB zeroing.
+  - Pages mapped in order are fewer views, not more: a call's consecutive places are one view.
+- **Memory.** A place given back keeps its committed pages until a page takes it again, or until its window's section closes when nothing is left in it. Below 4 GiB the one window rarely closes, so memory the title frees there is not returned to Windows until reused. Today an allocation's section returns it once all its pages are freed and unmapped. Watch "places given back" against "given again", and the commit.
+- **Correctness.**
+  - The places change where the bytes of view memory live, never which bytes a title address shows.
+  - Aliases, DirectStorage writes through views of ours, the GPU side's guards over several views of a page, and the page-mapping copies all go through the same page table as before.
+  - The first run of the switch should still be checked for the picture and for crashes in loading.
+- **Off,** the switch costs a look at whether any page waits for its place, in the mapping and freeing calls. The GPU side's line is not registered.
+
+**Tests.**
+- `xmem::tests`:
+  - `placement_switch_and_windows`;
+  - `pages_first_mapped_at_consecutive_addresses_are_one_run` (four views without the switch, one with it; aliases, a place kept, places held while shown and given back);
+  - `a_place_taken_first_keeps_the_allocations_place`;
+  - `freed_places_are_given_back_and_read_zero_when_given_again`;
+  - `pages_written_before_their_first_mapping_keep_their_place`;
+  - `a_run_over_a_window_bound_is_one_run_per_window`;
+  - `the_32_bit_memory_is_one_section_of_placement`;
+  - `the_placement_line_says_what_is_placed`.
+- `inplace::tests`:
+  - `warp_the_constants_heap_placed_at_its_addresses_is_one_run_in_place` (on the software adapter: the same eight one-page calls in one order, as allocated, are turned down as scattered; placed at their addresses, they are one run, the region opens, and the card's reads, copies and shader stores meet the title's bytes);
+  - `the_placement_line_names_the_constants_heap`.
 
 ## `VICTORY_COMPOSITE_GRADE_EDGE=1` (off by default; port of Cuebert 818c5a9)
 
