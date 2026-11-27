@@ -61,9 +61,14 @@ pub(crate) enum Lock {
     Loose,
     LooseRead,
     LooseWrite,
+    /// VIcky (`VICTORY_MADE_TURNS`): `made` handed by a thread that makes a
+    /// chunk of slots (the heap sync, the pass over buffer views) to a
+    /// thread that waits for it, between two slots; the ms are the chunk
+    /// maker's, from letting it go to having it again.
+    MadeTurn,
 }
 
-const LOCKS: usize = 19;
+const LOCKS: usize = 20;
 const NAMES: [&str; LOCKS] = [
     "made (alone)",
     "made (shared, the pass's threads)",
@@ -84,6 +89,7 @@ const NAMES: [&str; LOCKS] = [
     "windows (LOOSE)",
     "windows (LOOSE, read, striped)",
     "windows (LOOSE, written)",
+    "made handed to a waiting thread between a chunk's slots",
 ];
 
 /// Per lock: taken, of them after a wait, nanoseconds waited, taken on
