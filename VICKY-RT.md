@@ -123,7 +123,7 @@ This work is for making the title's compute ray tracing (the BVH structure build
 
 **Chapter-1 boat mission with ray tracing (2026-11-27, verified on an RTX 4080, Series X, RT on):** with this main, a save in the boat mission loads, the boat floats and the mission plays, with no extra switch: the texture copy-back (`VICTORY_TEXTURE_BACK`, on by default) gives the title's physics the water it computes on the card, and the builder's box rehydration programs' parent-link stores are left out by default (`VICTORY_BVH_LINK_STORES=keep` keeps them; with them the title crashed on that save's loading screen). Add `VICTORY_LATE_WAIT=2` in water scenes (at the relay's default stage 3 testers elsewhere saw the water surface vanish for single frames); `VICTORY_LATE_WATER=1` at stage 3 is the narrower wait to try instead, not measured yet (water section below). Measured: 480 s on that save, RT on, the fps set below plus `VICTORY_LATE_WAIT=2 VICTORY_REAPER=1`: no crash, 7.34 fps true mean of the last 12 lines (lines 7.8-8.5, about 122-127 ms a frame: preparing ~68, copy-back ~23-27, a wait for the card of ~17 ms that is the copy-back's read-back). The prologue cell with the same build: 5.32 fps true (a slow stretch mid-run; last lines 6.3-7.5), about level with 6.91 before the batch. `VICTORY_INPLACE_CONSTANTS` does not place the constants heap here ("view memory from several places") even without `VICTORY_FENCE_SENT`/`VICTORY_SECTION_MB`: leave it off.
 
-**Recommended since 2026-11-27 evening (lots 2-3 and the foxhound/trustno1/Belobug port batch; RTX 4080, Series X, RT on):** the fps set below plus `VICTORY_SYNC_FINE=1 VICTORY_CCD_PLACE=1`. In water scenes, use no `VICTORY_LATE_WAIT` and no water set (`VICTORY_WAVE_PAIRS_ONLY`/`VICTORY_LDS_FLAGS` for the water programs).
+**Recommended since 2026-11-27 evening (lots 2-3 and the foxhound/trustno1/Belobug port batch; RTX 4080, Series X, RT on):** the fps set below plus `VICTORY_SYNC_FINE=1 VICTORY_CCD_PLACE=1`, and `VICTORY_COMPOSITE_GRADE_EDGE=1` for the picture. In water scenes, use no `VICTORY_LATE_WAIT` and no water set (`VICTORY_WAVE_PAIRS_ONLY`/`VICTORY_LDS_FLAGS` for the water programs).
 
 Measured as true fps over the last 12 frame-time lines:
 
@@ -153,7 +153,7 @@ Water picture with this build:
 - The water set's paired form for `5dc3b25986622949`/`6f225b641c5b0708` turns the water turquoise with grey tiles.
 - `926c46bab3b86bd6` with LDS flags `2cc4c197ee29e291` puts bright green specks in shore vegetation.
 
-So leave the set off. Black specks remain in the sun's glint.
+So leave the set off. The black specks in the sun's glint go away with `VICTORY_COMPOSITE_GRADE_EDGE=1` (see its section; checked in the boat mission, 8.81 fps true on a cache translated the run before).
 
 With `VICTORY_BVH_LINK_STORES=keep`, the boat save no longer crashed on its load.
 
