@@ -98,7 +98,12 @@ thread_local! {
 /// The threads for a pass over `slots` slots; `None` for one: the switch
 /// off, or fewer than two chunks.
 pub(crate) fn wanted(slots: usize) -> Option<usize> {
-    let n = threads();
+    let mut n = threads();
+    // VIcky (`VICTORY_PARALLEL_MIRROR`, port of noaclr 589848256d): with no
+    // count asked, a pass of 256 slots or more on 8 threads.
+    if n <= 1 {
+        n = crate::descriptor::host::par_mirror::pass_threads(slots);
+    }
     (n > 1 && slots >= 2 * PASS_CHUNK).then(|| n.min(slots.div_ceil(PASS_CHUNK)))
 }
 

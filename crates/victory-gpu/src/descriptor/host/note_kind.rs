@@ -236,9 +236,9 @@ impl HostHeap {
             self.set_noted(index, !self.noted.is_empty() && now == PLAIN);
             self.set_kind(index, now);
         }
-        COUNTS[0].fetch_add(1, Relaxed);
+        bump(&COUNTS[0], SHORT);
         if mode() == Mode::Alt {
-            ALT[3].fetch_add(1, Relaxed);
+            bump(&ALT[3], SHORT_ALT);
         }
         true
     }
@@ -290,6 +290,59 @@ pub(crate) fn syncing(on: bool) {
     SYNCING.set(on);
 }
 
+thread_local! {
+    /// VIcky (`VICTORY_PARALLEL_MIRROR`): while this thread makes slots with
+    /// others, its counts are gathered here ([`KINDS`]' places, then the
+    /// short notes and those of `alt`'s phase), and added to the shared ones
+    /// once it is done ([`gather`]): the threads took the counters' line in
+    /// turn for every slot.
+    static GATHER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static GATHERED: [std::cell::Cell<u64>; 13] = const { [const { std::cell::Cell::new(0) }; 13] };
+}
+
+/// [`GATHERED`]' places of the short notes, and of those in `alt`'s phase.
+const SHORT: usize = 11;
+const SHORT_ALT: usize = 12;
+
+/// One more in `shared`, or in this thread's place `at` while it gathers.
+fn bump(shared: &AtomicU64, at: usize) {
+    if GATHER.get() {
+        GATHERED.with(|g| g[at].set(g[at].get() + 1));
+    } else {
+        shared.fetch_add(1, Relaxed);
+    }
+}
+
+/// VIcky (`VICTORY_PARALLEL_MIRROR`): this thread's counts gathered from now
+/// (`true`), or, when it was gathering, added to the shared ones now; returns
+/// whether it was gathering.
+pub(crate) fn gather(on: bool) -> bool {
+    let was = GATHER.replace(on);
+    if was && !on {
+        GATHERED.with(|g| {
+            let take = |at: usize, shared: &AtomicU64| {
+                let n = g[at].replace(0);
+                if n > 0 {
+                    shared.fetch_add(n, Relaxed);
+                }
+            };
+            #[cfg(feature = "diagnostics")]
+            for (at, shared) in KINDS.iter().enumerate() {
+                take(at, shared);
+            }
+            take(SHORT, &COUNTS[0]);
+            take(SHORT_ALT, &ALT[3]);
+        });
+    }
+    was
+}
+
+/// Diagnostics: whether this thread is in a heap sync now ([`syncing`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn syncing_now() -> bool {
+    SYNCING.get()
+}
+
 /// Diagnostics, by the slot's kind before and after: the heap sync's
 /// notes (`was * 3 + now`), then its slots made from the record they hold
 /// already, and those whose record is no view of ours.
@@ -312,7 +365,8 @@ pub(crate) enum Slot {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn noted(was: u8, now: u8) {
     if SYNCING.get() {
-        KINDS[usize::from(was.min(OTHER)) * 3 + usize::from(now.min(OTHER))].fetch_add(1, Relaxed);
+        let at = usize::from(was.min(OTHER)) * 3 + usize::from(now.min(OTHER));
+        bump(&KINDS[at], at);
     }
 }
 
@@ -320,7 +374,7 @@ pub(crate) fn noted(was: u8, now: u8) {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn slot(what: Slot) {
     if SYNCING.get() {
-        KINDS[what as usize].fetch_add(1, Relaxed);
+        bump(&KINDS[what as usize], what as usize);
     }
 }
 

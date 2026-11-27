@@ -2790,7 +2790,7 @@ fn workers() -> &'static Workers {
         later: Mutex::new(std::collections::VecDeque::new()),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = kept_threads();
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -2813,6 +2813,17 @@ fn workers() -> &'static Workers {
         }
     });
     workers
+}
+
+/// The threads kept for [`wide`].
+fn kept_threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+}
+
+/// The threads [`wide_run`] runs its jobs on: the kept ones and the
+/// caller's.
+pub(crate) fn wide_threads() -> usize {
+    kept_threads() + 1
 }
 
 /// Runs `jobs` on the kept threads and on this one, and returns when all
