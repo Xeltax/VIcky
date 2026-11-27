@@ -194,15 +194,7 @@ pub(crate) struct Beside {
 /// the changed pages of every heap. Without a thread (none could be
 /// made) the sync is done here, whole.
 pub(crate) fn start() -> Beside {
-    static LANE: OnceLock<Option<Arc<Lane>>> = OnceLock::new();
-    let lane = LANE.get_or_init(|| {
-        let lane = Lane::new("victory-heap-sync");
-        if lane.is_none() {
-            tracing::warn!("no thread for the heap sync (VICTORY_HEAP_SYNC_BESIDE=1): it runs on the submitting thread");
-        }
-        lane
-    });
-    match lane {
+    match lane() {
         Some(lane) => begin(lane, |asked| super::sync_heaps_told(Some(asked))),
         None => {
             super::sync_heaps();
@@ -211,17 +203,82 @@ pub(crate) fn start() -> Beside {
     }
 }
 
+/// The heap sync's lane, made at the first asking; `None` if no thread
+/// could be made. VIcky (`VICTORY_HEAP_SYNC_AT_SUBMIT`,
+/// `super::at_submit`): its syncs started ahead run on it too.
+pub(super) fn lane() -> Option<&'static Arc<Lane>> {
+    static LANE: OnceLock<Option<Arc<Lane>>> = OnceLock::new();
+    LANE.get_or_init(|| {
+        let lane = Lane::new("victory-heap-sync");
+        if lane.is_none() {
+            tracing::warn!("no thread for the heap sync (VICTORY_HEAP_SYNC_BESIDE=1): it runs on the submitting thread");
+        }
+        lane
+    })
+    .as_ref()
+}
+
 /// Gives `sync` to `lane`, with what it calls once its pages are asked
 /// for, and returns when it has called that (or has ended).
 pub(super) fn begin(lane: &Lane, sync: impl FnOnce(&dyn Fn()) + Send + 'static) -> Beside {
-    let asking = Instant::now();
+    let beside = give(lane, sync);
+    beside.wait_asked();
+    beside
+}
+
+/// VIcky (`VICTORY_HEAP_SYNC_AT_SUBMIT`, `super::at_submit`): [`begin`]
+/// without the wait for the asking; [`Beside::wait_asked`] waits for it.
+pub(super) fn give(lane: &Lane, sync: impl FnOnce(&dyn Fn()) + Send + 'static) -> Beside {
     let ticket = lane.give(Box::new(move |ticket: &Ticket| sync(&|| ticket.tell(|p| p.asked = true))));
-    drop(ticket.wait_until(|p| p.asked || p.done));
-    COUNTS[1].fetch_add(asking.elapsed().as_micros() as u64, Relaxed);
     Beside { ticket: Some(ticket) }
 }
 
 impl Beside {
+    /// Waits until the sync has asked for the heaps' pages (or has ended);
+    /// the wait is counted as the askings' on the sync line.
+    pub(super) fn wait_asked(&self) {
+        let Some(ticket) = &self.ticket else {
+            return;
+        };
+        let asking = Instant::now();
+        drop(ticket.wait_until(|p| p.asked || p.done));
+        COUNTS[1].fetch_add(asking.elapsed().as_micros() as u64, Relaxed);
+    }
+
+    /// VIcky (`super::at_submit`, before a sweep): waits for the sync's end
+    /// and returns how long, without taking it (its join is still to come,
+    /// and then waits for nothing).
+    pub(super) fn wait_end(&self) -> Duration {
+        let Some(ticket) = &self.ticket else {
+            return Duration::ZERO;
+        };
+        let waiting = Instant::now();
+        drop(ticket.wait_until(|p| p.done));
+        waiting.elapsed()
+    }
+
+    /// VIcky (`super::at_submit`, a sync started ahead that the submission
+    /// does not take): waits for the end, and returns how long. Counted
+    /// on the sync line as a sync of its own thread, not as a wait at the
+    /// join. A panic of the sync goes on here, as at the join.
+    pub(super) fn ended(mut self) -> Duration {
+        let Some(ticket) = self.ticket.take() else {
+            return Duration::ZERO;
+        };
+        let waiting = Instant::now();
+        let (took, panic) = {
+            let mut progress = ticket.wait_until(|p| p.done);
+            (progress.took, progress.panic.take())
+        };
+        let waited = waiting.elapsed();
+        COUNTS[0].fetch_add(1, Relaxed);
+        COUNTS[3].fetch_add(took, Relaxed);
+        if let Some(panic) = panic {
+            std::panic::resume_unwind(panic);
+        }
+        waited
+    }
+
     /// Waits for the sync to end, and returns how long this thread waited.
     /// A panic of the sync goes on here, as on the submitting thread before.
     pub(crate) fn join(mut self) -> Duration {

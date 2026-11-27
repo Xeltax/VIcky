@@ -886,6 +886,10 @@ pub(crate) struct HostList {
     /// The records its draws read from slots that its prelude fills
     /// (`crate::indirect::gather`).
     gather: Mutex<Gather>,
+    /// VIcky (`VICTORY_HEAP_SYNC_AT_SUBMIT`, `crate::descriptor::at_submit`):
+    /// the stamp of the title's last hand-over of the list, raised by the
+    /// waits its queue passed before it was taken; 0 for a list of ours.
+    pub(crate) handed: std::sync::atomic::AtomicU64,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -4772,6 +4776,7 @@ impl Host {
                 meter: AtomicU32::new(u32::MAX),
                 pipeline_meter: AtomicU32::new(u32::MAX),
                 gather: Mutex::default(),
+                handed: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -6492,10 +6497,15 @@ impl Host {
         }
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
-        // what they write.
+        // what they write. VIcky (`VICTORY_HEAP_SYNC_AT_SUBMIT`): a sync
+        // started ahead is not taken by a submission that settled before
+        // its sync's place (`crate::descriptor::at_submit`), if that
+        // settle had flights to land.
+        let mut settled_first = !late && flying();
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(mut why) = late_blocked(runs) {
+            settled_first = true;
             let reading = texture_back::reading(runs);
             loop {
                 // VIcky (`VICTORY_FILL_LATCH_PIECE=1`): a wait for a fill
@@ -6543,11 +6553,15 @@ impl Host {
         // one at every present).
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if !behind {
+            // VIcky: a sync started ahead never meets the sweep.
+            crate::descriptor::at_submit::before_sweep();
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
+            crate::descriptor::at_submit::before_sweep();
+            settled_first = true;
             self.settle(&mut submitted, WHY_SYNC);
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
@@ -6561,8 +6575,13 @@ impl Host {
         crate::shadow::preparing(this_submission);
         // VIcky: the heap sync starts here, after the sweep, and this
         // thread goes on once it has asked for the heaps' pages (ahead of
-        // the submission's own asking).
-        let beside = beside.then(crate::descriptor::beside::start);
+        // the submission's own asking). With `VICTORY_HEAP_SYNC_AT_SUBMIT`
+        // it may be the one started for this submission while it waited
+        // in line (`crate::descriptor::at_submit`).
+        let beside = beside.then(|| {
+            let stamps = runs.iter().map(|l| l.handed.load(Ordering::SeqCst));
+            crate::descriptor::at_submit::start(stamps, settled_first)
+        });
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
@@ -6644,6 +6663,12 @@ impl Host {
         batch.flush();
         batch.front_end();
         crate::watch::ask_once_end();
+        // VIcky (`VICTORY_HEAP_SYNC_AT_SUBMIT`): the steps are done and the
+        // asking has ended: the next submission's sync may start now, while
+        // it waits in line.
+        if beside.is_some() {
+            crate::descriptor::at_submit::ahead();
+        }
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card. VIcky (`VICTORY_SNAPSHOT_BESIDE`,

@@ -38,6 +38,11 @@ struct Queue {
     /// reached, in order; it runs when the fence gets there.
     #[cfg(windows)]
     held: std::sync::Mutex<Vec<Held>>,
+    /// VIcky (`VICTORY_HEAP_SYNC_AT_SUBMIT`, `crate::descriptor::at_submit`):
+    /// the stamp of the last wait the line passed that the title's own hand
+    /// may have met; the parts taken behind it carry it.
+    #[cfg(windows)]
+    sync_floor: AtomicU64,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -812,9 +817,19 @@ fn release_held_now(all: bool) {
                     Some(Held::Present(..)) if !joined.is_empty() => break,
                     Some(_) => {}
                 }
+                // SAFETY: as above.
+                let floor = unsafe { &(*(q as *const Queue)).sync_floor };
                 match held.remove(base) {
-                    Held::Wait(..) | Held::Running => {}
+                    Held::Running => {}
+                    // VIcky (`VICTORY_HEAP_SYNC_AT_SUBMIT`): a fence the
+                    // title may have signalled itself, a value it may have
+                    // written (found in memory, or forced): what is behind
+                    // may have been written just before.
+                    Held::Wait(..) => crate::descriptor::at_submit::wait_passed(floor),
                     Held::Value(wait) => {
+                        if all || wait.met() {
+                            crate::descriptor::at_submit::wait_passed(floor);
+                        }
                         // Passed at a present without being met: what the
                         // queue stood at.
                         if all && !value_met(&wait) {
@@ -829,6 +844,9 @@ fn release_held_now(all: bool) {
                         }
                     }
                     Held::Run(lists, order) => {
+                        // VIcky (`VICTORY_HEAP_SYNC_AT_SUBMIT`): behind the
+                        // waits the line passed.
+                        crate::descriptor::at_submit::taken(floor, lists.iter().map(|d| &d.host().handed));
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
                             format!(
@@ -967,6 +985,41 @@ fn release_held_now(all: bool) {
     }
 }
 
+/// VIcky (`VICTORY_HEAP_SYNC_AT_SUBMIT`, `crate::descriptor::at_submit`):
+/// whether a queue's line holds a submission of the title's not taken yet,
+/// with no wait before it that our thread would pass by the title's hand
+/// (a fence's, or a value already in memory: the part would then need a
+/// sync asked after that pass). Lines another thread holds just now are
+/// not looked at (the thread that submits may hold one, in
+/// [`release_held_now`]).
+#[cfg(windows)]
+pub(crate) fn runs_waiting() -> bool {
+    use std::sync::TryLockError;
+    let queues = match WAITING.try_lock() {
+        Ok(waiting) => waiting.clone(),
+        Err(TryLockError::Poisoned(e)) => e.into_inner().clone(),
+        Err(TryLockError::WouldBlock) => return false,
+    };
+    for q in queues {
+        // SAFETY: a live queue, as in `release_held_now`.
+        let line = unsafe { &(*(q as *const Queue)).held };
+        let held = match line.try_lock() {
+            Ok(held) => held,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => continue,
+        };
+        for h in held.iter() {
+            match h {
+                Held::Run(..) => return true,
+                Held::Running | Held::Signal(..) => {}
+                Held::Value(wait) if !wait.met() => {}
+                Held::Wait(..) | Held::Value(_) | Held::Present(..) => break,
+            }
+        }
+    }
+    false
+}
+
 /// Whether a queue may pass `wait`: memory holds the value, or, with
 /// submissions sent to the card without a wait (`crate::host::late`), it
 /// will once those in the air have run.
@@ -1001,6 +1054,8 @@ pub(crate) extern "system" fn create(
         desc,
         #[cfg(windows)]
         held: Default::default(),
+        #[cfg(windows)]
+        sync_floor: AtomicU64::new(0),
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -1078,6 +1133,9 @@ fn execute_now(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        // VIcky (`VICTORY_HEAP_SYNC_AT_SUBMIT`): handed over now, before
+        // anything is put in a line or sent.
+        crate::descriptor::at_submit::handed(lists.iter().filter_map(|&l| crate::list::host_list(l)).map(|h| &h.handed));
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;
@@ -1342,6 +1400,10 @@ extern "system" fn present(
     let presenting = std::time::Instant::now();
     #[cfg(windows)]
     crate::framelog::present_called();
+    // VIcky (`VICTORY_HEAP_SYNC_AT_SUBMIT`): the present's own submission
+    // is to come.
+    #[cfg(windows)]
+    let _presenting = crate::descriptor::at_submit::presenting();
     let hr = present_now(this, planes, plane_parameters);
     // VIcky: the next signal may begin the next frame (`crate::fence::sent`).
     crate::fence::sent::presented();

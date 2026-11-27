@@ -11,6 +11,8 @@ use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, T
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
+pub(crate) mod at_submit;
+#[cfg(windows)]
 pub(crate) mod beside;
 #[cfg(all(windows, any(test, feature = "diagnostics")))]
 pub(crate) mod burst;
@@ -583,8 +585,9 @@ fn fine_part(frames: f64) -> String {
 pub(crate) fn sync_line(frames: f64) {
     let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     fast_line(frames);
-    // (Taken with the others, whether the line is said or not.)
-    let beside = beside::part(frames);
+    // (Taken with the others, whether the line is said or not. VIcky,
+    // `VICTORY_HEAP_SYNC_AT_SUBMIT`: its part after the beside one.)
+    let beside = beside::part(frames) + &at_submit::part(frames);
     // (VIcky, `VICTORY_MIRROR_TRY`: said with the switch on even when no
     // heap page changed.)
     let tried = mirror_try::part(frames);
