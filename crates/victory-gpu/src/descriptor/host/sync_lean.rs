@@ -615,37 +615,54 @@ mod tests {
             })
             .collect();
         for (map, split) in [(None, false), (None, true), (Some((16, 24)), false), (Some((16, 24)), true)] {
-            super::super::TEST_FAST.set(Some((0, true, false)));
-            super::super::super::kept::TEST_SPLIT.set(Some(split));
-            super::super::TEST_MAP.set(map);
-            let usual = HostHeap::new(false, TITLES).unwrap();
-            let lean = HostHeap::new(false, TITLES).unwrap();
-            super::super::TEST_MAP.set(None);
-            // The title heap's memory: 32 bytes a slot.
-            let mut memory = vec![[0u32; 8]; TITLES as usize];
-            let start = memory.as_mut_ptr() as u64;
-            for round in 0..8u32 {
-                for s in 0..TITLES {
-                    let pick = ((s * 7 + round * 13) % (views.len() as u32 + 3)) as usize;
-                    let record = records.get(pick).copied().unwrap_or([0; 3]);
-                    memory[s as usize][..3].copy_from_slice(&record);
+            // Other tests submit to the same host meanwhile, and a heap map
+            // hands a pool slot given back out again by the counts of
+            // submissions started and finished (`crate::host::submissions`):
+            // the two heaps agree only if those counts held still while both
+            // were made. A case they moved in is made again (20 tries at
+            // most; the last is judged whatever happened).
+            for tries in 1..=20 {
+                let counts = crate::host::submissions();
+                super::super::TEST_FAST.set(Some((0, true, false)));
+                super::super::super::kept::TEST_SPLIT.set(Some(split));
+                super::super::TEST_MAP.set(map);
+                let usual = HostHeap::new(false, TITLES).unwrap();
+                let lean = HostHeap::new(false, TITLES).unwrap();
+                super::super::TEST_MAP.set(None);
+                // The title heap's memory: 32 bytes a slot.
+                let mut memory = vec![[0u32; 8]; TITLES as usize];
+                let start = memory.as_mut_ptr() as u64;
+                let mut rounds = Vec::new();
+                for round in 0..8u32 {
+                    for s in 0..TITLES {
+                        let pick = ((s * 7 + round * 13) % (views.len() as u32 + 3)) as usize;
+                        let record = records.get(pick).copied().unwrap_or([0; 3]);
+                        memory[s as usize][..3].copy_from_slice(&record);
+                    }
+                    let due: Vec<(u32, u64)> = (0..TITLES)
+                        .filter(|s| (s + round) % 3 != 0)
+                        .map(|s| (s, start + u64::from(s) * TITLE_SLOT_BYTES))
+                        .collect();
+                    let copied: Vec<[u32; 3]> = due
+                        .iter()
+                        .map(|&(s, _)| {
+                            let w = memory[s as usize];
+                            [w[0], w[1], w[2]]
+                        })
+                        .collect();
+                    usual.mirror_due(&due);
+                    lean.mirror_due_lean(&due, &copied, round % 2 == 1);
+                    rounds.push((round, state(&usual, TITLES), state(&lean, TITLES)));
                 }
-                let due: Vec<(u32, u64)> = (0..TITLES)
-                    .filter(|s| (s + round) % 3 != 0)
-                    .map(|s| (s, start + u64::from(s) * TITLE_SLOT_BYTES))
-                    .collect();
-                let copied: Vec<[u32; 3]> = due
-                    .iter()
-                    .map(|&(s, _)| {
-                        let w = memory[s as usize];
-                        [w[0], w[1], w[2]]
-                    })
-                    .collect();
-                usual.mirror_due(&due);
-                lean.mirror_due_lean(&due, &copied, round % 2 == 1);
-                assert_eq!(state(&usual, TITLES), state(&lean, TITLES), "round {round}, map {map:?}, split {split}");
+                drop(memory);
+                if crate::host::submissions() != counts && tries < 20 {
+                    continue;
+                }
+                for (round, usual, lean) in rounds {
+                    assert_eq!(usual, lean, "round {round}, map {map:?}, split {split}, try {tries}");
+                }
+                break;
             }
-            drop(memory);
         }
         super::super::TEST_FAST.set(None);
         super::super::super::kept::TEST_SPLIT.set(None);

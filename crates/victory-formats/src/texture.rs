@@ -299,7 +299,7 @@ impl TilePlan {
 
 /// The column runs and row offsets of the mips copied before, kept for
 /// copies of the same geometry (a thread that tiles the same textures
-/// again and again: the texture copy-back). After TaynanGT/Vice-Tay
+/// again and again: the texture copy-back). After TaynanGT
 /// f0019f2e20 (Taynan Piza).
 #[derive(Default)]
 pub struct TilingCache {
