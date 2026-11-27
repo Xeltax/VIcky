@@ -109,6 +109,8 @@ impl Written {
     /// The pages of `[first, last)` ever found written, in order, each with
     /// the asking that last found it written.
     fn range(&self, first: usize, last: usize) -> impl Iterator<Item = (usize, u64)> + '_ {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::JournalLooks, 1);
         let pieces = if first < last { first / PIECE..(last - 1) / PIECE + 1 } else { 0..0 };
         pieces.filter_map(|n| self.pieces.get(&n).map(|piece| (n, piece))).flat_map(move |(n, piece)| {
             let (from, to) = ((n * PIECE).max(first), ((n + 1) * PIECE).min(last));
@@ -291,6 +293,16 @@ fn slow(us: u64) {
 #[cfg(feature = "diagnostics")]
 pub(crate) static AHEAD_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// A `GetWriteWatch` call over `pages` 4 KiB pages made at `started`, failed
+/// or not (the copies line: calls, their microseconds, pages asked).
+#[cfg(feature = "diagnostics")]
+fn called(started: std::time::Instant, pages: usize) {
+    use crate::copystat::{C, add};
+    add(C::WatchCalls, 1);
+    add(C::WatchCallUs, started.elapsed().as_micros() as u64);
+    add(C::WatchPages, pages as u64);
+}
+
 /// [`SLOW`], taken.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn slow_asks() -> [u64; 3] {
@@ -466,6 +478,8 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let pages = count;
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -477,6 +491,8 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             &mut granularity,
         )
     } != 0;
+    #[cfg(feature = "diagnostics")]
+    called(started, pages);
     if failed {
         return false;
     }
@@ -588,6 +604,8 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
     let known_view = guarded && known_view(first * PAGE);
+    #[cfg(feature = "diagnostics")]
+    let pages = count;
     // SAFETY: the answer buffer holds `count` entries.
     let failed = known_view
         || unsafe {
@@ -600,6 +618,10 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
                 &mut granularity,
             )
         } != 0;
+    #[cfg(feature = "diagnostics")]
+    if !known_view {
+        called(started, pages);
+    }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         if known_view {
