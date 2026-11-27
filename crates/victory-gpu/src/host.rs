@@ -4451,10 +4451,18 @@ mod late_tests {
 /// mapped now fails the joined copy as a whole (it then goes page by page,
 /// zeros for what cannot be read, as a single copy does), where before
 /// only the copy that held it did.
+///
+/// VIcky: the same switch as foxhound 9f8838b1's (the code is the same);
+/// `VICTORY_JOIN_COPIES=alt` joins them in turns of twenty seconds, said as
+/// "(VICTORY_JOIN_COPIES=alt): ON/off".
 fn join_copies() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+    JOIN_COPIES.on()
 }
+
+static JOIN_COPIES: crate::alt::Alt = crate::alt::Alt::new(
+    "VICTORY_JOIN_COPIES",
+    "a title buffer copy that continues the one recorded before it in its list becomes one step with it",
+);
 
 /// Since the last frame-rate line: title buffer copies recorded, and those
 /// that continue the one before ([`join_copies`]).
@@ -9543,7 +9551,7 @@ impl Meter {
                 tracing::info!(
                     "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
                      (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
-                    if join_copies() { "on" } else { "off" }
+                    JOIN_COPIES.said()
                 );
             }
         }
