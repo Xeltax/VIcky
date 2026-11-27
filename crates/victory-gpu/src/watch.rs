@@ -61,11 +61,70 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
+/// Page number → the asking that last found it written, of the pages ever
+/// found written: in pieces of [`PIECE`] pages, each made when a page of it
+/// is first written. A look at a range of pages is a lookup for each piece
+/// it lies in.
+///
+/// It was a tree of every page ever written (some 80,000-150,000 in a
+/// cell): its lookups, under the journal's lock, some 10,000 a frame from
+/// the refreshes' looks ([`nothing_new`]) and their askings, walked it
+/// twice down to the range's ends; 111 ns a look at a range of a few pages
+/// in the tree, 20 ns in pieces (Biskwit/VIctory-reloaded 27b7a9002).
+struct Written {
+    pieces: HashMap<usize, Box<[u64; PIECE]>, BuildHasherDefault<WordHash>>,
+}
+
+/// Pages to a piece of [`Written`]: 4 MiB of title memory.
+const PIECE: usize = 64;
+
+impl Written {
+    const fn new() -> Written {
+        Written {
+            pieces: HashMap::with_hasher(BuildHasherDefault::new()),
+        }
+    }
+
+    /// `page` was found written by asking `now` (not 0); the asking that
+    /// found it written before (0: none).
+    fn insert(&mut self, page: usize, now: u64) -> u64 {
+        let piece = self.pieces.entry(page / PIECE).or_insert_with(|| Box::new([0; PIECE]));
+        std::mem::replace(&mut piece[page % PIECE], now)
+    }
+
+    /// The asking that last found `page` written, if one did.
+    #[cfg(test)]
+    fn get(&self, page: usize) -> Option<u64> {
+        self.pieces.get(&(page / PIECE)).map(|piece| piece[page % PIECE]).filter(|&w| w != 0)
+    }
+
+    /// `page` is not written, as far as the journal knows (the tests').
+    #[cfg(test)]
+    fn remove(&mut self, page: usize) {
+        if let Some(piece) = self.pieces.get_mut(&(page / PIECE)) {
+            piece[page % PIECE] = 0;
+        }
+    }
+
+    /// The pages of `[first, last)` ever found written, in order, each with
+    /// the asking that last found it written.
+    fn range(&self, first: usize, last: usize) -> impl Iterator<Item = (usize, u64)> + '_ {
+        let pieces = if first < last { first / PIECE..(last - 1) / PIECE + 1 } else { 0..0 };
+        pieces.filter_map(|n| self.pieces.get(&n).map(|piece| (n, piece))).flat_map(move |(n, piece)| {
+            let (from, to) = ((n * PIECE).max(first), ((n + 1) * PIECE).min(last));
+            (from..to).filter_map(move |page| {
+                let write = piece[page % PIECE];
+                (write != 0).then_some((page, write))
+            })
+        })
+    }
+}
+
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
     /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
+    written: Written,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -134,7 +193,7 @@ impl Ahead {
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
-    written: BTreeMap::new(),
+    written: Written::new(),
     found: Vec::new(),
     ahead: Ahead::new(),
     ahead_asked: 0,
@@ -369,7 +428,7 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
     if j.kept || !j.ahead.is_empty() {
         j.ahead_asked = now;
     }
-    let before = j.written.insert(page, now).unwrap_or(0);
+    let before = j.written.insert(page, now);
     for &other in others {
         if other != page {
             j.written.insert(other, now);
@@ -459,7 +518,7 @@ fn asked_inner(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     j.ahead
         .holds(first, last)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+        .then(|| (j.ahead_asked, j.written.range(first, last).collect()))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -501,7 +560,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     if j.ahead.holds(first, last) {
         #[cfg(feature = "diagnostics")]
         let collecting = std::time::Instant::now();
-        let written = j.written.range(first..last).map(|(&p, &w)| (p, w)).collect();
+        let written = j.written.range(first, last).collect();
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -518,7 +577,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     if guarded && light == 2 && published(j, first * PAGE, last * PAGE) {
         light_count(0);
         j.asked += 1;
-        return Some((j.asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
+        return Some((j.asked, j.written.range(first, last).collect()));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -590,7 +649,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     }
     #[cfg(feature = "diagnostics")]
     let collecting = std::time::Instant::now();
-    let written = j.written.range(first..last).map(|(&p, &w)| (p, w)).collect();
+    let written = j.written.range(first, last).collect();
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::WritesCollectNs, collecting.elapsed().as_nanos() as u64);
     Some((now, written))
@@ -2014,7 +2073,7 @@ fn nothing_noted(start: usize, end: usize, base: usize, copied: &[u64]) -> bool 
     if by_bits && !published(&j, first * PAGE, last * PAGE) {
         return false;
     }
-    let same = j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first]);
+    let same = j.written.range(first, last).all(|(page, write)| write <= taken[page - first]);
     if same && by_bits {
         light_count(0);
     }
@@ -2903,6 +2962,45 @@ fn writable(at: usize) -> bool {
 }
 
 #[cfg(test)]
+mod written_tests {
+    use super::{BTreeMap, PIECE, Written};
+
+    /// The pieces answer for any range what a tree of the same pages does
+    /// (the notes and removals random, in two clusters, one across pieces'
+    /// ends; after Biskwit/VIctory-reloaded 27b7a9002's test).
+    #[test]
+    fn the_pieces_say_what_a_tree_of_the_pages_says() {
+        let mut written = Written::new();
+        let mut tree = BTreeMap::new();
+        let mut seed = 0x9e37_79b9_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        for now in 1..5000u64 {
+            let page = if now % 3 == 0 { 1_000_000 + next() % 300 } else { 10 * PIECE - 150 + next() % 300 };
+            assert_eq!(written.insert(page, now), tree.insert(page, now).unwrap_or(0));
+            if now % 50 == 0 {
+                let gone = page + next() % 3;
+                written.remove(gone);
+                tree.remove(&gone);
+            }
+        }
+        for _ in 0..2000 {
+            let first = [0, 1_000_000 - 50, 10 * PIECE - 200][next() % 3] + next() % 400;
+            let last = first + [0, 1, 2, 63, 64, 65, 500][next() % 7];
+            let want: Vec<(usize, u64)> = tree.range(first..last).map(|(&p, &w)| (p, w)).collect();
+            assert_eq!(written.range(first, last).collect::<Vec<_>>(), want, "{first}..{last}");
+            assert_eq!(written.get(first), tree.get(&first).copied());
+        }
+        assert_eq!(written.range(5, 5).count(), 0);
+        assert_eq!(written.range(9, 5).count(), 0);
+    }
+}
+
+#[cfg(test)]
 mod ahead_tests {
     use super::Ahead;
 
@@ -2990,9 +3088,8 @@ mod tests {
     fn forget_written(start: usize, end: usize) {
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
         let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-        let pages: Vec<usize> = j.written.range(first..last).map(|(&page, _)| page).collect();
-        for page in pages {
-            j.written.remove(&page);
+        for page in first..last {
+            j.written.remove(page);
         }
     }
 
