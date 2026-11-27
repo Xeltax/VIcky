@@ -15,6 +15,8 @@ pub(crate) mod beside;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
+mod kept;
+#[cfg(windows)]
 pub(crate) mod mirror_try;
 #[cfg(windows)]
 mod slot_map;

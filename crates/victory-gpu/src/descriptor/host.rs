@@ -59,7 +59,9 @@ pub(crate) struct HostHeap {
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    /// VIcky (`VICTORY_HEAP_KEPT_SPLIT=1`, [`super::kept`]): the slots below
+    /// `dynamic_first` and the dynamic ones each behind a lock of their own.
+    kept: super::kept::Holds<ID3D12Resource>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -1328,7 +1330,7 @@ impl HostHeap {
             copied: Mutex::new(Vec::new()),
             title_start: AtomicU64::new(0),
             reclaimed: AtomicU64::new(u64::MAX),
-            kept: Mutex::new(vec![None; (dynamic_first + extra) as usize]),
+            kept: super::kept::Holds::new(dynamic_first + extra, super::kept::on().then_some(dynamic_first)),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -1859,12 +1861,7 @@ impl HostHeap {
             return false;
         };
         made.key_of(host).is_some_and(|made| made != 0 && made == key)
-            && self
-                .kept
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(host as usize)
-                .is_some_and(Option::is_some)
+            && self.kept.with(host, |slot| slot.is_some_and(Option::is_some))
     }
 
     /// Levels on demand (`crate::tiles`): makes again the host slots of the
@@ -2231,6 +2228,11 @@ impl HostHeap {
     /// [`HostHeap::note_buffer_marking`]), counts the mark spared if the
     /// slot was not marked already ([`PASS_MARKS_SPARED`]).
     fn mark_changed(&self, index: u32, marks: bool) {
+        // VIcky (`VICTORY_HEAP_KEPT_SPLIT`): in a chunk of `mirror_due`,
+        // made with the chunk's others at its end ([`KeptLater`]).
+        if marks && self.later(index, Later::Mark).is_ok() {
+            return;
+        }
         let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
         if marks {
             changed.insert(index);
@@ -2342,14 +2344,38 @@ impl HostHeap {
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let _keep = crate::draw::heap_pass::parts::enter(crate::draw::heap_pass::parts::Part::Keep);
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
-            // A running submission may still read the old resource through
-            // this slot.
-            if let Some(old) = std::mem::replace(slot, resource) {
-                retire_held(old);
-            }
+        // VIcky (`VICTORY_HEAP_KEPT_SPLIT`): a mirrored slot's, in a chunk of
+        // `mirror_due`, made with the chunk's others at its end
+        // ([`KeptLater`]).
+        let resource = match self.later(index, Later::Keep(resource)) {
+            Ok(()) | Err(Later::Mark) => return,
+            Err(Later::Keep(resource)) => resource,
+        };
+        // A running submission may still read the old resource through
+        // this slot.
+        self.kept.replace(index, resource, retire_held);
+    }
+
+    /// VIcky (`VICTORY_HEAP_KEPT_SPLIT`): `what`, for slot `index` (a host
+    /// slot's keep, a title slot's mark), noted for the end of the chunk
+    /// [`HostHeap::mirror_due`] is at on this thread, if it is at one of
+    /// this heap's and `what` is a mark or a mirrored slot's keep; else
+    /// given back, to be made now.
+    fn later(&self, index: u32, what: Later) -> Result<(), Later> {
+        if !self.kept.split() || (matches!(what, Later::Keep(_)) && !self.kept.low(index)) {
+            return Err(what);
         }
+        let me = std::ptr::from_ref(self) as usize;
+        KEPT_LATER.with_borrow_mut(|later| match later {
+            Some(later) if later.heap == me => {
+                match what {
+                    Later::Keep(resource) => later.keeps.push((index, resource)),
+                    Later::Mark => later.marks.push(index),
+                }
+                Ok(())
+            }
+            _ => Err(what),
+        })
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
@@ -2647,11 +2673,17 @@ impl HostHeap {
             RETIRE_LATER.set(Some(Vec::new()));
             {
                 let made = held_alone(&self.made);
+                // VIcky (`VICTORY_HEAP_KEPT_SPLIT`): the chunk's keeps of
+                // mirrored slots and its marks made together at its end,
+                // before `made` goes.
+                let later = KeptLater::begin(self);
                 for &(index, handle) in chunk {
                     if let Some(record) = self.record_at(index, handle, false) {
                         self.mirror_made(&made, true, (index, handle, false, true), record, &mut Lookups::each());
                     }
                 }
+                drop(later);
+                drop(made);
             }
             if let Some(held) = RETIRE_LATER.take().filter(|held| !held.is_empty()) {
                 crate::host::retire(held);
@@ -3069,14 +3101,14 @@ impl HostHeap {
             .flat_map(|chunk| {
                 let made = held_alone(&self.made);
                 let hosts: Vec<Option<u32>> = chunk.iter().map(|&index| made.host(index)).collect();
-                let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+                let kept = self.kept.both();
                 hosts
                     .into_iter()
                     .map(|host| {
                         let Some(host) = host else {
                             return (0, None);
                         };
-                        let shown = kept.get(host as usize).and_then(Option::as_ref);
+                        let shown = kept.get(host).and_then(Option::as_ref);
                         (made.key_of(host).unwrap_or(0), shown.map(|b| windows::core::Interface::as_raw(b) as usize))
                     })
                     .collect::<Vec<_>>()
@@ -3105,10 +3137,8 @@ impl HostHeap {
     #[cfg(test)]
     pub(crate) fn shown_raw(&self, index: u32) -> Option<usize> {
         let host = held_alone(&self.made).host(index)?;
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        kept.get(host as usize)?
-            .as_ref()
-            .map(|b| windows::core::Interface::as_raw(b) as usize)
+        self.kept
+            .with(host, |slot| slot?.as_ref().map(|b| windows::core::Interface::as_raw(b) as usize))
     }
 
     /// Whether title slot `index`'s host slot shows `buffer`; `None` if it
@@ -3127,9 +3157,10 @@ impl HostHeap {
         let host = made.host(index);
         drop(made);
         let host = host?;
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        let shown = kept.get(host as usize)?.as_ref()?;
-        Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+        self.kept.with(host, |slot| {
+            let shown = slot?.as_ref()?;
+            Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+        })
     }
 
     /// VIcky (`VICTORY_HEAP_PASS_THREADS`, diagnostics): of `slots` (title
@@ -3145,12 +3176,12 @@ impl HostHeap {
             let made = self.made.read().unwrap_or_else(|e| e.into_inner());
             slots.iter().map(|&(index, _)| made.host(index)).collect()
         };
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = self.kept.both();
         slots
             .iter()
             .zip(hosts)
             .filter(|&(&(_, buffer), host)| {
-                host.and_then(|host| kept.get(host as usize)?.as_ref())
+                host.and_then(|host| kept.get(host)?.as_ref())
                     .is_some_and(|shown| windows::core::Interface::as_raw(shown) != windows::core::Interface::as_raw(buffer))
             })
             .count() as u64
@@ -3813,6 +3844,65 @@ thread_local! {
     /// While [`HostHeap::mirror_due`] mirrors a chunk on this thread: the
     /// host resources its slots let go of, retired together after it.
     static RETIRE_LATER: std::cell::RefCell<Option<Vec<ID3D12Resource>>> = const { std::cell::RefCell::new(None) };
+}
+
+thread_local! {
+    /// VIcky (`VICTORY_HEAP_KEPT_SPLIT`): while [`HostHeap::mirror_due`]
+    /// mirrors a chunk on this thread ([`KeptLater`]), the heap's keeps of
+    /// mirrored slots and its marks, made together at the chunk's end.
+    static KEPT_LATER: std::cell::RefCell<Option<LaterOf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A change [`HostHeap::later`] may note for the chunk's end.
+enum Later {
+    /// [`HostHeap::keep`]'s resource for a slot.
+    Keep(Option<ID3D12Resource>),
+    /// [`HostHeap::mark_changed`] of a slot.
+    Mark,
+}
+
+/// [`KEPT_LATER`]: the heap (its address), and its changes in order.
+struct LaterOf {
+    heap: usize,
+    keeps: Vec<(u32, Option<ID3D12Resource>)>,
+    marks: Vec<u32>,
+}
+
+/// VIcky (`VICTORY_HEAP_KEPT_SPLIT`, [`super::kept`]): while it lives, the
+/// keeps of `heap`'s mirrored slots and its marks on this thread wait in
+/// [`KEPT_LATER`]; when it goes they are made, in their order, the keeps
+/// under one lock of the mirrored part and the marks under one lock of
+/// `changed`. Made with `made` held alone, and let go before it.
+struct KeptLater<'a> {
+    heap: &'a HostHeap,
+}
+
+impl<'a> KeptLater<'a> {
+    /// `None` for a heap whose slots are held in one part.
+    fn begin(heap: &'a HostHeap) -> Option<Self> {
+        if !heap.kept.split() {
+            return None;
+        }
+        KEPT_LATER.set(Some(LaterOf {
+            heap: std::ptr::from_ref(heap) as usize,
+            keeps: Vec::new(),
+            marks: Vec::new(),
+        }));
+        Some(KeptLater { heap })
+    }
+}
+
+impl Drop for KeptLater<'_> {
+    fn drop(&mut self) {
+        let Some(later) = KEPT_LATER.take() else {
+            return;
+        };
+        self.heap.kept.replace_together(later.keeps, retire_held);
+        if !later.marks.is_empty() {
+            let mut changed = self.heap.changed.lock().unwrap_or_else(|e| e.into_inner());
+            changed.extend(later.marks);
+        }
+    }
 }
 
 /// A host resource a slot held and lets go of: retired (`crate::host::retire`)
@@ -5423,9 +5513,43 @@ mod tests {
         let handle = slot.as_mut_ptr() as u64;
         crate::descriptor::create_cbv(std::ptr::null(), std::ptr::null(), handle);
         assert_eq!(heap.mirror(0, handle, false), Some(View::NullConstant));
-        assert!(heap.kept.lock().unwrap()[0].is_none());
+        assert!(heap.kept.with(0, |slot| slot.expect("slot 0").is_none()));
         // SAFETY: the device is live.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// VIcky (`VICTORY_HEAP_KEPT_SPLIT=1`): in a chunk of the sync's
+    /// mirroring, a mirrored slot's keeps and the marks wait for the
+    /// chunk's end and are made there in their order; a dynamic slot's keep
+    /// is made at once. Without the split, nothing waits.
+    #[test]
+    fn a_chunks_keeps_and_marks_are_made_at_its_end() {
+        let Some(host) = host() else { return };
+        let raw = |r: &ID3D12Resource| windows::core::Interface::as_raw(r) as usize;
+        for split in [true, false] {
+            super::super::kept::TEST_SPLIT.set(Some(split));
+            let heap = HostHeap::new(false, 4).expect("view heap");
+            super::super::kept::TEST_SPLIT.set(None);
+            assert_eq!(heap.kept.split(), split);
+            let (a, _) = host.shared_buffer(256).expect("buffer");
+            let (b, _) = host.shared_buffer(256).expect("buffer");
+            let shown = |slot: u32| heap.kept.with(slot, |s| s?.as_ref().map(raw));
+            let later = KeptLater::begin(&heap);
+            assert_eq!(later.is_some(), split);
+            heap.keep(1, Some(a.clone()));
+            heap.keep(1, Some(b.clone()));
+            heap.mark_changed(3, true);
+            heap.keep(heap.dynamic_first, Some(a.clone()));
+            assert_eq!(shown(heap.dynamic_first), Some(raw(&a)), "a dynamic slot's keep waited");
+            let marked = |heap: &HostHeap| heap.changed.lock().unwrap().contains(&3);
+            if split {
+                assert_eq!(shown(1), None, "made before the chunk's end");
+                assert!(!marked(&heap), "marked before the chunk's end");
+            }
+            drop(later);
+            assert_eq!(shown(1), Some(raw(&b)), "split {split}");
+            assert!(marked(&heap), "split {split}");
+        }
     }
 
     #[test]
@@ -5485,8 +5609,8 @@ mod tests {
             assert_eq!(made.map.as_ref().map(SlotMap::len), Some(48));
         }
         assert_eq!(mapped.tabled.len(), 64, "by title slot");
-        assert_eq!(mapped.kept.lock().unwrap().len(), (25 + DYNAMIC) as usize);
-        assert!(mapped.kept.lock().unwrap()[24].is_some(), "the map's raw view holds it");
+        assert_eq!(mapped.kept.len(), (25 + DYNAMIC) as usize);
+        assert!(mapped.kept.with(24, |slot| slot.expect("slot 24").is_some()), "the map's raw view holds it");
         assert_eq!(mapped.dynamic(DYNAMIC), Some(25));
         assert_eq!(mapped.dynamic(1), None);
         assert_eq!((fits.count(), fits.dynamic_first), (8, 8));
@@ -5750,10 +5874,8 @@ mod fast_tests {
     /// The buffer title slot `index`'s host slot holds, as a raw pointer.
     fn shown(heap: &HostHeap, index: u32) -> Option<usize> {
         let host = heap.made.read().unwrap().host(index)?;
-        let kept = heap.kept.lock().unwrap();
-        kept.get(host as usize)?
-            .as_ref()
-            .map(|b| windows::core::Interface::as_raw(b) as usize)
+        heap.kept
+            .with(host, |slot| slot?.as_ref().map(|b| windows::core::Interface::as_raw(b) as usize))
     }
 
     /// The same record in another slot is copied from the cache; the entry
