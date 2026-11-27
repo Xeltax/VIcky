@@ -511,7 +511,11 @@ fn wake() {
 #[cfg(windows)]
 fn worker() {
     crate::framelog::keep_on_fast_cores("victory-submit");
+    // VIcky (`VICTORY_HELPER_PRIORITY`, `crate::helpers`): the submitting
+    // thread with its helpers.
+    let mut priority = crate::helpers::Priority::new();
     loop {
+        priority.keep();
         {
             let mut work = lock(&WORK.0);
             while !*work {

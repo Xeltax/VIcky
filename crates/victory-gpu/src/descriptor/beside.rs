@@ -312,7 +312,10 @@ impl Lane {
     /// The lane's thread: each job in turn, timed, its panic kept for the
     /// one who waits for it.
     fn serve(&self) {
+        // VIcky (`VICTORY_HELPER_PRIORITY`, `crate::helpers`).
+        let mut priority = crate::helpers::Priority::new();
         loop {
+            priority.keep();
             let (job, ticket) = {
                 let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
                 loop {

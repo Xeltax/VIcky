@@ -721,7 +721,10 @@ impl Writer {
     /// The writer's loop: whatever is waiting, newest per allocation, each
     /// written with this thread's scratch.
     fn run(&self) {
+        // VIcky (`VICTORY_HELPER_PRIORITY`, `crate::helpers`).
+        let mut priority = crate::helpers::Priority::new();
         loop {
+            priority.keep();
             let batch: Vec<Landing> = {
                 let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
                 while held.waiting.is_empty() {

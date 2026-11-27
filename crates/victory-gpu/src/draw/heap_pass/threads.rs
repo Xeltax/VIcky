@@ -177,7 +177,11 @@ pub(crate) fn buffers(
             .filter_map(|i| {
                 std::thread::Builder::new()
                     .name(format!("victory-heap-pass-{i}"))
-                    .spawn_scoped(s, one)
+                    .spawn_scoped(s, move || {
+                        // VIcky (`VICTORY_HELPER_PRIORITY`, `crate::helpers`).
+                        crate::helpers::raise();
+                        one()
+                    })
                     .ok()
             })
             .collect();

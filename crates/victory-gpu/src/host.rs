@@ -4070,7 +4070,10 @@ fn relay_worker() {
         fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));
     };
     let mut fetch: Option<RelayFetch> = None;
+    // VIcky (`VICTORY_HELPER_PRIORITY`, `crate::helpers`).
+    let mut priority = crate::helpers::Priority::new();
     loop {
+        priority.keep();
         let next = {
             let mut line = line();
             loop {

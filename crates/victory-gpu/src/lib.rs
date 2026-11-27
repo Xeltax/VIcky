@@ -17,6 +17,8 @@
 
 #[cfg(windows)]
 mod alt;
+#[cfg(windows)]
+mod helpers;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod bvhcheck;
 #[cfg(all(windows, feature = "diagnostics"))]

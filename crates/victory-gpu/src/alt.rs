@@ -1,15 +1,13 @@
 //! VIcky: opt-in switches with an `alt` mode, for the ports of lot 4
-//! (`VICTORY_TEXTURE_BACK_ASYNC`, `VICTORY_SPANS_QUICK`, `VICTORY_SYNC_FINE`,
-//! `VICTORY_PLACE_CONSTANT_CARD`, `VICTORY_CARD_AWAKE`,
-//! `VICTORY_HELPER_PRIORITY`, `VICTORY_JOIN_COPIES`).
+//! (`VICTORY_SPANS_QUICK`, `VICTORY_SYNC_FINE`, `VICTORY_CARD_AWAKE`,
+//! `VICTORY_HELPER_PRIORITY`, `VICTORY_WIDE_THREADS`, `VICTORY_JOIN_COPIES`;
+//! `VICTORY_TEXTURE_BACK_ASYNC` uses texback's own, of the same form).
 //!
 //! Unset or `0`: off (the default, as before). `1`: on. `alt`: twenty
 //! seconds off and twenty on, in turn from the first asking, each change
 //! said in the log as `<what> from now (<NAME>=alt): ON` or `... : off, as
 //! usual` (the form `xcl-notes/alt-fps.sh` and the other `alt` switches,
-//! `VICTORY_LATE_WATER`, `VICTORY_TEXTURE_BACK_LEAN`, use). A switch that
-//! can be changed only once, at its first asking (a thread's priority, a
-//! thread started), reads `alt` as `1` and says so.
+//! `VICTORY_LATE_WATER`, `VICTORY_TEXTURE_BACK_LEAN`, use).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
@@ -61,25 +59,6 @@ impl Alt {
                     tracing::info!("{} from now ({}=alt): {}", self.what, self.name, if on { "ON" } else { "off, as usual" });
                 }
                 on
-            }
-        }
-    }
-
-    /// For a switch that is set once, at its first asking: `alt` counts as
-    /// `1` (said once).
-    pub(crate) fn once(&self) -> bool {
-        match self.mode() {
-            0 => false,
-            1 => true,
-            _ => {
-                if self.last.swap(1, Relaxed) == 2 {
-                    tracing::info!(
-                        "{} ({}=alt is taken as 1: it is set once, at the start, and cannot change in a run)",
-                        self.what,
-                        self.name
-                    );
-                }
-                true
             }
         }
     }

@@ -2794,10 +2794,23 @@ fn workers() -> &'static Workers {
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
+                // VIcky (`VICTORY_HELPER_PRIORITY`, `crate::helpers`).
+                let mut priority = crate::helpers::Priority::new();
                 loop {
+                    priority.keep();
                     let job = {
                         let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
+                            // VIcky (`VICTORY_WIDE_THREADS=alt`): a thread
+                            // past the phase's count takes nothing.
+                            if !crate::helpers::wide_active(i) {
+                                jobs = workers
+                                    .more
+                                    .wait_timeout(jobs, std::time::Duration::from_millis(50))
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .0;
+                                continue;
+                            }
                             if let Some(job) = jobs.pop_front() {
                                 break job;
                             }
@@ -2815,15 +2828,17 @@ fn workers() -> &'static Workers {
     workers
 }
 
-/// The threads kept for [`wide`].
+/// The threads kept for [`wide`]: a quarter of the logical processors, 2
+/// to 6 (VIcky, `VICTORY_WIDE_THREADS`, `crate::helpers`: or foxhound's
+/// three eighths, 2 to 8, or as many as it says).
 fn kept_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    crate::helpers::wide_kept()
 }
 
 /// The threads [`wide_run`] runs its jobs on: the kept ones and the
-/// caller's.
+/// caller's (with `VICTORY_WIDE_THREADS=alt`, ours).
 pub(crate) fn wide_threads() -> usize {
-    kept_threads() + 1
+    crate::helpers::wide_sized() + 1
 }
 
 /// Runs `jobs` on the kept threads and on this one, and returns when all

@@ -447,7 +447,10 @@ fn crew() -> &'static Crew {
         for i in 0..crew_size() {
             let _ = std::thread::Builder::new().name(format!("victory-mirror-{i}")).spawn(|| {
                 let crew = CREW.get().expect("made above");
+                // VIcky (`VICTORY_HELPER_PRIORITY`, `crate::helpers`).
+                let mut priority = crate::helpers::Priority::new();
                 loop {
+                    priority.keep();
                     let job = {
                         let mut jobs = crew.jobs.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
