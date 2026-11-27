@@ -275,6 +275,7 @@ impl HostHeap {
         let turns = super::turns_now();
         // VIcky (`VICTORY_MADE_PASS_FIRST`, `super::made_first`): the same.
         let hand = super::made_first::hand_now();
+        let mut since = super::made_first::PASS_TURN_EVERY;
         for (slots, words) in due.chunks(MIRROR_CHUNK).zip(records.chunks(MIRROR_CHUNK)) {
             RETIRE_LATER.set(Some(Vec::new()));
             {
@@ -285,13 +286,15 @@ impl HostHeap {
                     // `made`: the chunk ends here and goes on once that
                     // thread had it. VIcky (`VICTORY_MADE_PASS_FIRST`): the
                     // pass over buffer views first, if it waits.
-                    if self.pass_wanted(hand) {
+                    if since >= super::made_first::PASS_TURN_EVERY && self.pass_wanted(hand) {
                         chunk.end(self, &made);
                         made = self.pass_turn_over(made);
+                        since = 0;
                     } else if self.turn_wanted(turns) {
                         chunk.end(self, &made);
                         made = self.turn_over(made);
                     }
+                    since += 1;
                     if index >= mirrored {
                         // (Counted and said there, as before.)
                         let _ = self.record_at(index, handle, false);

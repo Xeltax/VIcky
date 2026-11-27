@@ -356,7 +356,8 @@ The pass waits 52-55 ms of its 102-108 for `made`: "120 of 1,168 chunks waited",
 
 With the switch on (`crates/victory-gpu/src/descriptor/host/made_first.rs`):
 - **(a) The pass spins.** When a chunk of the pass (made alone, on its one thread) finds `made` held (`HostHeap::made_counted`), the pass says it waits: a count of its own beside `Turns::waiting`. It then tries again for up to 200 us before it sleeps in the lock, and a spinning thread catches the gap between two of the sync's chunks.
-- **(b) The sync hands over.** The heap sync's chunk loops (`HostHeap::mirror_due`, and `mirror_due_lean` with `VICTORY_HEAP_SYNC_LEAN`) look at that count before each slot, where they look for `VICTORY_MADE_TURNS`' waiters (the pass first). When the pass waits, the chunk ends there (its keeps and marks made) and `made` goes. The sync waits up to 100 us for the pass to have taken it, then takes it back after the pass's chunk.
+- **(b) The sync hands over.** The heap sync's chunk loops (`HostHeap::mirror_due`, and `mirror_due_lean` with `VICTORY_HEAP_SYNC_LEAN`) look at that count before each slot, where they look for `VICTORY_MADE_TURNS`' waiters (the pass first). When the pass waits, the chunk ends there (its keeps and marks made) and `made` goes. The sync waits up to 100 us for the pass to have taken it, then takes it back after the pass's chunk, spinning for it up to 200 us before it sleeps. It then makes at least 64 slots (a chunk's worth) before it hands `made` over again. So the two take turns chunk for chunk, and the pass waits at most about one of the sync's chunks.
+- Why the last two rules: in the bench below, with the hand-over at every slot and the sync asleep in the lock to take it back, the pass (which there never pauses) took `made` again before the sync woke, and the sync fell from 2.37 M to 0.14 M slots a second.
 - `VICTORY_MADE_PASS_FIRST_HAND=0` leaves (b) out (the pass only spins), for telling the two steps apart.
 
 The pass's own loops never look at the count and the sync never raises it, so the two cannot hand `made` back and forth. Not changed:
@@ -424,7 +425,15 @@ Lever 1, `at_submit::ledger::tests` (the check):
 
 Lever 2, `descriptor::host::fast_tests` (on a device):
 - `the_pass_first_leaves_every_slot_as_without_it`: the sync's chunks and the pass's chunks on two threads at once, 24 rounds, the pass first with both steps. Every slot's record and held resource is as the same rounds one after the other with the switch off leave it; the pass said it waited and the sync handed `made` over.
-- Micro-benchmark `bench_pass_first` (`cargo test -p victory-gpu --profile diag --lib descriptor::host::fast_tests::bench_pass_first -- --ignored --nocapture`): the pass's wait for `made` a chunk and the sync's slots a second, off / spin / spin + hand-over.
+- Micro-benchmark `bench_pass_first` (`cargo test -p victory-gpu --profile diag --lib descriptor::host::fast_tests::bench_pass_first -- --ignored --nocapture`): one thread makes 8,192 slots in the sync's chunks over and over, another (counted as the pass's) 2,048 slots of its own in the pass's chunks of 64, with no pause between its chunks; 2 s each, two runs each way (Ryzen 9 9900X, another agent building beside):
+
+| | the pass: chunks in 2 s, wait for `made` a chunk, share of its time | the sync |
+|---|---|---|
+| off | 13,440-14,080; 109-116 us; 77-78 % | 2.30 M slots/s |
+| spin (a) | 18,656-19,712; 69-75 us; 68-70 % | 2.06-2.12 M slots/s |
+| spin + hand-over (a + b) | 46,144-46,336; 12.3-12.4 us; 28-29 % | 0.98 M slots/s |
+
+  With (b) the two take turns: the pass waits about a tenth as long and makes 3.4 times the chunks, and the sync gets a bit under half of `made`, the most it can when the pass never pauses. In the game the pass works outside the lock between its chunks (its copies and ranges), so the sync should lose less: the note expects it to wait for the pass's ~38 ms of holds.
 - `made_first::tests::the_line_says_each_phase`.
 
 Also `alt::tests::a_follower_takes_its_leader_s_phases_when_both_alternate`, and `burst`'s tests with the covered columns.
@@ -435,8 +444,8 @@ Also `alt::tests::a_follower_takes_its_leader_s_phases_when_both_alternate`, and
 - **Lever 1, fewer syncs (rule 2).** When one is still running, a submission starts none, so the next sync asks up to one submission later than today. Records copied as bytes then reach the pass over buffer views' marks later, so a slot may be made by the next pass instead. That lateness already exists today (the syncs race with the pass's call), but its window grows. `alt` runs show it as more slots on the next pass, if anything.
 - **Lever 1, what the check does not cover.** It checks pages taken, not each slot's making. Slots left waiting for a texture's host copy (`make_waiting`, still run at the join place), slots left to the draws through tables, and `VICTORY_MIRROR_TRY`'s deferred slots (drained by every sync after its asking) are as before, so the check does not look at them.
 - **Lever 1, the burst line's sync ms by place** shift with skips: a sync left running is counted with a later submission.
-- **Lever 2, the sync slows.** It waits for the pass's holds, up to 100 us a hand-over plus the pass's chunk (~35 us). Without lever 1 every sync is joined, so the join grows. Use it with lever 1.
-- **Lever 2, the pass's spin** burns up to 200 us of a core per wait (120 waits a frame in PF5b, so at most ~24 ms a frame of a core, on the pass's thread only).
+- **Lever 2, the sync slows.** It waits for the pass's holds: up to 100 us a hand-over plus the pass's chunk (~35 us), at most once every 64 of its slots, and it spins up to 200 us to take `made` back. While both want `made` the sync gets about half (the bench). Without lever 1 every sync is joined, so the join grows. Use it with lever 1.
+- **Lever 2, the spins** burn up to 200 us of a core per wait: the pass's (120 waits a frame in PF5b, so at most ~24 ms a frame of a core) and the sync's, once per hand-over.
 - **Lever 2, other waiters.** The title's one-slot takers may wait a little longer while the pass, preferred, holds `made` chunk after chunk. `VICTORY_MADE_TURNS` still lets them in between the pass's slots.
 - **Neither is measured yet.** The unit tests show the order and the mechanism, not the frame.
 

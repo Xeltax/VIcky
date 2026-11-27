@@ -27,7 +27,13 @@
 //!   before each slot, where they look for `VICTORY_MADE_TURNS`' waiters;
 //!   when the pass waits, the chunk ends there (its keeps and marks made),
 //!   `made` goes, the sync waits up to `TURN_WAIT` for the pass to have taken
-//!   it ([`HostHeap::pass_turn_over`]) and then takes it back.
+//!   it ([`HostHeap::pass_turn_over`]) and then takes it back. It then makes
+//!   at least [`PASS_TURN_EVERY`] slots before it hands `made` over again,
+//!   and takes it back spinning (up to [`PASS_SPIN`]) rather than asleep in
+//!   the lock: the pass waits at most about one of the sync's chunks, and
+//!   the two take turns chunk for chunk instead of the sync's starving (a
+//!   pass that never pauses took `made` back before the sleeping sync woke:
+//!   2.37 M slots a second of the sync's without the switch, 0.14 M so).
 //!   `VICTORY_MADE_PASS_FIRST_HAND=0` leaves (b) out (the pass only spins).
 //!
 //! The pass's own loops never look at the count and the sync never raises
@@ -65,6 +71,14 @@ pub(crate) static PASS_FIRST: crate::alt::Alt = crate::alt::Alt::following(
 /// How long the pass spins for `made` before it sleeps in the lock: some
 /// five of the sync's chunks.
 pub(crate) const PASS_SPIN: Duration = Duration::from_micros(200);
+
+/// Slots a chunk maker of the sync makes between two hand-overs (a chunk's
+/// worth, `MIRROR_CHUNK`): the pass waits at most about one of the sync's
+/// chunks. Handed over at every slot, the sync was starved in the bench
+/// (`bench_pass_first`: 2.37 M slots a second off, 0.14 M with the
+/// hand-over at each slot): the pass asks again right after each of its
+/// chunks, and the sync made one slot between two of them.
+pub(crate) const PASS_TURN_EVERY: usize = 64;
 
 /// Whether the sync's chunks hand `made` to a waiting pass (step (b);
 /// `VICTORY_MADE_PASS_FIRST_HAND=0`: the pass only spins, step (a)).
@@ -148,8 +162,11 @@ impl HostHeap {
     }
 
     /// A chunk of the sync lets `made` go to the waiting pass, waits up to
-    /// `TURN_WAIT` for the pass to have it, and takes it back (after the
-    /// pass's chunk).
+    /// `TURN_WAIT` for the pass to have it, and takes it back after the
+    /// pass's chunk: it spins for it up to [`PASS_SPIN`] (a pass that never
+    /// pauses takes `made` again at once, before a sleeper in the lock
+    /// wakes: the spin catches the gap between two of its chunks), then
+    /// sleeps for it.
     pub(super) fn pass_turn_over<'a>(&'a self, made: std::sync::RwLockWriteGuard<'a, Made>) -> std::sync::RwLockWriteGuard<'a, Made> {
         let began = Instant::now();
         let served = self.turns.pass_served.load(SeqCst);
@@ -160,7 +177,15 @@ impl HostHeap {
         {
             std::hint::spin_loop();
         }
-        let made = held_alone(&self.made);
+        let back = Instant::now();
+        let mut got = None;
+        while got.is_none() && back.elapsed() < PASS_SPIN {
+            for _ in 0..32 {
+                std::hint::spin_loop();
+            }
+            got = made_tried(&self.made);
+        }
+        let made = got.unwrap_or_else(|| held_alone(&self.made));
         #[cfg(test)]
         PASS_TURNS.fetch_add(1, Relaxed);
         count(K::Hands, 1);

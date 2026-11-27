@@ -3031,6 +3031,9 @@ impl HostHeap {
         // VIcky (`VICTORY_MADE_PASS_FIRST`, [`made_first`]): asked once a
         // call (never on the pass's own thread).
         let hand = made_first::hand_now();
+        // (Slots made since the last hand-over: at least a chunk's between
+        // two, `made_first::PASS_TURN_EVERY`.)
+        let mut since = made_first::PASS_TURN_EVERY;
         for chunk in due.chunks(MIRROR_CHUNK) {
             RETIRE_LATER.set(Some(Vec::new()));
             {
@@ -3045,15 +3048,17 @@ impl HostHeap {
                     // made) and goes on once that thread had it. VIcky
                     // (`VICTORY_MADE_PASS_FIRST`): the pass over buffer
                     // views first, if it waits.
-                    if self.pass_wanted(hand) {
+                    if since >= made_first::PASS_TURN_EVERY && self.pass_wanted(hand) {
                         drop(later);
                         made = self.pass_turn_over(made);
                         later = KeptLater::begin(self);
+                        since = 0;
                     } else if self.turn_wanted(turns) {
                         drop(later);
                         made = self.turn_over(made);
                         later = KeptLater::begin(self);
                     }
+                    since += 1;
                     if let Some(record) = self.record_at(index, handle, false) {
                         self.mirror_made(&made, true, (index, handle, false, true), record, &mut Lookups::each());
                     }
