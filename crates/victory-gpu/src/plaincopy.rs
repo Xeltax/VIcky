@@ -281,6 +281,25 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
     whole
 }
 
+/// With [`on`]: copies a run of title memory that read the last time it
+/// was copied (`crate::host::sparseknown`, the holes beside it remembered)
+/// in place, whatever its length and whether its blocks faulted lately
+/// (the holes beside it did). False if it is off or a page was not there.
+pub(crate) fn copy_run(to: *mut u8, from: *const u8, len: usize) -> bool {
+    if !on() {
+        return false;
+    }
+    let whole = guarded(to, from, len);
+    if whole {
+        COUNT[0].fetch_add(1, Relaxed);
+        COUNT[1].fetch_add(len as u64, Relaxed);
+    } else {
+        COUNT[2].fetch_add(1, Relaxed);
+        note_fault(from as usize, len);
+    }
+    whole
+}
+
 /// With [`on`]: copies `len` bytes, fewer than [`LEAST`], of title memory
 /// at `from` into host memory at `to`, for a caller that is NOT asking
 /// whether the page is there but expects it to be (a list's fill of upload

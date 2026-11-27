@@ -1312,7 +1312,7 @@ pub(crate) fn log(frames: f64) {
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
          refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
-         {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms{}; \
+         {:.1} submissions, snapshots {:.1} ms{}, {:.1} MB compared back; sparse reads {:.1} ms{}{}; \
          guards {:.1} ms ({:.0} askings, {:.0} found all clean at once{}, {:.0} blocks walked: \
          {:.0} written ({:.0} of them still read-only), {:.0} absent, {:.0} clean; \
          {:.0} waits for their lock {:.2} ms, held {:.2} ms finding all clean and {:.2} ms \
@@ -1333,6 +1333,7 @@ pub(crate) fn log(frames: f64) {
         c[C::GpuWrites as usize],
         c[C::BackSubmissions as usize],
         ms(c[C::SnapshotUs as usize]),
+        crate::shadow::snapside::clause(frames),
         mb(c[C::BackCompared as usize]),
         ms(c[C::SparseUs as usize]),
         crate::host::sparse_clause(
@@ -1341,6 +1342,7 @@ pub(crate) fn log(frames: f64) {
             c[C::SparseReadsFailed as usize],
             c[C::SparseQueries as usize]
         ),
+        crate::host::sparseknown::clause(frames),
         ms(c[C::GuardUs as usize]),
         c[C::GuardAsked as usize],
         c[C::GuardAllClean as usize],

@@ -28,6 +28,11 @@
 //! 5. as before: the settle when the card's results run low, the copies
 //!    in the card's memory, `ExecuteCommandLists`.
 //!
+//! VIcky (`VICTORY_SNAPSHOT_BESIDE=1`): the snapshots of 3 are only given
+//! to the threads kept for wide work there, and are done just before
+//! `ExecuteCommandLists`: they run beside 4 and 5 (`crate::shadow::snapside`
+//! says why that order holds).
+//!
 //! What the sync shares with the rest of a submission, and how the order
 //! is kept:
 //!
@@ -100,7 +105,10 @@
 //!   meanwhile; no job waits for a caller. The sync itself runs on a
 //!   thread of its own ([`Lane`]) and never in that queue: there the
 //!   submitting thread, waiting for its snapshots, could take it and run
-//!   it whole.
+//!   it whole. Snapshots given beside (`VICTORY_SNAPSHOT_BESIDE`) wait in
+//!   a queue of their own, which the kept threads take only when the shared
+//!   one is empty and no caller of `wide` takes: the sync's page reads go
+//!   first.
 //! - The list of heaps (read-locked for the whole sync) and one sync at a
 //!   time (`SYNCING`): as before, from the asking to the last slot on one
 //!   thread. A heap the title releases waits for the sync's end, as it did.

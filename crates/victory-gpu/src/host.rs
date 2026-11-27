@@ -6502,14 +6502,10 @@ impl Host {
         crate::watch::ask_once_end();
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
-        // lists have not gone to the card.
-        {
-            #[cfg(feature = "diagnostics")]
-            let snapshots = std::time::Instant::now();
-            crate::shadow::take_snapshots();
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
-        }
+        // lists have not gone to the card. VIcky (`VICTORY_SNAPSHOT_BESIDE`,
+        // `crate::shadow::snapside`): on the wide threads until just before
+        // the lists go, below.
+        let snapping = crate::shadow::snapside::take();
         // VIcky: the heap sync started beside the refreshes ends before
         // anything reads the host heaps (the lists, when they run), and the
         // slots it left waiting for a texture made since are made now. The
@@ -6534,6 +6530,7 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        crate::shadow::snapside::done(snapping);
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -8276,6 +8273,10 @@ enum Refreshed {
 /// VIcky: a submission's refreshes by part, `VICTORY_REFRESH_FRONT`.
 pub(crate) mod front;
 
+/// VIcky: ranges read around the holes found the last time,
+/// `VICTORY_SPARSE_KNOWN`.
+pub(crate) mod sparseknown;
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
@@ -8513,6 +8514,15 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
     }
+    // VIcky (`VICTORY_SPARSE_KNOWN`): around the holes found the last time.
+    let known = if !title_dst && len >= SPARSE_LEAST {
+        sparseknown::copy(dst, src, len)
+    } else {
+        sparseknown::Known::Off
+    };
+    if matches!(known, sparseknown::Known::Done) {
+        return;
+    }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     // A range read around its holes if the copy fails (into host memory,
@@ -8538,6 +8548,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
+        sparseknown::whole(&known, src as usize, len);
         return;
     }
     // The copy failed: a source page is not there, or the destination is
@@ -8559,6 +8570,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         } else {
             read_sparse(src, dst, len, &mut calls);
         }
+        sparseknown::found(&known, src as usize, len, &calls.holes);
     } else {
         read_pieces(src, dst, len, &mut calls);
     }
@@ -8586,6 +8598,8 @@ struct SparseCalls {
     reads: u64,
     failed: u64,
     queries: u64,
+    /// The holes zeroed (first byte, bytes), for `sparseknown`.
+    holes: Vec<(usize, usize)>,
 }
 
 /// Whether ranges with holes are read around them without asking Windows
@@ -8656,6 +8670,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize, calls: &mut SparseCalls
         };
         if !readable {
             unmapped(n);
+            calls.holes.push((at as usize, n));
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
         } else {
@@ -8728,6 +8743,7 @@ fn read_probing(src: *const u8, dst: *mut u8, len: usize, from: usize, calls: &m
             }
             calls.failed += 1;
             unmapped(n);
+            calls.holes.push((base + at, n));
             // SAFETY: inside the destination, writable host memory.
             unsafe { to.write_bytes(0, n) };
             at = next;
@@ -8742,6 +8758,7 @@ fn read_probing(src: *const u8, dst: *mut u8, len: usize, from: usize, calls: &m
                     }
                     Some((n, false)) => {
                         unmapped(n);
+                        calls.holes.push((base + at, n));
                         // SAFETY: as above.
                         unsafe { to.write_bytes(0, n) };
                         at += n;
@@ -8767,6 +8784,7 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize, calls: &mut SparseCalls
                 if !read(at as *const u8, to, n) {
                     calls.failed += 1;
                     unmapped(n);
+                    calls.holes.push((at, n));
                     // SAFETY: inside the destination, which is mapped.
                     unsafe { to.write_bytes(0, n) };
                 }
@@ -9456,7 +9474,7 @@ impl Meter {
                 tracing::info!(
                     "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
                      {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \
-                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms)",
+                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms){}",
                     card[7],
                     card[8] >> 20,
                     card[9] >> 20,
@@ -9466,7 +9484,8 @@ impl Meter {
                     per_frame(3),
                     per_frame(4) / 1e6,
                     per_frame(5),
-                    per_frame(6) / 1e3
+                    per_frame(6) / 1e3,
+                    crate::shadow::cardlist::clause()
                 );
             }
             tracing::info!(
