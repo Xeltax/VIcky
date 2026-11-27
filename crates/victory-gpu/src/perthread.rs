@@ -304,16 +304,28 @@ mod tests {
         assert!(seen.len() < SLOTS, "blocks were not given back: {} distinct", seen.len());
     }
 
-    /// The largest of every thread's own value.
+    /// The largest of every living thread's own value. (The threads stay
+    /// alive while it is read: a block given back may be taken by the next
+    /// thread, which sets its own value there.)
     #[test]
     fn each_thread_sets_its_own() {
         static C: Counters<1> = Counters::new();
-        std::thread::scope(|s| {
+        let (set, read) = (std::sync::Barrier::new(6), std::sync::Barrier::new(6));
+        let most = std::thread::scope(|s| {
             for t in 1..=5u64 {
-                s.spawn(move || C.set_if(0, t * 10, |old, v| v > old));
+                let (set, read) = (&set, &read);
+                s.spawn(move || {
+                    C.set_if(0, t * 10, |old, v| v > old);
+                    set.wait();
+                    read.wait();
+                });
             }
+            set.wait();
+            let most = C.each(0).max();
+            read.wait();
+            most
         });
-        assert_eq!(C.each(0).max(), Some(50));
+        assert_eq!(most, Some(50));
     }
 
     /// Micro-benchmark (`cargo test -p victory-gpu --release perthread -- --ignored --nocapture`):
