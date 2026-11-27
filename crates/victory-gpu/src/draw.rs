@@ -1672,6 +1672,10 @@ impl State {
                 heap_pass::Turn::Run(run) => run,
             };
             let started = std::time::Instant::now();
+            // VIcky (`VICTORY_MIRROR_TRY`): slots copied while the heap's
+            // lock was held are noted before the pass takes its slots, as
+            // when they were made at the call.
+            host.drain_deferred(false);
             heap_pass::start(list, heap, host, frame, run, false);
             let textures_began = std::time::Instant::now();
             self.heap_textures(list, heap, host);
@@ -1685,6 +1689,8 @@ impl State {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
+        // (As above.)
+        host.drain_deferred(false);
         let made = heap_pass::in_place(list, heap, host, frame);
         let textures_began = std::time::Instant::now();
         self.heap_textures(list, heap, host);
@@ -1860,6 +1866,10 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
+        // VIcky (`VICTORY_MIRROR_TRY`): slots copied while the heap's lock
+        // was held are queued before the pass takes its due slots, as when
+        // they were made at the call.
+        host.drain_deferred(false);
         /// Bytes of texture memory staged per frame.
         // `VICTORY_TEXTURE_STAGE_MB` raises it: a backlog of tens of thousands of
         // textures (a scene's first minutes) then drains in fewer frames.

@@ -125,6 +125,9 @@ pub(crate) struct HostHeap {
     /// write-combined memory: a write there, followed by the next lock
     /// taken, cost about 0.1 us a slot (the bench in `fast_tests`).
     strides_held: Vec<std::sync::atomic::AtomicU32>,
+    /// VIcky (`VICTORY_MIRROR_TRY`, [`super::mirror_try`]): the copied
+    /// slots [`HostHeap::mirror_copy`] left to the next drain.
+    deferred: super::mirror_try::Deferred,
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -1357,6 +1360,7 @@ impl HostHeap {
             })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            deferred: Default::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -2762,6 +2766,99 @@ impl HostHeap {
         let record = self.record_at(index, handle, for_draw)?;
         let made = held_alone(&self.made);
         self.mirror_made(&made, true, (index, handle, for_draw, true), record, &mut Lookups::each())
+    }
+
+    /// [`HostHeap::mirror`] (not for a draw) of a descriptor the title
+    /// copied into title slot `index` at `handle` (`super::copy_simple`).
+    /// VIcky (`VICTORY_MIRROR_TRY`, [`super::mirror_try`]): made now if
+    /// `made` is free; else left on this heap's list for the next drain
+    /// ([`HostHeap::drain_deferred`]), and with `check` made now all the
+    /// same, waiting for the lock. Without the switch, `mirror` itself.
+    pub(crate) fn mirror_copy(&self, index: u32, handle: u64) {
+        use super::mirror_try::{Count, Mode, Slot, count, mode, record_key};
+        let check = match mode() {
+            Mode::Off => {
+                self.mirror(index, handle, false);
+                return;
+            }
+            Mode::Try => false,
+            Mode::Check => true,
+        };
+        let Some(record) = self.record_at(index, handle, false) else {
+            return;
+        };
+        let free = match self.made.try_write() {
+            Ok(made) => Some(made),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(made) = free {
+            count(Count::MadeAtCall, 1);
+            self.mirror_made(&made, true, (index, handle, false, true), record, &mut Lookups::each());
+            return;
+        }
+        if check {
+            // Made as before, then left with the record it was made from.
+            let made = held_alone(&self.made);
+            self.mirror_made(&made, true, (index, handle, false, true), record, &mut Lookups::each());
+        }
+        let key = if check { record_key(record) } else { 0 };
+        if self.deferred.push(Slot { index, handle, key }) {
+            count(Count::Left, 1);
+        } else if !check {
+            // The list is full: made now, waiting, as before.
+            self.mirror(index, handle, false);
+        }
+    }
+
+    /// VIcky (`VICTORY_MIRROR_TRY`): the slots [`HostHeap::mirror_copy`] left
+    /// on this heap's list, made now in the order they were left, through
+    /// [`HostHeap::mirror_due`] as the heap sync makes the slots it finds
+    /// written, each from its record as it is now. A slot whose record can
+    /// no longer be read (the title unmapped its page) is not made. With
+    /// `check`, the slots whose record is not the one made at the call are
+    /// counted. `by_sync`: drained by the heap sync, else by a pass over
+    /// the heap (for the counts).
+    pub(crate) fn drain_deferred(&self, by_sync: bool) {
+        use super::mirror_try::{Count, Mode, count, mode, readable, record_key};
+        let slots = self.deferred.take();
+        if slots.is_empty() {
+            return;
+        }
+        let check = mode() == Mode::Check;
+        let (mut due, mut gone, mut differing) = (Vec::with_capacity(slots.len()), 0, 0);
+        // The page last found readable: a copy's slots lie side by side.
+        let mut page_read = None;
+        for slot in &slots {
+            let pages = (slot.handle >> 12, (slot.handle + 11) >> 12);
+            if page_read != Some(pages) {
+                if !readable(slot.handle) {
+                    gone += 1;
+                    continue;
+                }
+                page_read = Some(pages);
+            }
+            if check && record_key(super::record_words(slot.handle)) != slot.key {
+                differing += 1;
+            }
+            due.push((slot.index, slot.handle));
+        }
+        self.mirror_due(&due);
+        count(if by_sync { Count::DrainedBySync } else { Count::DrainedByPass }, due.len() as u64);
+        count(Count::Gone, gone);
+        if check {
+            count(Count::Compared, due.len() as u64);
+            count(Count::Differing, differing);
+        }
+    }
+
+    /// Tests: `f` run with `made` held alone by this thread.
+    #[cfg(test)]
+    pub(crate) fn with_made_held<R>(&self, f: impl FnOnce() -> R) -> R {
+        let made = held_alone(&self.made);
+        let out = f();
+        drop(made);
+        out
     }
 
     /// [`HostHeap::mirror`] for a draw, with the host copies its making
