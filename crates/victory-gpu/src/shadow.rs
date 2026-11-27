@@ -3898,6 +3898,16 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            // With `VICTORY_INPLACE_CONSTANTS` the range still goes into the
+            // flights' account of title memory their shaders may write
+            // (nothing is snapshot or copied back for it: `writing`,
+            // `copy_back` and `copy_back_done` pass over a copy in place),
+            // so that what reads or writes it on the CPU at a later
+            // submission waits for them as it does for a copy's range.
+            if crate::inplace::constants_on() {
+                let len = len.min(self.left(address));
+                list.defer_gpu_write(self, address as usize, len as usize);
+            }
             return;
         }
         let len = len.min(self.left(address));
@@ -5170,6 +5180,11 @@ impl Shadow {
         self.card.is_some()
     }
 
+    /// Whether this is title memory in place (`crate::inplace`), not a copy.
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
     fn card_changed(&self, from: usize, to: usize) {
@@ -5711,9 +5726,27 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         drop(map);
         return loose(address, end, len <= 1, any);
     };
+    // With `VICTORY_INPLACE_CONSTANTS`, for a buffer that has no copy yet:
+    // whether no title buffer in its pages has one either (the constants
+    // heap opens a region only then: one memory, one form,
+    // `crate::inplace::place_constants`).
+    let fresh = crate::inplace::constants_on()
+        && map.get(&key).is_some_and(|entry| entry.shadow.is_none())
+        && {
+            let (at, to) = crate::inplace::pages_of_range(key.0, map.get(&key).map_or(0, |entry| entry.end - key.0));
+            let copied = |entry: &Entry| entry.shadow.as_ref().is_some_and(|s| !s.in_place());
+            !map.range((at, 0)..(to, 0)).any(|(_, entry)| copied(entry))
+                && !map.range(..(at, 0)).rev().take(256).any(|(_, entry)| entry.end > at && copied(entry))
+        };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
+        // The title's constants heap, and what lies inside it, in place
+        // whatever its size (`crate::inplace::constants_on`).
+        if let Some(placed) = crate::inplace::place_constants(key.0, len, fresh) {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
+        }
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let size = len.next_multiple_of(1 << 16);
