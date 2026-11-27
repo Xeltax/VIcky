@@ -28,6 +28,12 @@
 //! 770 a second (fxceless/victory-fork issue #1340: `copied=965888` in a
 //! 21-minute run), and on Linux with NVIDIA's open kernel module that churn
 //! ran the driver out of DMA mappings. After fork PR #1359 (fxceless).
+//!
+//! A thread that lands copy-backs keeps its buffer for the title's bytes
+//! and the tiling geometry of the textures it tiled ([`Scratch`]), after
+//! TaynanGT/Vice-Tay f0019f2e20 (Taynan Piza): a buffer of the texture's
+//! size (up to 512 KiB) was made, and the runs of its layout found again,
+//! at every landing.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -312,8 +318,26 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
     Some(Back { buffer, pooled, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
+/// What a thread that lands copy-backs keeps from one landing to the next:
+/// the title's bytes being tiled and the tiling geometry of the mips it
+/// tiled. After TaynanGT/Vice-Tay f0019f2e20 (there one is handed down by
+/// each caller; here each thread that lands keeps its own).
+#[derive(Default)]
+struct Scratch {
+    tiled: Vec<u8>,
+    tiling: victory_formats::texture::TilingCache,
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
 /// Once the list has run, tile its texels back into the same title allocation.
 pub(crate) fn land(back: &Back) {
+    SCRATCH.with_borrow_mut(|scratch| land_with(back, scratch));
+}
+
+fn land_with(back: &Back, scratch: &mut Scratch) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
     let _mapping = crate::watch::title_memory_reading();
@@ -327,9 +351,13 @@ pub(crate) fn land(back: &Back) {
     }
     let (at, end) = back.range();
     let size = end - at;
-    let mut tiled = vec![0u8; size];
+    let Scratch { tiled, tiling } = scratch;
+    if tiled.len() < size {
+        tiled.resize(size, 0);
+    }
+    let tiled = &mut tiled[..size];
     // Keep title bytes the subresources do not cover.
-    if !crate::host::read_into(at as *const u8, &mut tiled) {
+    if !crate::host::read_into(at as *const u8, tiled) {
         return;
     }
     let mut data = std::ptr::null_mut();
@@ -346,7 +374,7 @@ pub(crate) fn land(back: &Back) {
         let len = pitch * rows as usize * f.Depth as usize;
         // SAFETY: the subresource's part of the mapped buffer.
         let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
-        if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
+        if let Err(e) = tiling.tile(&back.layout, tiled, (mip, slice), linear, (pitch, pitch * rows as usize)) {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
             // SAFETY: mapped above.
