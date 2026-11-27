@@ -141,7 +141,7 @@ fn rejected_bind_releases_only_its_new_tables() {
         heap.dynamic(1).is_none(),
         "the first bind must reserve two slots"
     );
-    heap.release(free, 6);
+    heap.release(heap.id(), free, 6);
 
     // Six free slots allow the first new table (four), then refuse the next (three).
     state.set_table(true, 1, four_slot_table);
@@ -172,8 +172,8 @@ fn rejected_bind_releases_only_its_new_tables() {
         "the rolled-back four-slot table must be absent from the cache"
     );
 
-    heap.release(probe, 6);
-    heap.release(blocker, DYNAMIC - 8);
+    heap.release(heap.id(), probe, 6);
+    heap.release(heap.id(), blocker, DYNAMIC - 8);
     state.set_table(true, 2, three_slot_table);
     assert!(
         state.bind(&list, &pipeline, true),
@@ -186,5 +186,5 @@ fn rejected_bind_releases_only_its_new_tables() {
     let all = heap
         .dynamic(DYNAMIC)
         .expect("dropping the recording must return every slot");
-    heap.release(all, DYNAMIC);
+    heap.release(heap.id(), all, DYNAMIC);
 }

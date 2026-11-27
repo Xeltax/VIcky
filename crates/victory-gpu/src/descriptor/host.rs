@@ -22,7 +22,17 @@ pub(crate) mod note_kind;
 pub(crate) mod par_mirror;
 pub(crate) mod sync_lean;
 
+/// The next host heap's identity ([`HostHeap::release`]).
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    /// This host heap's identity, recorded with the dynamic slots a list
+    /// takes from it and checked when they are given back
+    /// ([`HostHeap::release`]): a title heap can be let go before the lists
+    /// that used it are reset, and a new one made at the same address; the
+    /// old lists' reset must not free the new heap's slots. Port of
+    /// trustno1 47747d62 (fxceless #1324).
+    id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -1324,6 +1334,7 @@ impl HostHeap {
             None => (0, count, count),
         };
         let h = HostHeap {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -2361,11 +2372,20 @@ impl HostHeap {
         });
     }
 
+    /// This host heap's identity ([`HostHeap::release`]).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), if they were taken from this heap (`id`, its
+    /// [`HostHeap::id`] then); a release naming another heap frees nothing.
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.dynamic_first) else {
             return;
         };
@@ -5639,17 +5659,17 @@ mod tests {
         assert_eq!((first, left, right, rest), (4, 5, 7, 9));
 
         // Reallocating the left half puts the cursor back in the middle.
-        heap.release(left, 2);
+        heap.release(heap.id(), left, 2);
         assert_eq!(heap.dynamic(2), Some(left));
-        heap.release(left, 2);
-        heap.release(right, 2);
+        heap.release(heap.id(), left, 2);
+        heap.release(heap.id(), right, 2);
         assert_eq!(heap.dynamic(4), Some(left));
         assert_eq!(heap.dynamic(1), None);
 
         // A free slot at each physical end does not form a two-slot range.
-        heap.release(first, 1);
+        heap.release(heap.id(), first, 1);
         let last = first + heap.dynamic - 1;
-        heap.release(last, 1);
+        heap.release(heap.id(), last, 1);
         assert_eq!(heap.dynamic(2), None);
     }
 
@@ -5712,9 +5732,26 @@ mod tests {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// trustno1 47747d62 (fxceless #1324): a release naming another heap's
+    /// identity frees nothing.
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        let (Some(a), Some(b)) = (HostHeap::new(false, 4), HostHeap::new(false, 4)) else {
+            return; // no host GPU
+        };
+        assert_ne!(a.id(), b.id());
+        let first = a.dynamic(2).unwrap();
+        let free = || a.free.load(std::sync::atomic::Ordering::Relaxed);
+        let taken = free();
+        a.release(b.id(), first, 2);
+        assert_eq!(free(), taken, "released with another heap's identity: nothing is freed");
+        a.release(a.id(), first, 2);
+        assert_eq!(free(), taken + 2);
     }
 
     /// The title's view heap on NVIDIA's 1,000,000 views with a
