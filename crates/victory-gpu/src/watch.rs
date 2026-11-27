@@ -2851,6 +2851,20 @@ mod tests {
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+    /// The journal forgets the pages of `[start, end)`. The tests share it,
+    /// as the runtime's threads do: pages another test wrote or noted
+    /// written (`wrote`, `wrote_own`) stay in it after that memory is
+    /// freed, and a fresh allocation given the same address was found
+    /// written before anything wrote it (in the parallel suite only).
+    fn forget_written(start: usize, end: usize) {
+        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let pages: Vec<usize> = j.written.range(first..last).map(|(&page, _)| page).collect();
+        for page in pages {
+            j.written.remove(&page);
+        }
+    }
+
     #[test]
     fn written_pages_are_reported_to_every_asker() {
         // SAFETY: a fresh write-watched allocation, freed at the end.
@@ -2864,6 +2878,7 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
+        forget_written(start, end);
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
         // SAFETY: committed pages of ours.
