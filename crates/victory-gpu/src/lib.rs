@@ -48,6 +48,10 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 pub mod list;
+/// Lot 4's device and copy-queue probes (`VICTORY_LOT4_PROBE=1`); public
+/// for the entry of its child processes ([`lot4::child`]).
+#[cfg(windows)]
+pub mod lot4;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

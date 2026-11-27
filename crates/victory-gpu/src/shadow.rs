@@ -5237,7 +5237,14 @@ impl Shadow {
         let start = self.start as usize;
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
+        // Lot 4's P8 times the copies of one frame in 64 (`VICTORY_LOT4_PROBE=1`).
+        let timed = crate::lot4::recording().then(std::time::Instant::now);
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if let Some(began) = timed {
+            let watched = self.watched.load(Ordering::Relaxed) == 1;
+            let ns = began.elapsed().as_nanos() as u64;
+            crate::lot4::copied(self.id, (self.start, self.len), self.card.is_some(), watched, from, to, ns);
+        }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
