@@ -67,6 +67,11 @@
 //!   atomics or exports). Run 2026-11-26: the stores of
 //!   `CS_ShadowRenderTiledCascadesAlphaCBPPPC` (#f133e35e), to find which of
 //!   its outputs costs the characters their skin.
+//!
+//! The same machinery leaves out, by default, the parent-link stores of the
+//! ray-tracing structure builder's two box rehydration programs
+//! ([`BVH_LINK_STORES`]); `VICTORY_BVH_LINK_STORES=keep` keeps them. The
+//! offsets `VICTORY_STORE_DROP` lists are left out as well.
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -102,7 +107,7 @@ pub(crate) fn current() -> Option<String> {
 /// decision into its own key) and so left out of the translator's
 /// fingerprint ([`super::translation_fingerprint`]): a new list translates
 /// again only the programs whose decision it changes.
-pub(super) const PER_PROGRAM_SWITCHES: [&str; 7] = [
+pub(super) const PER_PROGRAM_SWITCHES: [&str; 8] = [
     "VICTORY_WAVE_DEEP_SKIPS_NOT",
     "VICTORY_WAVE_DEEP_SKIPS_ONLY",
     "VICTORY_SHADER_OPT_NOT",
@@ -110,6 +115,36 @@ pub(super) const PER_PROGRAM_SWITCHES: [&str; 7] = [
     "VICTORY_WAVE_MASK_COPIES",
     "VICTORY_STORE_DROP",
     "VICTORY_WAVE_SITE_PAIRS",
+    "VICTORY_BVH_LINK_STORES",
+];
+
+/// The parent-link stores of the ray-tracing structure builder's box rehydration programs,
+/// 16-bit boxes (#caa78b8c, 64-byte nodes) and 32-bit boxes (#28918b71, 128-byte nodes),
+/// left out of their translations unless `VICTORY_BVH_LINK_STORES=keep`.
+///
+/// Each thread writes one node in place over the compressed data, then for each of its four
+/// children whose type takes one, one dword: its node's address at
+/// `c1 + ((((child << 3) & !63) - c2) >> 4 & 0x0ffffffc)`, an offset the child pointer
+/// alone decides. With ray tracing on (`VICTORY_BVH_BUILDER=1`, RTX 4080, 32-lane waves) a
+/// save loaded into the first chapter made the title read all ones at `+0x108557`, an
+/// object a few KiB past a rehydrated structure that a rehydration dispatch had written
+/// (fxceless/victory-fork#16, follow-ups 13 and 14). Runs on that save (2026-11-27):
+/// - the four rehydration stages skipped (`VICTORY_BVH_SKIP=47-50`): no crash;
+/// - only these two programs skipped (`49-50`): no crash, with every copy number used up
+///   in the builder's first frame as in the crashing run;
+/// - all four stages run, these 16 stores left out (`VICTORY_STORE_DROP`): no crash.
+///
+/// So some child pointer these stores read holds something else (f16 bounds, another
+/// node's words) and sends the dword out of the structure. The translations were checked
+/// (2026-11-27): read through (`dxc -dumpbin`), and run in place on the RTX 4080 over
+/// synthetic compressed data (512 groups, last groups of 1 to 64 threads, 0 to 4 children of
+/// each kind), where every node and every parent link came out as the console's code writes
+/// them. So the pointers are most likely wrong in the data the programs are given, not
+/// computed wrong; where from is not known yet (VICKY-RT.md). What is lost: the parent links
+/// of rehydrated structures, which a refit walks up; traversal does not read them.
+pub(super) const BVH_LINK_STORES: [(&str, [usize; 8]); 2] = [
+    ("caa78b8ca62bc3d6", [0xb44, 0xb90, 0xbcc, 0xc18, 0xc54, 0xca0, 0xcdc, 0xd28]),
+    ("28918b7150a7aad5", [0x904, 0x950, 0x98c, 0x9d8, 0xa14, 0xa60, 0xa9c, 0xae8]),
 ];
 
 /// Whether the program whose hash is `hash` (`None`: not known) is built with fork #1002's
@@ -151,16 +186,26 @@ fn site_pairs_decide(value: Option<&str>, hash: Option<&str>) -> bool {
     }
 }
 
-/// The console offsets of the stores `VICTORY_STORE_DROP` (module notes)
-/// leaves out of the translation of the program whose hash is `hash`
-/// (`None`: not known), in increasing order; empty for most.
+/// The console offsets of the stores left out of the translation of the
+/// program whose hash is `hash` (`None`: not known), in increasing order:
+/// those `VICTORY_STORE_DROP` lists (module notes) and [`BVH_LINK_STORES`];
+/// empty for most.
 pub fn dropped_stores(hash: Option<&str>) -> Vec<usize> {
     #[cfg(test)]
-    if let Some(value) = TEST_STORE_DROP.get() {
-        return stores_for(&parse_store_drop(value), hash);
+    if TEST_STORE_DROP.get().is_some() || TEST_BVH_LINK_STORES.get().is_some() {
+        let list = drop_list(TEST_STORE_DROP.get().unwrap_or_default(), TEST_BVH_LINK_STORES.get().flatten());
+        return stores_for(&list, hash);
     }
     static LIST: OnceLock<Vec<(String, Vec<usize>)>> = OnceLock::new();
-    let list = LIST.get_or_init(|| parse_store_drop(&std::env::var(PER_PROGRAM_SWITCHES[5]).unwrap_or_default()));
+    let list = LIST.get_or_init(|| {
+        let links = std::env::var(PER_PROGRAM_SWITCHES[7]).ok();
+        if !links_kept(links.as_deref()) {
+            eprintln!(
+                "VICTORY_BVH_LINK_STORES: the parent-link stores of #caa78b8c and #28918b71 are left out (`keep` keeps them)"
+            );
+        }
+        drop_list(&std::env::var(PER_PROGRAM_SWITCHES[5]).unwrap_or_default(), links.as_deref())
+    });
     stores_for(list, hash)
 }
 
@@ -175,6 +220,25 @@ pub(crate) fn store_dropped_here(offset: usize) -> bool {
 thread_local! {
     /// A test's value of `VICTORY_STORE_DROP`, for its thread only.
     pub(crate) static TEST_STORE_DROP: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    /// A test's value of `VICTORY_BVH_LINK_STORES` (`Some(None)`: unset), for its thread only.
+    pub(crate) static TEST_BVH_LINK_STORES: std::cell::Cell<Option<Option<&'static str>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether `VICTORY_BVH_LINK_STORES`'s value (`None`: unset) keeps the stores of
+/// [`BVH_LINK_STORES`]: only `keep` does.
+fn links_kept(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim().eq_ignore_ascii_case("keep"))
+}
+
+/// The stores left out: `VICTORY_STORE_DROP`'s entries (`store_drop`), then
+/// [`BVH_LINK_STORES`] unless `links` is `keep`. Pure, for testing.
+fn drop_list(store_drop: &str, links: Option<&str>) -> Vec<(String, Vec<usize>)> {
+    let mut list = parse_store_drop(store_drop);
+    if !links_kept(links) {
+        list.extend(BVH_LINK_STORES.iter().map(|(hash, offsets)| ((*hash).to_owned(), offsets.to_vec())));
+    }
+    list
 }
 
 /// `VICTORY_STORE_DROP`'s entries: (hash or its first digits, offsets).
@@ -581,5 +645,41 @@ mod tests {
         assert!(!for_program(A, || store_dropped_here(0x2957c)));
         assert!(!store_dropped_here(0x2957c), "outside a program's translation");
         TEST_STORE_DROP.set(was);
+    }
+
+    #[test]
+    fn the_builders_parent_link_stores_are_left_out_unless_kept() {
+        const BOX16: &str = "caa78b8ca62bc3d6";
+        const BOX32: &str = "28918b7150a7aad5";
+        let box16 = vec![0xb44, 0xb90, 0xbcc, 0xc18, 0xc54, 0xca0, 0xcdc, 0xd28];
+        let box32 = vec![0x904, 0x950, 0x98c, 0x9d8, 0xa14, 0xa60, 0xa9c, 0xae8];
+        // unset, or any value but `keep`: left out, from those two programs only
+        for links in [None, Some("0"), Some("1"), Some("")] {
+            let list = drop_list("", links);
+            assert_eq!(stores_for(&list, Some(BOX16)), box16, "{links:?}");
+            assert_eq!(stores_for(&list, Some(BOX32)), box32, "{links:?}");
+            assert_eq!(stores_for(&list, Some(A)), Vec::<usize>::new(), "{links:?}");
+            assert_eq!(stores_for(&list, None), Vec::<usize>::new(), "{links:?}");
+        }
+        for links in ["keep", " KEEP "] {
+            let list = drop_list("", Some(links));
+            assert_eq!(stores_for(&list, Some(BOX16)), Vec::<usize>::new(), "{links:?}");
+            assert_eq!(stores_for(&list, Some(BOX32)), Vec::<usize>::new(), "{links:?}");
+        }
+        // `VICTORY_STORE_DROP` adds to them, each offset once, or stands alone with `keep`
+        let mut more = box16.clone();
+        more.push(0xd30);
+        assert_eq!(stores_for(&drop_list("caa78b8c:b44+d30", None), Some(BOX16)), more);
+        assert_eq!(stores_for(&drop_list("caa78b8c:d30", Some("keep")), Some(BOX16)), vec![0xd30]);
+        // The test overrides, and the program on this thread.
+        let was = TEST_BVH_LINK_STORES.replace(Some(None));
+        assert_eq!(dropped_stores(Some(BOX32)), box32);
+        assert!(for_program(BOX16, || store_dropped_here(0xb44)));
+        assert!(!for_program(BOX16, || store_dropped_here(0x904)));
+        assert!(!for_program(A, || store_dropped_here(0xb44)));
+        TEST_BVH_LINK_STORES.set(Some(Some("keep")));
+        assert!(!for_program(BOX16, || store_dropped_here(0xb44)));
+        assert!(dropped_stores(Some(BOX32)).is_empty());
+        TEST_BVH_LINK_STORES.set(was);
     }
 }

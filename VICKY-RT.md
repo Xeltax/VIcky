@@ -16,7 +16,7 @@ This work is for making the title's compute ray tracing (the BVH structure build
 | #346 | Gargalindis | stores through title memory by address mark their copy; only marked copies are snapshotted and compared |
 | #1032 | UwUCammie | with `VICTORY_COPY_PLAIN=1`, shader writes go back into title memory in place, guarded, instead of by kernel call (`VICTORY_WRITE_PLAIN=0` turns it off) |
 
-**VIcky's own commits.** All are opt-in, except the dispatch parts (last item).
+**VIcky's own commits.** All are opt-in, except the dispatch parts (last item) and the parent-link stores of the builder's box rehydration programs, left out by default since 2026-11-27 (`VICTORY_BVH_LINK_STORES=keep` keeps them; see "The chapter-1 save crash" below).
 - `VICTORY_BACK_JOIN=<bytes>` writes nearby runs of shader writes back as one kernel call. The builder's output gave about 850,000 runs a frame, one `NtWriteVirtualMemory` each.
 - `VICTORY_MEMORY_REFRESH=touched`: shaders note which copies they read (no extra store), and only those are refreshed, plus every copy once in 8 frames.
 - `VICTORY_MEMORY_NAMED_WRITES=0`: a copy that is only named by a constant and never marked stops being snapshotted.
@@ -381,6 +381,33 @@ Same window shot, builder on, `VICTORY_BVH_COPY=skip` and the recommended switch
 | RT82c / RT82d | the same on this branch (7e8e6a8: + dispatch parts) | 5.12 / 5.35 (the first two runs of the build were the driver's) | the bottom strip fixed; the price of the full pass |
 
 - Next: copy numbers. Every builder-on run uses all 1,023 numbers of title memory by address by the second world frame, and later pages read zeros; that fits #24's count of structures with nodes of zeros and pointers far out. Recycling idle numbers is being written.
+
+### The chapter-1 save crash at `+0x108557`: the builder's parent-link stores, left out by default (2026-11-27)
+
+**The crash.** With `VICTORY_BVH_BUILDER=1` (RTX 4080, 32-lane waves), loading the user's chapter-1 save crashed the title at `+0x108557`, reading `0xffffffffffffffff`, about 130 s after `the ray-tracing structure builder runs` (run S2A). fxceless/victory-fork#16 (follow-ups 13 and 14, RTX 4090) saw the same kind of crash: the object read was overwritten with builder data a few KiB past a rehydrated structure, and only the parent-link stores of two rehydration programs can write at an offset that far, since each takes it from a child pointer. Analysis: `xcl-notes/fable-2026-11-27-rehydrate.md`.
+
+**The runs on that save:**
+
+| switch | stages run | crash |
+|---|---|---|
+| none (S2A) | all | yes |
+| `VICTORY_BVH_SKIP=47-50` | rehydration skipped | no |
+| `VICTORY_BVH_SKIP=49-50` | the two box rehydration programs skipped; every copy number used up in the builder's first frame, as in S2A | no |
+| `VICTORY_STORE_DROP=caa78b8c:b44+b90+bcc+c18+c54+ca0+cdc+d28,28918b71:904+950+98c+9d8+a14+a60+a9c+ae8` | all, without the 16 parent-link stores of #caa78b8c (16-bit boxes) and #28918b71 (32-bit boxes) | no |
+
+**The translation is not where the pointers go wrong** (as far as two checks can tell):
+- Read through: the two programs were translated offline as a run translates them (`set_host_max_wave(32)`, same sizes as the run's `first bind` lines) and disassembled with `dxc -dumpbin`. The 64-lane bit count of `EXEC`, the wave sum and both exclusive prefix sums (`wavePrefixOp` per host wave plus the lower half's total, through the LDS exchange), the partial-group mask (`USER_DISPATCH_THREADS`) on every sum, ballot and store, the child select loop and the link address `c1 + ((((child << 3) & !63) - c2) >> 4 & 0x0ffffffc)` all give what the console's code gives.
+- Run on the card: both translations, run in place on the RTX 4080 (roots 1 and 2 on one buffer, as the title binds them) over synthetic compressed data, 512 groups, last groups of 64, 40, 33, 32, 31, 17 and 1 threads, 0–4 children per thread of kinds 0, 4 and 5, four data sets each: every node's child words and every parent link exactly as the console's code writes them, nothing else in the link table. 56 runs, 0 differences. (A scratch test that reads the program from the title's files, so not in the tree.)
+- The meetings of the two host waves are group barriers with a shared-memory fence only (mode 9, no UAV fence), and these programs rehydrate in place, so the D3D12 memory model would let a host wave's node stores pass the other half's loads of the same bytes. On this card that did not happen in the 56 runs.
+
+**So the most likely cause is the data the programs are given:** a compressed region whose host copy is not the title's at that moment (streaming reuses addresses: a structure rehydrated earlier at the same address reads as compressed data of f16 bounds and node words, which is what follow-up 14 found in the stray dwords), or an earlier stage's output not yet there. Not proven.
+
+**The workaround, on by default.** `per_program::BVH_LINK_STORES` leaves those 16 stores out of the two programs' translations, through the `VICTORY_STORE_DROP` machinery (each program's shader cache key names its dropped stores). `VICTORY_BVH_LINK_STORES=keep` keeps them; `VICTORY_STORE_DROP` still adds its own. The log says it once: `VICTORY_BVH_LINK_STORES: the parent-link stores of #caa78b8c and #28918b71 are left out`.
+- What is lost: the parent links of rehydrated structures. A refit walks up them; traversal does not read them. A rehydrated structure the title later refits would refit from whatever those dwords hold.
+- What it does not fix: nodes built from wrong child pointers are still written, inside the structure (rays may miss or hit wrong there).
+- **The translator's source changed, so the shader cache key changed: warm the cache again** (`victory translate --warm`, or one rebuild run) before measuring.
+- To verify in a run: S2A's switches (builder on, no `VICTORY_BVH_SKIP` or `VICTORY_STORE_DROP`), the save restored: the line above in the log, no exception at `+0x108557` for 300 s or more after `the ray-tracing structure builder runs` (two runs, as for any "no crash"). Then once with `VICTORY_BVH_LINK_STORES=keep`: it should crash as S2A did.
+- Next, to find where the pointers go wrong: log, for one stray link (its address outside the structure), the dispatch's root address and the group's region the program read (4 KiB, 8 KiB for 32-bit boxes), from the host copy just before the dispatch and from title memory at the same moment.
 
 ## Roadmap: from about 3.5 fps toward 15–20
 
