@@ -55,6 +55,9 @@ static CARD_AWAKE: crate::alt::Alt = crate::alt::Alt::new(
 /// Since the last frame line: dispatches sent to keep the card awake.
 static SENT: AtomicU64 = AtomicU64::new(0);
 
+/// Whether the thread ended on an error (said once in the log).
+static FAILED: AtomicBool = AtomicBool::new(false);
+
 fn now_ms() -> u64 {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
@@ -119,6 +122,7 @@ pub(crate) fn start(device: &ID3D12Device, wanted: impl Fn() -> bool + Send + 's
         .name("victory-card-awake".into())
         .spawn(move || {
             if let Err(e) = run(&device, &wanted, &ended) {
+                FAILED.store(true, Ordering::Relaxed);
                 tracing::warn!(error = %e, "the card is not kept awake (VICTORY_CARD_AWAKE)");
             }
         })
@@ -219,9 +223,15 @@ mod tests {
         let before = SENT.load(Ordering::Relaxed);
         let awake = start(&host.device, || true);
         assert!(awake.is_some());
-        std::thread::sleep(Duration::from_millis(50));
+        // Its first dispatch goes once the program is compiled and its
+        // pipeline made (some tens of ms, more on a busy machine).
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while SENT.load(Ordering::Relaxed) <= before && !FAILED.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         drop(awake);
-        assert!(SENT.load(Ordering::Relaxed) > before, "no dispatch was sent");
+        assert!(!FAILED.load(Ordering::Relaxed), "the thread ended on an error");
+        assert!(SENT.load(Ordering::Relaxed) > before, "no dispatch was sent in 20 s");
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
