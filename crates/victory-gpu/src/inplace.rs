@@ -49,6 +49,9 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::{Interface, s};
 use windows_sys::Win32::System::Memory as mem;
 
+/// VIcky: lot 4's probes P4 and P5 (`crate::lot4`).
+pub(crate) mod lot4;
+
 /// The unit heaps and placed buffers are cut on, and the console's page.
 const K64: usize = 64 << 10;
 /// The host's write watching (not in windows-sys' memory module).
@@ -802,6 +805,7 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// the title's allocations); without, it keeps to [`title_memory_section`]'s
 /// forgetting, as before.
 pub fn title_memory_section_closed(section: usize) {
+    lot4::section_closed(section);
     views().sections.remove(&section);
     let own = OWN.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|own| own.remove(&section)).flatten();
     if let Some(own) = own {
@@ -814,6 +818,8 @@ pub fn title_memory_section_closed(section: usize) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
+    // VIcky (`VICTORY_LOT4_PROBE`, P4): the page's simulated place.
+    lot4::mapped(at, len, section, offset);
     {
         let mut v = views();
         v.views.insert(at, (len, section, offset));

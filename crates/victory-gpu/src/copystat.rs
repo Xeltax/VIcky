@@ -1141,6 +1141,8 @@ pub(crate) fn recorded(started: std::time::Instant) {
 /// A submission is called on this thread (before it waits for the
 /// submission lock).
 pub(crate) fn submission_begins() {
+    // VIcky (`VICTORY_CCD_PLACE`): a submitting thread.
+    crate::lot4::ccd::submitting();
     let now = now_us();
     if !SUBMITTED_SINCE.load(Relaxed) && !SUBMITTED_SINCE.swap(true, Relaxed) {
         add(C::UntilSubmitUs, now.saturating_sub(PRESENTED_AT.load(Relaxed)));

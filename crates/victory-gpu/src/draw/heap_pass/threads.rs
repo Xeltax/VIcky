@@ -254,6 +254,9 @@ fn work(
             let Some((view, mut lookups)) = made.next() else {
                 break;
             };
+            // VIcky (`VICTORY_LOT4_PROBE`, P2): the pass's slots by kind.
+            #[cfg(feature = "diagnostics")]
+            crate::lot4::slot(crate::lot4::Who::Pass, view.as_ref());
             let Some(view) = view else {
                 let found = noting.then(|| Found { index, view: None, range: None });
                 chunk.push(Slot { index, found, range: None });

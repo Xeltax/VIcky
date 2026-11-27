@@ -359,6 +359,9 @@ pub(crate) fn buffers_taken(
             let mut lookups = Lookups::each();
             (host.mirror_with(index, handle, &mut lookups, marks), lookups)
         };
+        // VIcky (`VICTORY_LOT4_PROBE`, P2): the pass's slots by kind.
+        #[cfg(feature = "diagnostics")]
+        crate::lot4::slot(crate::lot4::Who::Pass, view.as_ref());
         let Some(view) = view else {
             if let Some(found) = found.as_deref_mut() {
                 found.push(Found { index, view: None, range: None });

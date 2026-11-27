@@ -1507,7 +1507,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+    crate::lot4::locks::mutex(crate::lot4::locks::Lock::Guards, &GUARDS)
 }
 
 /// [`guards`] for an asking of [`guard`]. With diagnostics a wait for the
@@ -1516,15 +1516,24 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 fn guards_waited() -> std::sync::MutexGuard<'static, Guards> {
     #[cfg(feature = "diagnostics")]
     {
+        use crate::lot4::locks::{Lock, tried, waited};
         match GUARDS.try_lock() {
-            Ok(g) => return g,
-            Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+            Ok(g) => {
+                tried(Lock::Guards, true);
+                return g;
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => {
+                tried(Lock::Guards, true);
+                return e.into_inner();
+            }
             Err(std::sync::TryLockError::WouldBlock) => {}
         }
         let waiting = std::time::Instant::now();
-        let g = guards();
+        let g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+        let ns = waiting.elapsed().as_nanos() as u64;
+        waited(Lock::Guards, ns);
         crate::copystat::add(crate::copystat::C::GuardWaits, 1);
-        crate::copystat::add(crate::copystat::C::GuardWaitNs, waiting.elapsed().as_nanos() as u64);
+        crate::copystat::add(crate::copystat::C::GuardWaitNs, ns);
         g
     }
     #[cfg(not(feature = "diagnostics"))]
@@ -2544,6 +2553,9 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    // VIcky (`VICTORY_LOT4_PROBE`, P6): blocks held no-access there opened.
+    #[cfg(feature = "diagnostics")]
+    crate::lot4::faults::release(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.

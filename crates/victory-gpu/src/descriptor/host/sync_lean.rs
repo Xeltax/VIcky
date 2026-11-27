@@ -231,7 +231,7 @@ impl Chunk {
         self.flush_map(heap, made);
         self.flush_keeps(heap);
         if !self.marks.is_empty() {
-            let mut changed = heap.changed.lock().unwrap_or_else(|e| e.into_inner());
+            let mut changed = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Changed, &heap.changed);
             changed.extend(self.marks.drain(..));
         }
         if std::mem::take(&mut self.taken) {
@@ -311,6 +311,9 @@ impl HostHeap {
             let _view = enter(Part::View);
             (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
         };
+        // VIcky (`VICTORY_LOT4_PROBE`, P2): the sync's slots by kind.
+        #[cfg(feature = "diagnostics")]
+        crate::lot4::sync_slot(view.as_ref());
         let Some(view) = view else {
             count(Count::NotOurs);
             #[cfg(feature = "diagnostics")]

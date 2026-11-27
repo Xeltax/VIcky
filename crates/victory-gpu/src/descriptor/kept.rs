@@ -77,7 +77,7 @@ pub(crate) struct Both<'a, T> {
 }
 
 fn lock<T>(part: &Mutex<T>) -> MutexGuard<'_, T> {
-    part.lock().unwrap_or_else(|e| e.into_inner())
+    crate::lot4::locks::mutex(crate::lot4::locks::Lock::Kept, part)
 }
 
 impl<T> Holds<T> {

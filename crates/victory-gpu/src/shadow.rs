@@ -1604,6 +1604,9 @@ fn write_back(address: usize, merged: &[u8], stored: Option<&[(usize, usize)]>) 
             }
         }
     }
+    // VIcky (`VICTORY_LOT4_PROBE`, P6): in a sampled frame, held no-access.
+    #[cfg(feature = "diagnostics")]
+    crate::lot4::faults::written(address, merged.len());
 }
 
 /// The parts of offsets `[at, at + n)` of a copy that hold title bytes put
@@ -2916,6 +2919,10 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
 /// not yet done), the 64 KiB pieces that differ from the snapshot, as
 /// [`Shadow::copy_back_with`] takes them; found on several threads.
 pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+    // VIcky (`VICTORY_LOT4_PROBE`, P3): before title memory takes the
+    // shaders' bytes, sampled blocks of the snapshots against it.
+    #[cfg(feature = "diagnostics")]
+    crate::lot4::landed(work);
     let scans = work
         .iter()
         .map(|(shadow, address, end)| {
@@ -3946,6 +3953,23 @@ impl Shadow {
         (from - start, (address + len).clamp(from, end) - start)
     }
 
+    /// VIcky (`VICTORY_LOT4_PROBE`, P3): whether title memory at
+    /// `[from, to)` still holds the snapshot's bytes there (`None`: no
+    /// snapshot, or title memory not readable). `title` is scratch.
+    pub(crate) fn lot4_matches(&self, from: usize, to: usize, title: &mut Vec<u8>) -> Option<bool> {
+        let (a, e) = self.inside(from, to.saturating_sub(from));
+        if a >= e {
+            return None;
+        }
+        title.resize(e - a, 0);
+        if !crate::host::read_into((self.start as usize + a) as *const u8, title) {
+            return None;
+        }
+        let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = before.as_ref()?.get(a..e)?;
+        Some(snapshot == &title[..])
+    }
+
     /// Shaders of `list` may write `[address, address + len)` of the copy
     /// (unordered access): after the list's submission has run, the range
     /// is copied back into title memory, where the title reads it; until
@@ -4030,6 +4054,8 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        #[cfg(feature = "diagnostics")]
+        crate::lot4::snapped(self.start, &parts);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
@@ -5190,6 +5216,9 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        // VIcky (`VICTORY_LOT4_PROBE`, P1): the blocks found written.
+        #[cfg(feature = "diagnostics")]
+        crate::lot4::copied(from, to, self.card.is_some());
         if self.card.is_some() {
             let stale = crate::census::stale_pages(self.id, from, to);
             if !stale.is_empty() {
@@ -5685,7 +5714,17 @@ struct Entry {
 static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
 
 fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+    crate::lot4::locks::mutex(crate::lot4::locks::Lock::Buffers, &BUFFERS)
+}
+
+/// VIcky (`VICTORY_LOT4_PROBE`, P1): every live host copy, of title buffers
+/// and windows: its title start and bytes, whether it is in the card's
+/// memory, whether it is a window.
+pub(crate) fn lot4_copies() -> Vec<(u64, u64, bool, bool)> {
+    let mut out: Vec<(u64, u64, bool, bool)> =
+        buffers().values().filter_map(|e| e.shadow.as_ref()).map(|s| (s.start, s.len, s.card.is_some(), false)).collect();
+    out.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().map(|s| (s.start, s.len, s.card.is_some(), true)));
+    out
 }
 
 /// A title buffer exists at `start` (`len` bytes).

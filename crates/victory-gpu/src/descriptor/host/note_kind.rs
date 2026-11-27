@@ -222,7 +222,7 @@ impl HostHeap {
         if (was, now) != (BARE, BARE) {
             let stride = view.and_then(view_stride);
             self.note_stride(index, stride);
-            let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+            let mut buffers = crate::lot4::locks::mutex(crate::lot4::locks::Lock::HeapBuffers, &self.buffers);
             let listed = if now == PLAIN {
                 buffers.insert(index);
                 true
@@ -254,7 +254,7 @@ impl HostHeap {
             .slots
             .contains_key(&index);
         let spanned = {
-            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            let placed = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Placed, &*self.placed);
             placed.by_slot.contains_key(&index) || placed.first.contains_key(&index)
         };
         let listed = self

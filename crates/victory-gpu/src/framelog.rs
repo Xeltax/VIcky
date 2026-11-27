@@ -310,7 +310,7 @@ pub fn on_slow_core() -> bool {
 
 /// The system's processor sets of group 0: each one's id, its logical
 /// processor and its efficiency class (higher is faster).
-fn cpu_sets() -> Vec<(u32, u8, u8)> {
+pub(crate) fn cpu_sets() -> Vec<(u32, u8, u8)> {
     use windows_sys::Win32::System::SystemInformation::{GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut bytes = 0u32;
@@ -743,6 +743,9 @@ pub fn frame() {
             // Another thread presented: its processor time is not this frame's.
             (f.s[S_THREAD_USER], f.s[S_THREAD_KERNEL]) = (0.0, 0.0);
         }
+        // VIcky: lot 4's probes and `VICTORY_CCD_PLACE`, frame by frame.
+        #[cfg(feature = "diagnostics")]
+        crate::lot4::frame_ended(f.us, f.t[T::WorkerUs as usize], f.t[T::RecordNs as usize], f.w[W::LongestRecordNs as usize]);
         state.frames.push(f);
     }
     let elapsed = state.since.elapsed();
@@ -763,6 +766,9 @@ pub fn frame() {
     for line in lines(&frames, usual, elapsed.as_secs_f64()) {
         tracing::info!("{line}");
     }
+    // VIcky (`VICTORY_LOT4_PROBE`): the probes' lines with the reading.
+    #[cfg(feature = "diagnostics")]
+    crate::lot4::period(frames.len());
 }
 
 #[cfg(test)]

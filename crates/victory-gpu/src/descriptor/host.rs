@@ -154,7 +154,7 @@ pub(crate) fn next_start(start: u64, end: u64) -> Option<u64> {
     heaps
         .iter()
         .filter_map(std::sync::Weak::upgrade)
-        .filter_map(|spans| spans.lock().unwrap_or_else(|e| e.into_inner()).next_start(start, end))
+        .filter_map(|spans| crate::lot4::locks::mutex(crate::lot4::locks::Lock::Placed, &*spans).next_start(start, end))
         .min()
 }
 
@@ -166,7 +166,7 @@ pub(crate) fn first_viewed(start: u64) -> Option<u32> {
     heaps
         .iter()
         .filter_map(std::sync::Weak::upgrade)
-        .filter_map(|spans| spans.lock().unwrap_or_else(|e| e.into_inner()).first_viewed(start))
+        .filter_map(|spans| crate::lot4::locks::mutex(crate::lot4::locks::Lock::Placed, &*spans).first_viewed(start))
         .min()
 }
 
@@ -294,7 +294,7 @@ impl Made {
 
 /// The made state held alone, poisoned or not.
 fn held_alone(made: &std::sync::RwLock<Made>) -> std::sync::RwLockWriteGuard<'_, Made> {
-    made.write().unwrap_or_else(|e| e.into_inner())
+    crate::lot4::locks::write(crate::lot4::locks::Lock::Made, made)
 }
 
 thread_local! {
@@ -1468,7 +1468,7 @@ impl HostHeap {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Next, &self.next);
         let (next, taken) = &mut *guard;
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
@@ -1694,7 +1694,7 @@ impl HostHeap {
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let textures = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures);
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
     }
 
@@ -1703,7 +1703,7 @@ impl HostHeap {
     /// look): for the card accounting line
     /// (`crate::resource::card_accounting`).
     pub(crate) fn texture_slots_all_due(&self, frame: u64) -> Vec<(u32, bool)> {
-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let textures = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures);
         textures
             .slots
             .iter()
@@ -1717,7 +1717,7 @@ impl HostHeap {
     /// that many bytes of its memory there, not all), or not until the
     /// slot is written again.
     pub(crate) fn texture_slot_done(&self, index: u32, write: u64, again: Option<(u64, u64)>) {
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut textures = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures);
         match again {
             Some((frame, mapped)) => textures.partly(index, write, frame, mapped),
             None => textures.done(index, write),
@@ -1736,37 +1736,37 @@ impl HostHeap {
         looks: u8,
         uploaded: u64,
     ) {
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut textures = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures);
         textures.recheck(index, write, due, at, print, looks, uploaded);
     }
 
     /// See [`TextureQueue::checked`].
     pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
+        crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures).checked(index)
     }
 
     /// Nothing to upload at title slot `index` now (its memory is not
     /// mapped, or no more of it than before): looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
     pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, most: u64) {
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut textures = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures);
         textures.later(index, write, frame, most);
     }
 
     /// See [`TextureQueue::hold`].
     pub(crate) fn texture_slot_held(&self, index: u32, write: u64, due: u64) {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).hold(index, write, due);
+        crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures).hold(index, write, due);
     }
 
     /// See [`TextureQueue::room`].
     pub(crate) fn texture_slots_room(&self, frame: u64) -> usize {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).room(frame)
+        crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures).room(frame)
     }
 
     /// Bytes of title slot `index`'s memory that were mapped when it was
     /// last uploaded in part (0: not uploaded, or whole).
     pub(crate) fn texture_slot_mapped(&self, index: u32) -> u64 {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).mapped(index)
+        crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures).mapped(index)
     }
 
     /// Takes the ranges of title memory the runtime mapped, unmapped or
@@ -1787,13 +1787,13 @@ impl HostHeap {
             return 0;
         }
         let mut slots: Vec<u32> = {
-            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            let placed = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Placed, &*self.placed);
             ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
         };
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut textures = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures);
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
         }
@@ -1827,14 +1827,14 @@ impl HostHeap {
     fn slots_written_under(&self, ranges: &[(u64, u64)], frame: u64, due: bool) -> [usize; 3] {
         use std::sync::atomic::Ordering::Relaxed;
         let mut slots: Vec<u32> = {
-            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            let placed = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Placed, &*self.placed);
             ranges.iter().flat_map(|&(start, end)| placed.slots_holding(start, end)).collect()
         };
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let held = slots.len();
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut textures = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures);
         // Uploaded before: out of the queue, or in it after an upload (in
         // part, or whole and being looked at again).
         slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
@@ -1919,13 +1919,13 @@ impl HostHeap {
             return 0;
         }
         let mut slots: Vec<u32> = {
-            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            let placed = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Placed, &*self.placed);
             starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
         };
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut textures = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures);
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
         }
@@ -1948,7 +1948,7 @@ impl HostHeap {
             return 0;
         }
         let slots: Vec<u32> = {
-            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            let placed = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Placed, &*self.placed);
             starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
         };
         let made = held_alone(&self.made);
@@ -2043,7 +2043,7 @@ impl HostHeap {
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
             if tabled_out() {
-                let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+                let mut textures = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures);
                 if textures.slots.remove(&index).is_some() {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
@@ -2079,7 +2079,7 @@ impl HostHeap {
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let mut textures = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures);
         if texture && !read_now {
             let due = if lately && !seen {
                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2095,7 +2095,7 @@ impl HostHeap {
 
     /// The title slots that hold buffer views.
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
-        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let buffers = crate::lot4::locks::mutex(crate::lot4::locks::Lock::HeapBuffers, &self.buffers);
         buffers.iter().copied().collect()
     }
 
@@ -2103,13 +2103,13 @@ impl HostHeap {
     /// under the lock of that set (VIcky, `VICTORY_HEAP_PASS_SPREAD`: a
     /// sixteenth of them, `crate::draw::heap_pass::window`).
     pub(crate) fn with_buffer_slots<R>(&self, f: impl FnOnce(&std::collections::BTreeSet<u32>) -> R) -> R {
-        f(&self.buffers.lock().unwrap_or_else(|e| e.into_inner()))
+        f(&crate::lot4::locks::mutex(crate::lot4::locks::Lock::HeapBuffers, &self.buffers))
     }
 
     /// The title slots whose buffer view was written, or went, since the
     /// last call.
     pub(crate) fn buffer_changes(&self) -> Vec<u32> {
-        let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
+        let mut changed = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Changed, &self.changed);
         std::mem::take(&mut *changed).into_iter().collect()
     }
 
@@ -2214,7 +2214,7 @@ impl HostHeap {
         };
         let stale = {
             use std::sync::atomic::Ordering::Relaxed;
-            let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            let mut placed = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Placed, &*self.placed);
             let span = placed_view.and_then(|(resource, start, first)| {
                 Some((start, start.saturating_add(placed.bytes(resource)?), first))
             });
@@ -2235,14 +2235,14 @@ impl HostHeap {
         };
         if !stale.is_empty() {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            let mut textures = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures);
             for &slot in &stale {
                 textures.remove(slot);
             }
         }
         let stride = view.and_then(view_stride);
         self.note_stride(index, stride);
-        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buffers = crate::lot4::locks::mutex(crate::lot4::locks::Lock::HeapBuffers, &self.buffers);
         let was = if stride.is_some() {
             buffers.insert(index);
             true
@@ -2279,7 +2279,7 @@ impl HostHeap {
         if marks && self.later(index, Later::Mark).is_ok() {
             return;
         }
-        let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
+        let mut changed = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Changed, &self.changed);
         if marks {
             changed.insert(index);
         } else if !changed.contains(&index) {
@@ -2336,7 +2336,7 @@ impl HostHeap {
             .slots
             .contains_key(&index);
         let spanned = {
-            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            let placed = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Placed, &*self.placed);
             placed.by_slot.contains_key(&index) || placed.first.contains_key(&index)
         };
         let listed = self
@@ -2357,7 +2357,7 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.dynamic_first) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Next, &self.next);
         let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
             let given = slots.iter().filter(|taken| **taken).count() as u32;
@@ -2823,6 +2823,8 @@ impl HostHeap {
     /// how long it is held are counted (`crate::draw::heap_pass::parts`).
     fn made_counted(&self, alone: bool) -> MadeCounted<'_> {
         use crate::draw::heap_pass::parts;
+        use crate::lot4::locks::{Lock, tried as counted, waited};
+        let lock = if alone { Lock::Made } else { Lock::MadeShared };
         let tried = if alone {
             match self.made.try_write() {
                 Ok(made) => Some(MadeHeld::Alone(made)),
@@ -2837,15 +2839,19 @@ impl HostHeap {
             }
         };
         let made = match tried {
-            Some(made) => made,
+            Some(made) => {
+                counted(lock, true);
+                made
+            }
             None => {
                 let _wait = parts::enter(parts::Part::Wait);
                 let began = std::time::Instant::now();
                 let made = if alone {
-                    MadeHeld::Alone(held_alone(&self.made))
+                    MadeHeld::Alone(self.made.write().unwrap_or_else(|e| e.into_inner()))
                 } else {
                     MadeHeld::Shared(self.made.read().unwrap_or_else(|e| e.into_inner()))
                 };
+                waited(lock, began.elapsed().as_nanos() as u64);
                 parts::waited(began.elapsed());
                 made
             }
@@ -2902,6 +2908,7 @@ impl HostHeap {
             Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
             Err(std::sync::TryLockError::WouldBlock) => None,
         };
+        crate::lot4::locks::tried(crate::lot4::locks::Lock::Made, free.is_some());
         if let Some(made) = free {
             count(if created { Count::CreatedAtCall } else { Count::MadeAtCall }, 1);
             self.mirror_made(&made, true, (index, handle, false, true), record, &mut Lookups::each());
@@ -3043,6 +3050,11 @@ impl HostHeap {
             let _view = enter(Part::View);
             (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
         };
+        // VIcky (`VICTORY_LOT4_PROBE`, P2): the sync's slots by kind.
+        #[cfg(feature = "diagnostics")]
+        if !for_draw {
+            crate::lot4::sync_slot(view.as_ref());
+        }
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
@@ -3164,7 +3176,7 @@ impl HostHeap {
         if !alone && lookups.kept {
             let _ = shown_copy(view, extent.0, extent.1, lookups);
         }
-        let mut cache = made.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Cache, &made.cache);
         if !cache.tried {
             cache.tried = true;
             cache.table = RecordCache::new(size, self.step);
@@ -3275,7 +3287,7 @@ impl HostHeap {
     /// `index` at `frame`, in a few words (diagnostics).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn texture_slot_state(&self, index: u32, frame: u64) -> String {
-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let textures = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures);
         match textures.slots.get(&index) {
             None => "not queued".into(),
             Some(w) => format!(
@@ -3984,7 +3996,7 @@ impl Drop for KeptLater<'_> {
         };
         self.heap.kept.replace_together(later.keeps, retire_held);
         if !later.marks.is_empty() {
-            let mut changed = self.heap.changed.lock().unwrap_or_else(|e| e.into_inner());
+            let mut changed = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Changed, &self.heap.changed);
             changed.extend(later.marks);
         }
     }

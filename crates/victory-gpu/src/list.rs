@@ -153,6 +153,9 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     crate::copystat::recorded(started);
     #[cfg(feature = "diagnostics")]
     crate::profile::seen(crate::profile::Seen::Record);
+    // VIcky (`VICTORY_CCD_PLACE`): a recording thread of the title.
+    #[cfg(feature = "diagnostics")]
+    crate::lot4::ccd::recording();
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'

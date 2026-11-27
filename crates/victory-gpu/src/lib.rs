@@ -48,12 +48,14 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 pub mod list;
+#[cfg(windows)]
+mod lot4;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
-mod plaincopy;
-#[cfg(windows)]
 mod perthread;
+#[cfg(windows)]
+mod plaincopy;
 #[cfg(windows)]
 mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]

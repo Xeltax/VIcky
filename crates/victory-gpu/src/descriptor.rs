@@ -178,13 +178,16 @@ fn mirror(handle: u64, copied: bool) {
         Some(host) => {
             drop(pending);
             if let Some(host) = host {
-                if copied {
-                    host.mirror_copy(index, handle);
-                } else if mirror_try::created() {
-                    host.mirror_created(index, handle);
-                } else {
-                    host.mirror(index, handle, false);
-                }
+                // (VIcky, `VICTORY_LOT4_PROBE`: not the sync's slots, P2.)
+                crate::lot4::in_call(|| {
+                    if copied {
+                        host.mirror_copy(index, handle);
+                    } else if mirror_try::created() {
+                        host.mirror_created(index, handle);
+                    } else {
+                        host.mirror(index, handle, false);
+                    }
+                });
             }
         }
     }
@@ -1022,11 +1025,11 @@ fn words_for(view: View) -> [u32; 2] {
 }
 
 fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
-    VIEWS.read().unwrap_or_else(|e| e.into_inner())
+    crate::lot4::locks::read(crate::lot4::locks::Lock::Views, &VIEWS)
 }
 
 fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
-    VIEWS.write().unwrap_or_else(|e| e.into_inner())
+    crate::lot4::locks::write(crate::lot4::locks::Lock::ViewsWrite, &VIEWS)
 }
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them

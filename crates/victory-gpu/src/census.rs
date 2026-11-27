@@ -177,6 +177,8 @@ fn reservations() -> MutexGuard<'static, BTreeMap<usize, Reservation>> {
 pub fn title_memory_reserved(at: usize, len: usize, kind: u32, flags: u64, protect: u32) {
     // Holes found there are no longer known (`VICTORY_SPARSE_KNOWN`).
     crate::host::sparseknown::forget(at, len);
+    // VIcky (`VICTORY_LOT4_PROBE`, P5): reservations by class.
+    crate::lot4::reserved(len, kind, protect);
     if !tracking() || at == 0 || len == 0 {
         return;
     }
