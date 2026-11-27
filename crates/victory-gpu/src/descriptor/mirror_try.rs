@@ -1,6 +1,7 @@
 //! VIcky: descriptors the title copies (`CopyDescriptorsSimple`,
-//! `CopyDescriptors`) mirrored without waiting for the host heap's slot
-//! state (`VICTORY_MIRROR_TRY=1|check`; off by default).
+//! `CopyDescriptors`), and with `=2` the views it makes by calls
+//! (`Create*View`), mirrored without waiting for the host heap's slot
+//! state (`VICTORY_MIRROR_TRY=1|2|check|check2`; off by default).
 //!
 //! Profile PF2 (fable-2026-11-27-pf2.md): the title's recording threads
 //! waited some 194 ms a frame (about 39 ms each) for `HostHeap::made`, 116
@@ -36,7 +37,16 @@
 //! - Shaders that pick a slot by index read it when their list runs, after
 //!   the sync of the submission that sends it: a copy the title made before
 //!   it sent the list is drained by then.
-//! - Views made by calls (`Create*View`) are mirrored at the call.
+//! - Views made by calls (`Create*View`) are mirrored at the call, but
+//!   with `=2`.
+//!
+//! `VICTORY_MIRROR_TRY=2` (profile PF3, fable-2026-11-27-pf3.md: with `=1`
+//! the title's threads still waited some 32 ms a frame for the lock in the
+//! mirror of a view made by a call, `super::record`): views made by calls
+//! go the same way as copies (`HostHeap::mirror_created`), left on the
+//! same list and drained by the same drains. A view made by a call is a
+//! record we write in the title's slot at the call, read again at the
+//! drain like a copied one; what moves for it is what moves for a copy.
 //!
 //! What moves, for a slot left on the list: between the call and the
 //! drain its host slot shows what it showed before the copy; what its
@@ -57,7 +67,8 @@
 //! at the call, waiting for the lock as before, and then left on the list
 //! with the record it was made from; the drain counts the slots whose
 //! record differs by then (the title wrote them again in between). The
-//! counts go with the heap sync's line ([`part`]).
+//! counts go with the heap sync's line ([`part`]). `check2`: the same, with
+//! the views made by calls going the way of `=2`.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -77,34 +88,60 @@ pub(crate) enum Mode {
 thread_local! {
     /// Tests: the mode for this thread, whatever the environment says.
     pub(crate) static TEST_MODE: std::cell::Cell<Option<Mode>> = const { std::cell::Cell::new(None) };
+    /// Tests: whether views made by calls go the try way too ([`created`]),
+    /// whatever the environment says.
+    pub(crate) static TEST_CREATED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// The mode, read once (`VICTORY_MIRROR_TRY=1|check`).
+/// The mode, read once (`VICTORY_MIRROR_TRY=1|2|check|check2`).
 pub(crate) fn mode() -> Mode {
     #[cfg(test)]
     if let Some(mode) = TEST_MODE.get() {
         return mode;
     }
-    static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        let mode = match std::env::var("VICTORY_MIRROR_TRY").as_deref() {
-            Ok("1") => Mode::Try,
-            Ok("check") => Mode::Check,
-            _ => return Mode::Off,
+    modes().0
+}
+
+/// Whether views the title makes by calls (`Create*View`) go the try way
+/// too (`VICTORY_MIRROR_TRY=2` or `check2`; with the mode off, never).
+pub(crate) fn created() -> bool {
+    #[cfg(test)]
+    if let Some(created) = TEST_CREATED.get() {
+        return created;
+    }
+    modes().1
+}
+
+/// The mode, and whether views made by calls go its way too, read once.
+fn modes() -> (Mode, bool) {
+    static MODES: std::sync::OnceLock<(Mode, bool)> = std::sync::OnceLock::new();
+    *MODES.get_or_init(|| {
+        let (mode, created) = match std::env::var("VICTORY_MIRROR_TRY").as_deref() {
+            Ok("1") => (Mode::Try, false),
+            Ok("2") => (Mode::Try, true),
+            Ok("check") => (Mode::Check, false),
+            Ok("check2") => (Mode::Check, true),
+            _ => return (Mode::Off, false),
         };
         if !super::sync_on() {
             tracing::warn!(
                 "VICTORY_MIRROR_TRY is not used with VICTORY_HEAP_SYNC=0: no heap sync would make the copied slots \
                  left to it"
             );
-            return Mode::Off;
+            return (Mode::Off, false);
         }
         tracing::info!(
-            "descriptors the title copies are mirrored without waiting for the host heap's lock: one that finds it \
+            "descriptors the title copies{} are mirrored without waiting for the host heap's lock: one that finds it \
              held is left to the next heap sync or heap pass (VICTORY_MIRROR_TRY={})",
-            if mode == Mode::Check { "check: made at the call as well, and compared at the drain" } else { "1" }
+            if created { ", and the views it makes by calls," } else { "" },
+            match (mode, created) {
+                (Mode::Check, false) => "check: made at the call as well, and compared at the drain",
+                (Mode::Check, true) => "check2: made at the call as well, and compared at the drain",
+                (_, false) => "1",
+                (_, true) => "2",
+            }
         );
-        mode
+        (mode, created)
     })
 }
 
@@ -209,10 +246,14 @@ pub(crate) enum Count {
     /// With `check`: of them, those whose record differed from the one
     /// made at the call.
     Differing,
+    /// With `=2`: views made by calls, made at the call, the lock free.
+    CreatedAtCall,
+    /// With `=2`: views made by calls left on a list, the lock held.
+    CreatedLeft,
 }
 
 /// Since the last line, by [`Count`].
-pub(crate) static COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+pub(crate) static COUNTS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// Counts `n` of `what`.
 pub(crate) fn count(what: Count, n: u64) {
@@ -224,7 +265,7 @@ pub(crate) fn count(what: Count, n: u64) {
 /// The heap sync line's part (`super::sync_line`), per frame over
 /// `frames`; empty with the switch off.
 pub(crate) fn part(frames: f64) -> String {
-    let n: [u64; 8] = std::array::from_fn(|i| COUNTS[i].swap(0, Ordering::Relaxed));
+    let n: [u64; 10] = std::array::from_fn(|i| COUNTS[i].swap(0, Ordering::Relaxed));
     let mode = mode();
     if mode == Mode::Off {
         return String::new();
@@ -239,10 +280,19 @@ pub(crate) fn part(frames: f64) -> String {
     } else {
         String::new()
     };
+    let created = if created() {
+        format!(
+            "; views made by calls (=2): {:.0} mirrored at the call, {:.0} left as the heap's lock was held",
+            per(Count::CreatedAtCall),
+            per(Count::CreatedLeft)
+        )
+    } else {
+        String::new()
+    };
     format!(
         " (VICTORY_MIRROR_TRY: per frame {:.0} copied slots mirrored at the call, {:.0} left as the heap's lock was \
          held, {:.0} drained by the heap sync, {:.0} by the heap passes, {:.1} not made as their page was gone, {:.1} \
-         made waiting as the list was full{check})",
+         made waiting as the list was full{created}{check})",
         per(Count::MadeAtCall),
         per(Count::Left),
         per(Count::DrainedBySync),
@@ -337,11 +387,18 @@ mod tests {
         let _ = part(1.0);
         assert!(part(1.0).is_empty());
         TEST_MODE.set(Some(Mode::Check));
+        TEST_CREATED.set(Some(false));
         count(Count::Left, 10);
         count(Count::Differing, 4);
         let text = part(2.0);
         assert!(text.contains("VICTORY_MIRROR_TRY"), "{text}");
         assert!(text.contains("whose record differed"), "{text}");
+        assert!(!text.contains("views made by calls"), "{text}");
+        TEST_CREATED.set(Some(true));
+        count(Count::CreatedLeft, 6);
+        let text = part(2.0);
+        assert!(text.contains("views made by calls (=2)"), "{text}");
+        TEST_CREATED.set(None);
         TEST_MODE.set(None);
     }
 }

@@ -162,7 +162,9 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap. `copied`: the title copied it there
 /// ([`copy_simple`]); VIcky's `VICTORY_MIRROR_TRY` may then leave it to the
-/// next heap sync ([`mirror_try`], `host::HostHeap::mirror_copy`).
+/// next heap sync ([`mirror_try`], `host::HostHeap::mirror_copy`). Else a
+/// view made by a call ([`record`]): with `VICTORY_MIRROR_TRY=2` the same
+/// (`host::HostHeap::mirror_created`).
 #[cfg(windows)]
 fn mirror(handle: u64, copied: bool) {
     let Some((heap, index)) = shader_slot(handle) else {
@@ -176,6 +178,8 @@ fn mirror(handle: u64, copied: bool) {
             if let Some(host) = host {
                 if copied {
                     host.mirror_copy(index, handle);
+                } else if mirror_try::created() {
+                    host.mirror_created(index, handle);
                 } else {
                     host.mirror(index, handle, false);
                 }
@@ -1730,6 +1734,44 @@ mod tests {
             assert!(!host.made(7));
             host.drain_deferred(false);
             assert!(host.made(7), "not made by a pass's drain");
+            mirror_try::TEST_MODE.set(None);
+        }
+        drop(one);
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+    }
+
+    /// VIcky (`VICTORY_MIRROR_TRY=2`): a view made by a call while the host
+    /// heap's lock is held is left to the next drain, as a copy is; one
+    /// made with the lock free is made at the call.
+    #[cfg(windows)]
+    #[test]
+    fn with_2_a_view_made_while_the_lock_is_held_is_made_by_the_next_drain() {
+        let one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let none = Placement { address: 0, size: 0 };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            mirror_try::TEST_MODE.set(Some(mirror_try::Mode::Try));
+            mirror_try::TEST_CREATED.set(Some(true));
+            let sampler = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+            let at = |i: u64| heap(h).start + i * 16;
+            host.with_made_held(|| create_sampler(std::ptr::null(), &sampler, at(3)));
+            assert!(!host.made(3), "made while the lock was held");
+            create_sampler(std::ptr::null(), &sampler, at(4));
+            assert!(host.made(4), "the lock free: made at the call");
+            sync_held(None, std::time::Instant::now());
+            assert!(host.made(3), "not made by the sync");
+            host.with_made_held(|| create_sampler(std::ptr::null(), &sampler, at(8)));
+            assert!(!host.made(8));
+            host.drain_deferred(false);
+            assert!(host.made(8), "not made by a pass's drain");
+            mirror_try::TEST_CREATED.set(None);
             mirror_try::TEST_MODE.set(None);
         }
         drop(one);

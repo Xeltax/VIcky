@@ -2807,6 +2807,20 @@ impl HostHeap {
     /// ([`HostHeap::drain_deferred`]), and with `check` made now all the
     /// same, waiting for the lock. Without the switch, `mirror` itself.
     pub(crate) fn mirror_copy(&self, index: u32, handle: u64) {
+        self.mirror_tried(index, handle, false);
+    }
+
+    /// [`HostHeap::mirror`] (not for a draw) of a view the title made by a
+    /// call (`Create*View`) in title slot `index` at `handle`
+    /// (`super::record`). VIcky (`VICTORY_MIRROR_TRY=2`, `check2`): as
+    /// [`HostHeap::mirror_copy`], counted apart.
+    pub(crate) fn mirror_created(&self, index: u32, handle: u64) {
+        self.mirror_tried(index, handle, true);
+    }
+
+    /// [`HostHeap::mirror_copy`], or with `created`
+    /// [`HostHeap::mirror_created`].
+    fn mirror_tried(&self, index: u32, handle: u64, created: bool) {
         use super::mirror_try::{Count, Mode, Slot, count, mode, record_key};
         let check = match mode() {
             Mode::Off => {
@@ -2825,7 +2839,7 @@ impl HostHeap {
             Err(std::sync::TryLockError::WouldBlock) => None,
         };
         if let Some(made) = free {
-            count(Count::MadeAtCall, 1);
+            count(if created { Count::CreatedAtCall } else { Count::MadeAtCall }, 1);
             self.mirror_made(&made, true, (index, handle, false, true), record, &mut Lookups::each());
             return;
         }
@@ -2836,15 +2850,16 @@ impl HostHeap {
         }
         let key = if check { record_key(record) } else { 0 };
         if self.deferred.push(Slot { index, handle, key }) {
-            count(Count::Left, 1);
+            count(if created { Count::CreatedLeft } else { Count::Left }, 1);
         } else if !check {
             // The list is full: made now, waiting, as before.
             self.mirror(index, handle, false);
         }
     }
 
-    /// VIcky (`VICTORY_MIRROR_TRY`): the slots [`HostHeap::mirror_copy`] left
-    /// on this heap's list, made now in the order they were left, through
+    /// VIcky (`VICTORY_MIRROR_TRY`): the slots [`HostHeap::mirror_copy`] (and
+    /// [`HostHeap::mirror_created`]) left on this heap's list, made now in
+    /// the order they were left, through
     /// [`HostHeap::mirror_due`] as the heap sync makes the slots it finds
     /// written, each from its record as it is now. A slot whose record can
     /// no longer be read (the title unmapped its page) is not made. With
