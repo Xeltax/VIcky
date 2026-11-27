@@ -18,19 +18,28 @@
 //! are the same as the shared counters gave, add for add.
 //!
 //! A thread gets its block at its first add, for every table at once
-//! ([`slot`]), and keeps it until the process ends (a block outlives its
-//! thread; its counts stay in the sums). Past [`SLOTS`] threads the rest
-//! share one more block, written with locked adds as before.
+//! ([`slot`]), and gives it back when it ends, to the next thread that
+//! starts (the counts stay in the block and in the sums: its next owner
+//! adds on). The pass over buffer views starts threads of its own at each
+//! pass, so blocks are not handed out once and for all. With more than
+//! [`SLOTS`] threads alive at once the rest share one more block, written
+//! with locked adds as before.
 
 use std::cell::Cell;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering::Relaxed;
 
-/// Threads with a block of their own.
+/// Threads with a block of their own at once.
 pub(crate) const SLOTS: usize = 512;
 
-/// Threads that took a block so far (the ones past [`SLOTS`] included).
-static CLAIMED: AtomicUsize = AtomicUsize::new(0);
+/// Which blocks a living thread holds.
+static IN_USE: [AtomicBool; SLOTS] = [const { AtomicBool::new(false) }; SLOTS];
+
+/// Blocks handed out so far, at most (the sums read these), and the threads
+/// that found none free (they write the shared one).
+static HIGH: AtomicUsize = AtomicUsize::new(0);
+static SHARED: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     /// This thread's block in every table ([`SLOTS`]: the shared one);
@@ -38,6 +47,28 @@ thread_local! {
     /// destructor: no registration, no allocation (the allocator's
     /// counters use it).
     static SLOT: Cell<usize> = const { Cell::new(usize::MAX) };
+    /// While this thread takes its block (an allocation made meanwhile
+    /// counts in the shared block).
+    static CLAIMING: Cell<bool> = const { Cell::new(false) };
+    /// Gives this thread's block back when the thread ends.
+    static GIVE_BACK: GiveBack = const { GiveBack };
+}
+
+/// See [`GIVE_BACK`].
+struct GiveBack;
+
+impl Drop for GiveBack {
+    fn drop(&mut self) {
+        // Adds made later in this thread's end (other thread locals
+        // dropped) go to the shared block, with locked adds.
+        let at = SLOT.try_with(|s| s.replace(SLOTS)).unwrap_or(SLOTS);
+        if at < SLOTS {
+            // Release: this thread's last plain stores to the block come
+            // before the next owner's first loads (it takes the flag with
+            // acquire).
+            IN_USE[at].store(false, Ordering::Release);
+        }
+    }
 }
 
 /// This thread's block, taken at its first call.
@@ -54,16 +85,34 @@ pub(crate) fn slot() -> usize {
 
 #[cold]
 fn claim(s: &Cell<usize>) -> usize {
-    let at = CLAIMED.fetch_add(1, Relaxed).min(SLOTS);
+    if CLAIMING.replace(true) {
+        return SLOTS;
+    }
+    let free = IN_USE.iter().position(|f| f.compare_exchange(false, true, Ordering::Acquire, Relaxed).is_ok());
+    let at = match free {
+        Some(at) => {
+            HIGH.fetch_max(at + 1, Relaxed);
+            at
+        }
+        None => {
+            SHARED.fetch_add(1, Relaxed);
+            SLOTS
+        }
+    };
+    // Set before the hand-back is registered: that registration may
+    // allocate, and the allocator's counters then find the block.
     s.set(at);
+    if at < SLOTS {
+        let _ = GIVE_BACK.try_with(|_| ());
+    }
+    CLAIMING.set(false);
     at
 }
 
-/// Threads that took a block so far: (with a block of their own, sharing
-/// the last).
-pub(crate) fn threads() -> (usize, usize) {
-    let n = CLAIMED.load(Relaxed);
-    (n.min(SLOTS), n.saturating_sub(SLOTS))
+/// The threads holding a block of their own now, the most blocks held at
+/// once so far, and the threads that found none free.
+pub(crate) fn threads() -> (usize, usize, usize) {
+    (IN_USE.iter().filter(|f| f.load(Relaxed)).count(), HIGH.load(Relaxed), SHARED.load(Relaxed))
 }
 
 /// One thread's `N` counters, on lines of their own.
@@ -117,17 +166,15 @@ impl<const N: usize> Counters<N> {
         }
     }
 
-    /// The blocks written so far.
-    fn used(&self) -> &[Block<N>] {
-        let (own, past) = threads();
-        // The shared block is the last; it is summed only once it is used.
-        let end = if past > 0 { SLOTS + 1 } else { own };
-        &self.blocks[..end]
+    /// The blocks written so far: every one handed out, and the shared
+    /// one (summed always: a thread at its end adds there too).
+    fn used(&self) -> impl Iterator<Item = &Block<N>> {
+        self.blocks[..HIGH.load(Relaxed).min(SLOTS)].iter().chain(std::iter::once(&self.blocks[SLOTS]))
     }
 
     /// Counter `i` summed over every thread, since the start.
     pub(crate) fn total(&self, i: usize) -> u64 {
-        self.used().iter().fold(0u64, |sum, b| sum.wrapping_add(b.0[i].load(Relaxed)))
+        self.used().fold(0u64, |sum, b| sum.wrapping_add(b.0[i].load(Relaxed)))
     }
 
     /// Every counter summed over every thread, since the start.
@@ -154,7 +201,7 @@ impl<const N: usize> Counters<N> {
     /// Counter `i` of every thread's block in use, one value each (for a
     /// maximum over threads, not a sum).
     pub(crate) fn each(&self, i: usize) -> impl Iterator<Item = u64> + '_ {
-        self.used().iter().map(move |b| b.0[i].load(Relaxed))
+        self.used().map(move |b| b.0[i].load(Relaxed))
     }
 
     /// This thread's counter `i` set to `v`; on the shared block, `v` is
@@ -233,6 +280,28 @@ mod tests {
             (taken + C.take()[0], added)
         });
         assert_eq!(taken.0, taken.1);
+    }
+
+    /// A thread that ends gives its block back, to the threads after it:
+    /// 2,000 threads one after another find blocks free (none shares), and
+    /// what each added stays in the sums.
+    #[test]
+    fn blocks_come_back_when_threads_end() {
+        static C: Counters<1> = Counters::new();
+        let before = (C.total(0), SHARED.load(Relaxed));
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..2_000 {
+            let at = std::thread::spawn(|| {
+                C.add(0, 3);
+                slot()
+            })
+            .join()
+            .unwrap();
+            seen.insert(at);
+        }
+        assert_eq!(C.total(0).wrapping_sub(before.0), 6_000);
+        assert_eq!(SHARED.load(Relaxed), before.1, "a thread found no block free");
+        assert!(seen.len() < SLOTS, "blocks were not given back: {} distinct", seen.len());
     }
 
     /// The largest of every thread's own value.

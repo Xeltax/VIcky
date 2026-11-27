@@ -16,7 +16,9 @@
 //!   taken, and at each landing, one 64 KiB block in 16 compared with title
 //!   memory: equal, title memory still is the before-image; different, the
 //!   block needs a true one (and whether it needed one in the 64 frames
-//!   before).
+//!   before). A block an earlier landing wrote after its snapshot is not
+//!   judged (title memory holds that landing's bytes, the snapshot older
+//!   ones), only counted.
 //! - P4 and P5: `crate::inplace::lot4` (each physical page placed at its
 //!   first mapping, simulated; the alias census), and the title's
 //!   reservations by class ([`reserved`]).
@@ -96,8 +98,9 @@ pub(crate) fn frame_ended(us: f64, at_work_us: f64, record_ns: f64, longest_ns: 
         let w = w.get_or_insert_with(Written::default);
         w.blocks += w.frame.len() as u64;
         w.frames += 1;
-        let frame_blocks = std::mem::take(&mut w.frame);
-        w.period.extend(frame_blocks);
+        // (Drained: the frame's set keeps its room.)
+        let Written { frame, period, .. } = w;
+        period.extend(frame.drain());
     }
     faults::frame(frame);
 }
@@ -434,7 +437,8 @@ fn slots_line(frames: f64) {
 /// Snapshot bytes and blocks taken; at landings, blocks compared (one in
 /// [`SAMPLE`]) and their bytes, of them equal to title memory and their
 /// bytes, different, of those with a difference in the 64 frames before
-/// and without; blocks with no snapshot; nanoseconds of the compares.
+/// and without; blocks with no snapshot; nanoseconds of the compares;
+/// blocks not judged (an earlier landing wrote them after their snapshot).
 static SNAPS: Counters<12> = Counters::new();
 const P_BYTES: usize = 0;
 const P_BLOCKS: usize = 1;
@@ -447,6 +451,41 @@ const P_HISTORY: usize = 7;
 const P_FRESH: usize = 8;
 const P_NONE: usize = 9;
 const P_NS: usize = 10;
+const P_LANDED_OVER: usize = 11;
+
+/// Per sampled block: when its snapshot was last taken and when a landing
+/// last wrote it (numbers of [`ORDER`]).
+static SEQ: Mutex<Option<HashMap<u64, (u64, u64)>>> = Mutex::new(None);
+static ORDER: AtomicU64 = AtomicU64::new(1);
+
+/// Notes in [`SEQ`] the sampled blocks of `[from, to)`: their snapshot
+/// (`snap`) or a landing's write.
+fn sequence(from: usize, to: usize, snap: bool) {
+    if from >= to {
+        return;
+    }
+    let blocks: Vec<u64> = (from / BLOCK..=(to - 1) / BLOCK).map(|b| b as u64).filter(|&b| sampled(b)).collect();
+    if blocks.is_empty() {
+        return;
+    }
+    let at = ORDER.fetch_add(1, Relaxed);
+    let mut seq = SEQ.lock().unwrap_or_else(|e| e.into_inner());
+    let seq = seq.get_or_insert_with(HashMap::new);
+    for b in blocks {
+        let e = seq.entry(b).or_insert((0, 0));
+        if snap { e.0 = at } else { e.1 = at }
+    }
+}
+
+/// A landing wrote what shaders wrote into title memory at `[at, at + len)`
+/// (`crate::shadow`'s write-back): P3's order, and P6's hold.
+pub(crate) fn wrote_back(at: usize, len: usize) {
+    if !on() {
+        return;
+    }
+    sequence(at, at + len, false);
+    faults::written(at, len);
+}
 
 /// One block in this many is compared at a landing.
 const SAMPLE: u64 = 16;
@@ -469,6 +508,7 @@ pub(crate) fn snapped(start: u64, parts: &[(usize, usize)]) {
             let (a, e) = (start as usize + from, start as usize + to);
             bytes += (to - from) as u64;
             blocks += ((e - 1) / BLOCK - a / BLOCK + 1) as u64;
+            sequence(a, e, true);
         }
     }
     SNAPS.add(P_BYTES, bytes);
@@ -494,7 +534,16 @@ pub(crate) fn landed(work: &[(Arc<crate::shadow::Shadow>, usize, usize)]) {
         while at < *to {
             let block = (at / BLOCK) as u64;
             let end = ((at / BLOCK + 1) * BLOCK).min(*to);
-            if sampled(block) {
+            let over = sampled(block)
+                && SEQ
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .and_then(|seq| seq.get(&block).copied())
+                    .is_some_and(|(snap, landed)| landed > snap);
+            if over {
+                SNAPS.add(P_LANDED_OVER, 1);
+            } else if sampled(block) {
                 match shadow.lot4_matches(at, end, &mut title) {
                     None => SNAPS.add(P_NONE, 1),
                     Some(equal) => {
@@ -537,7 +586,8 @@ fn snapshots_line(frames: f64) {
          (one in {SAMPLE}, {:.2} MB) compared with title memory: {:.1} % of their bytes still equal to the snapshot (title \
          memory could stand in; kill under 80 %), {:.1} blocks a frame differ (about {:.0} a frame over all blocks, which \
          need a true before-image): {:.1} of them (about {:.0}) with a difference in the 64 frames before, {:.1} (about \
-         {:.0}) without; {:.1} sampled blocks a frame had no snapshot; the compares took {:.2} ms a frame",
+         {:.0}) without; {:.1} sampled blocks a frame had no snapshot, {:.1} were not judged (an earlier landing wrote \
+         them after their snapshot); the compares took {:.2} ms a frame",
         s[P_BYTES] as f64 / 1e6 / frames,
         s[P_BLOCKS] as f64 / frames,
         s[P_SAMPLED] as f64 / frames,
@@ -550,6 +600,7 @@ fn snapshots_line(frames: f64) {
         s[P_FRESH] as f64 / frames,
         s[P_FRESH] as f64 * scale,
         s[P_NONE] as f64 / frames,
+        s[P_LANDED_OVER] as f64 / frames,
         s[P_NS] as f64 / 1e6 / frames,
     );
 }
@@ -627,6 +678,25 @@ mod tests {
     fn one_block_in_sixteen_is_sampled() {
         let n = (0..160_000u64).filter(|&b| sampled(b)).count();
         assert!((9_000..11_000).contains(&n), "{n}");
+    }
+
+    /// A sampled block's snapshot and landings are ordered: written by a
+    /// landing after its snapshot, it is not judged.
+    #[test]
+    fn a_landing_after_the_snapshot_is_seen() {
+        let block = (0..u64::MAX).find(|&b| b > 0x1234_0000 && sampled(b)).unwrap();
+        let at = block as usize * BLOCK;
+        let get = || SEQ.lock().unwrap().as_ref().and_then(|s| s.get(&block).copied()).unwrap();
+        sequence(at, at + 100, true);
+        let (snap, landed) = get();
+        assert!(snap > 0 && landed == 0);
+        sequence(at + 10, at + 20, false);
+        let (snap2, landed2) = get();
+        assert_eq!(snap2, snap);
+        assert!(landed2 > snap2);
+        sequence(at, at + BLOCK, true);
+        let (snap3, landed3) = get();
+        assert!(snap3 > landed3);
     }
 
     #[test]

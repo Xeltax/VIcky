@@ -411,6 +411,50 @@ Same window shot, builder on, `VICTORY_BVH_COPY=skip` and the recommended switch
 - To verify in a run: S2A's switches (builder on, no `VICTORY_BVH_SKIP` or `VICTORY_STORE_DROP`), the save restored: the line above in the log, no exception at `+0x108557` for 300 s or more after `the ray-tracing structure builder runs` (two runs, as for any "no crash"). Then once with `VICTORY_BVH_LINK_STORES=keep`: it should crash as S2A did.
 - Next, to find where the pointers go wrong: log, for one stray link (its address outside the structure), the dispatch's root address and the group's region the program read (4 KiB, 8 KiB for 32-bit boxes), from the host copy just before the dispatch and from title memory at the same moment.
 
+## Lot 4 probes (host side, 2026-11-27)
+
+Branch `fx-lot4-host-dev`. One counting build for lot 4's decision (`xcl-notes\lot4-plan-2026-11-27.md`; the probes as section D of `fable-2026-11-27-sources.md` lays them out). The device probes P0 and P8 are the D3D12 side's, on another branch.
+
+### The diagnostics counters are kept per thread (always on, a fix)
+
+The fps runs use the diagnostics exe, whose counters were arrays of adjacent shared atomics: eight to a cache line, each add a locked add from the title's recording threads, the heap sync, the pass and the submitting thread at once (`copystat`'s 128 counters, `framelog`'s totals, the heap's per-slot `FAST` counters, the pass's `HEAP_PASS_FAST`). Worst of all, the diagnostics allocator added two locked adds on one shared line for every allocation and every release, on every thread. The frame log's "longest recording thread" was one shared word compared and swapped at each list call of the leading thread and read at everyone else's.
+
+`crate::perthread` gives each thread a block of its own (aligned to 128 bytes, written with a plain load and store, no locked instruction); the log lines sum the blocks. Totals and log text are the same as before, add for add (the sums wrap, so a release on one thread of a block made on another still nets out). A thread gives its block back when it ends, to the next thread that starts (the counts stay in the block and the sums; the pass over buffer views starts threads of its own at each pass, so blocks cannot be handed out once and for all); with more than 512 threads alive at once the rest share one more block with locked adds as before (P7's line says how many hold one now, at most, and how many found none free). Tests: `perthread::tests::sums_match_under_several_threads` (12 threads, adds and subtractions across threads), `takes_while_adding_lose_nothing`, `blocks_come_back_when_threads_end` (2,000 threads one after another, none shares a block, sums kept), `each_thread_sets_its_own`.
+
+Micro-benchmark (`cargo test -p victory-gpu --profile diag --lib perthread::tests::bench -- --ignored --nocapture`; each thread adds to four adjacent counters in turn, ns an add, wall over adds per thread):
+
+BENCH_TABLE
+
+Expected in a run: a few ms a frame less on the threads that count most (the recording threads' 41,000 list calls, the sync's and pass's 87,000 + 67,000 slots, every allocation); not measured in a game run yet.
+
+### The probes: `VICTORY_LOT4_PROBE=1` (off by default)
+
+Each says one line with the frame log's reading (every five seconds), per frame over the reading's frames (P6: per sampled frame). Off, every hook is one load of a flag (and in builds without `diagnostics` the hooks are compiled out). With the probes on, the counting itself costs some time (P2's lookup per slot, P3's compares on the relay, P6's protections one frame in 64): use the probe run for counts, not for fps.
+
+| probe | grep | what it counts | kill |
+|---|---|---|---|
+| P1 mirror size | `lot4 probe P1:` | 64 KiB blocks under live host copies of buffers and windows (census thread every reading): in card / PC memory, over XMem private memory / views of physical pages / host addresses; blocks found written (copied in from title memory, `Shadow::copy`) per frame and distinct over the reading | with P0: over ~3 GB and no PC-memory tiles, or "host addresses" over 20 % |
+| P2 slot share | `lot4 probe P2:` | of the slots the heap sync mirrors (the title's own descriptor calls left out) and the pass over buffer views makes: buffer views whose range lies wholly in P1's blocks (the last census's), constant buffer views likewise, texture views, others, none; count and % | **under 60 % of slots: the mirror is not worth weeks** |
+| P3 replaceable snapshots | `lot4 probe P3:` | snapshot bytes and blocks taken (`Shadow::writing`); at each landing (`shadow::find_all`), one 64 KiB block in 16 of the declared ranges compared with title memory before the shaders' bytes go in: equal (title memory still is the before-image) or not; the differing ones per frame (scaled by 16), with or without a difference in the 64 frames before. A sampled block that an earlier landing wrote after its snapshot is not judged (title memory then holds that landing's bytes, the snapshot older ones; C3 could still use title memory there), only counted | **under 80 % of the bytes equal: idea 3 is dead**; differences without history over ~20 a frame: too many settles |
+| P4 lazy page placement | `lot4 probe P4:` | simulated beside the real table: each physical page gets its place at its first mapping (its address; a page whose address another took first goes elsewhere, and keeps its place when mapped again). For the live windows over view memory and the title buffers of the constants heap's size (64 MB, `VICTORY_INPLACE_CONSTANTS_MIN_MB`) and more: bytes one run today / scattered / with holes, and of the bytes not one run today those the simulated places make one run; the three largest buffers listed. Behaviour unchanged | **under half of the bytes not one run today: idea 4 is dead** (the constants heap alone becoming one run keeps a narrow one alive) |
+| P5 alias census | `lot4 probe P5:` (two lines) | physical pages mapped now by how many addresses show them (1, 2, 3, 4+), over all and over the blocks under live copies, with the bytes shown at more than one address; sections of physical pages; the title's reservations (`XMemVirtualAlloc` at an address of its choice) by page size, write-combining and uncached, since the start | context |
+| P6 lazy write-back | `lot4 probe P6:` | one frame in 64, each block a landing writes into title memory (buffers' write-back, texture copy-back) is made no-access right after the write and kept so through the next frame; faults open it again and are counted (read or write, by the title's code or the runtime's image); the runtime's own kernel reads and writes (`copy_mapped`, `read_into`, `write_mapped`, `watch::writing`) open their range first and are counted apart; handler µs a fault, and an estimate with a 64 KiB fetch each. Only committed read-write private memory at console addresses that no view shows is sampled. `VICTORY_LOT4_PROBE_FAULTS=0` leaves P6 out | context (over ~300 blocks read a sampled frame: lazy read-back is dead) |
+| P7 locks | `lot4 probe P7:` | per lock, per frame: taken, taken after a wait, ms waited, % taken on the other CCD than the lock's last taker, tries that found it held: `made` alone / shared (the pass's threads) / its pieces (`VICTORY_PARALLEL_MIRROR`), the table of views (read, written), `BUFFERS`, `placed`, `kept`, the heap's buffer slots, `changed`, `textures`, `next` (dynamic slots), the guards, the made views' cache; the CCDs found and the placement's state | every lock under 10^4 a frame or under 20 % cross-CCD: lock bouncing is not a cost |
+
+How P7 counts: a lock is tried first and only one held elsewhere is timed, so an acquisition that does not wait reads no clock. The last taker's CCD is one word per kind of lock (all heaps' `made` share one), written only when it changes.
+
+### `VICTORY_CCD_PLACE=1|alt` (P7's switch, off by default; works without the probes)
+
+The CCDs are read at start from the L3 caches (`GetLogicalProcessorInformationEx`, `RelationCache`), not assumed; the start line names them (`CCD 0 (L3) processors 0-11 ..., CCD 1 ... 12-23`). With the switch, as CPU sets (`SetThreadSelectedCpuSets`):
+- on the CCD holding most of processors 0-15 (where the title pins its own threads): the submitting thread (`victory-submit`, and any thread that submits), the heap sync (`victory-heap-sync`), the parallel mirror's threads (`victory-mirror-*`), the pass's threads (`victory-heap-pass*`) and the title's recording threads (every thread that makes a list call);
+- on the other: the bulk copy threads (`victory-wide-*`, `victory-relay`).
+
+A thread the title pinned to processors of the other CCD only keeps its pinning (a hard affinity wins; the lines count those as "pinned away"). Off, each placed thread gets back the CPU sets it had. `=alt`: twenty seconds without, twenty with, from the first frame; each change is logged as the other switches' (`threads placed by CCD from now (VICTORY_CCD_PLACE=alt): ON, ...` / `: off, ...`), so `xcl-notes\alt-fps.sh` reads it, and the line also gives what the phase before took: frames, ms a frame, the submit thread at work, recording on all threads, the longest recording thread, and the ms waited for `made` (with `VICTORY_LOT4_PROBE=1`). Kill: no phase differs by more than 3 % on "at work" or the recording sum.
+
+### What to grep in the probe run
+
+`lot4 probe P` (seven kinds of line), `lot 4 probes on` at the start, `threads placed by CCD` with the switch. Read them in this order: P1 and P2 together (does the mirror pay?), P3 (idea 3), P4 (idea 4), P7 and the `=alt` phases (CCD placement), P5 and P6 for context.
+
 ## Roadmap: from about 3.5 fps toward 15–20
 
 **Why it is possible.** The console runs this title at 30 fps on a 12-TFLOPS RDNA2 GPU. An RTX 4080 has about 49 TFLOPS, and the title's CPU code is x86-64 that runs natively. RT10's frame is about 280 ms against the console's 33 ms: the gap is our translation, not the hardware. shadPS4 (AMD GPU, unified memory, raw command buffers) shows that this class of runtime can reach playable speeds.

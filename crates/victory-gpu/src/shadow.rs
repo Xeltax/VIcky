@@ -1604,9 +1604,10 @@ fn write_back(address: usize, merged: &[u8], stored: Option<&[(usize, usize)]>) 
             }
         }
     }
-    // VIcky (`VICTORY_LOT4_PROBE`, P6): in a sampled frame, held no-access.
+    // VIcky (`VICTORY_LOT4_PROBE`): P3's order of snapshots and landings,
+    // and in P6's sampled frame, held no-access.
     #[cfg(feature = "diagnostics")]
-    crate::lot4::faults::written(address, merged.len());
+    crate::lot4::wrote_back(address, merged.len());
 }
 
 /// The parts of offsets `[at, at + n)` of a copy that hold title bytes put

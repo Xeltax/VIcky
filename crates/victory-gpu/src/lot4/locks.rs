@@ -219,10 +219,10 @@ pub(crate) fn line(frames: f64) {
             super::pct(c[at + CROSS], taken),
         ));
     }
-    let (own, shared) = crate::perthread::threads();
+    let (own, most, shared) = crate::perthread::threads();
     tracing::info!(
-        "lot4 probe P7: locks per frame: {}; per-thread counters: {own} threads with a block of their own, {shared} sharing \
-         one; {}",
+        "lot4 probe P7: locks per frame: {}; per-thread counters: {own} threads with a block of their own now, {most} at \
+         most, {shared} found none free; {}",
         if parts.is_empty() { "none taken".into() } else { parts.join("; ") },
         super::ccd::state_text(),
     );
@@ -250,5 +250,29 @@ mod tests {
         let rw = RwLock::new(5u32);
         *write(Lock::Made, &rw) += 1;
         assert_eq!(*read(Lock::Made, &rw), 6);
+    }
+
+    /// What a counted lock site costs with the probes off (tests run
+    /// without `VICTORY_LOT4_PROBE`), against the plain lock, one thread:
+    /// `cargo test -p victory-gpu --profile diag --lib lot4::locks::tests::bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a benchmark: run alone, with --nocapture"]
+    fn bench_off_against_plain() {
+        assert!(!super::super::on(), "run without VICTORY_LOT4_PROBE");
+        const N: u32 = 20_000_000;
+        let m = Mutex::new(0u64);
+        let time = |f: &dyn Fn()| {
+            let started = std::time::Instant::now();
+            for _ in 0..N {
+                f();
+            }
+            started.elapsed().as_nanos() as f64 / f64::from(N)
+        };
+        for _ in 0..2 {
+            let plain = time(&|| *m.lock().unwrap_or_else(|e| e.into_inner()) += 1);
+            let counted = time(&|| *mutex(Lock::Next, &m) += 1);
+            println!("lot4 locks bench (probes off): plain lock {plain:.2} ns, through the counting helper {counted:.2} ns");
+        }
+        assert_eq!(*m.lock().unwrap(), 4 * u64::from(N));
     }
 }
