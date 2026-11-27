@@ -34,9 +34,28 @@
 //! TaynanGT/Vice-Tay f0019f2e20 (Taynan Piza): a buffer of the texture's
 //! size (up to 512 KiB) was made, and the runs of its layout found again,
 //! at every landing.
+//!
+//! Two opt-in switches, each `1` or `alt` (twenty seconds off, twenty on,
+//! in turn, as `VICTORY_LIGHT_REFRESH=alt`; each change said in the log):
+//!
+//! - `VICTORY_TEXTURE_BACK_LEAN`: a copy that a later copy of the same
+//!   memory in the same flight supersedes is not landed (nothing tells the
+//!   title anything between the read-backs of one flight's lists), and
+//!   texels title memory holds already are not written again (the write
+//!   opens the guards over them and makes the textures placed there due
+//!   again). What the title can read, and when, is the same.
+//! - `VICTORY_TEXTURE_BACK_AHEAD`: the memory copy-backs write no longer
+//!   holds back a submission sent ahead whose preparing reads it (a texture
+//!   of the title's in the same memory, a buffer copy, a fill): its
+//!   flights are not waited for. What the title's CPU reads is the same:
+//!   a copy-back still lands before anything behind its flight is told to
+//!   the title. What changes is what such a preparing takes: the texels of
+//!   the last landing, older by the flights in the air (about a frame; on
+//!   the console a pass after the compute pass reads what it wrote), and,
+//!   if it reads while a landing writes, a mix until the next landing.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -82,6 +101,119 @@ fn parse_kinds(spec: Option<&str>) -> Vec<(u64, u32, u32)> {
             Some((w.parse().ok()?, h.parse().ok()?, format.parse().ok()?))
         })
         .collect()
+}
+
+/// An opt-in switch: unset or `0` off, `1` on, `alt` twenty seconds off
+/// and twenty on, in turn from the first asking, each change said in the
+/// log as `<what> from now (<name>=alt): ON` (or `off, as usual`).
+struct Switch {
+    name: &'static str,
+    what: &'static str,
+    mode: OnceLock<u8>,
+    epoch: OnceLock<std::time::Instant>,
+    last: AtomicU8,
+}
+
+impl Switch {
+    const fn new(name: &'static str, what: &'static str) -> Self {
+        Self { name, what, mode: OnceLock::new(), epoch: OnceLock::new(), last: AtomicU8::new(2) }
+    }
+
+    fn mode(&self) -> u8 {
+        *self.mode.get_or_init(|| {
+            let mode = match std::env::var(self.name).as_deref().map(str::trim) {
+                Ok("1") => 1,
+                Ok("alt") => 2,
+                _ => 0,
+            };
+            if mode == 1 {
+                tracing::info!("{} ({}=1)", self.what, self.name);
+            }
+            mode
+        })
+    }
+
+    fn on(&self) -> bool {
+        match self.mode() {
+            0 => false,
+            1 => true,
+            _ => {
+                let on = (self.epoch.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+                if self.last.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                    tracing::info!("{} from now ({}=alt): {}", self.what, self.name, if on { "ON" } else { "off, as usual" });
+                }
+                on
+            }
+        }
+    }
+
+    /// Its state, for the frame-rate line.
+    fn said(&self) -> &'static str {
+        match (self.mode(), self.last.load(Ordering::Relaxed)) {
+            (0, _) => "off",
+            (1, _) => "on",
+            (_, 1) => "alt, ON",
+            _ => "alt, off",
+        }
+    }
+}
+
+static LEAN: Switch = Switch::new(
+    "VICTORY_TEXTURE_BACK_LEAN",
+    "texture copy-backs land lean: a copy a later one of the same memory in the same flight supersedes is not landed, texels title memory holds already are not written again",
+);
+static AHEAD: Switch = Switch::new(
+    "VICTORY_TEXTURE_BACK_AHEAD",
+    "submissions that read memory texture copy-backs in the air write go ahead without waiting for them: they read the last landing's texels",
+);
+
+/// Whether copy-backs land lean (`VICTORY_TEXTURE_BACK_LEAN`).
+pub(crate) fn lean() -> bool {
+    LEAN.on()
+}
+
+/// Whether the memory copy-backs in the air write holds back a submission
+/// whose preparing reads it (unless `VICTORY_TEXTURE_BACK_AHEAD`).
+pub(crate) fn holding() -> bool {
+    !AHEAD.on()
+}
+
+/// Since the last frame-rate line ([`summary`]): copies recorded and their
+/// bytes; copies landed into title memory and their bytes; copies left out
+/// as superseded and as unchanged (`VICTORY_TEXTURE_BACK_LEAN`);
+/// microseconds landing; settles for a submission that reads memory
+/// copy-backs in the air write, and the microseconds they waited;
+/// such submissions that went ahead (`VICTORY_TEXTURE_BACK_AHEAD`).
+pub(crate) static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+pub(crate) const SUPERSEDED: usize = 4;
+pub(crate) const SETTLES: usize = 7;
+pub(crate) const WAITED_US: usize = 8;
+pub(crate) const WENT_AHEAD: usize = 9;
+
+/// Whether a copy-back was ever recorded (the frame-rate line says
+/// nothing of them before).
+static EVER: AtomicBool = AtomicBool::new(false);
+
+/// The copy-backs' part of the frame-rate line, per frame since the line
+/// before; empty before the first copy-back.
+pub(crate) fn summary(frames: f64) -> String {
+    let frames = frames.max(1.0);
+    let [copied, copied_bytes, landed, bytes, superseded, unchanged, landing_us, settles, waited_us, ahead] =
+        std::array::from_fn(|i| STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if !EVER.load(Ordering::Relaxed) {
+        return String::new();
+    }
+    format!(
+        " texture copy-back: {copied:.1} copied {:.1} MB, {landed:.1} landed {:.1} MB in {:.2} ms (lean {}: {superseded:.1} \
+         superseded, {unchanged:.1} unchanged), {settles:.2} settles for a read of its memory, {:.1} ms waiting for the card \
+         (ahead {}: {ahead:.2} such reads went ahead);",
+        copied_bytes / 1e6,
+        bytes / 1e6,
+        landing_us / 1e3,
+        LEAN.said(),
+        waited_us / 1e3,
+        AHEAD.said()
+    )
 }
 
 /// Whether title texture `resource` is of a kind copied back.
@@ -259,6 +391,11 @@ impl Back {
     pub(crate) fn range(&self) -> (usize, usize) {
         (self.ticket.at, self.ticket.end)
     }
+
+    /// Whether its allocation is still the one it was recorded for.
+    pub(crate) fn fresh(&self) -> bool {
+        self.ticket.valid.load(Ordering::Acquire)
+    }
 }
 
 /// Records a host copy from a texture already in COPY_SOURCE.
@@ -299,6 +436,9 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
     let (buffer, pooled) = read_back_buffer(host, total)?;
+    EVER.store(true, Ordering::Relaxed);
+    STATS[0].fetch_add(1, Ordering::Relaxed);
+    STATS[1].fetch_add(total, Ordering::Relaxed);
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -319,12 +459,14 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
 }
 
 /// What a thread that lands copy-backs keeps from one landing to the next:
-/// the title's bytes being tiled and the tiling geometry of the mips it
+/// the title's bytes being tiled, the same as read
+/// (`VICTORY_TEXTURE_BACK_LEAN`), and the tiling geometry of the mips it
 /// tiled. After TaynanGT/Vice-Tay f0019f2e20 (there one is handed down by
 /// each caller; here each thread that lands keeps its own).
 #[derive(Default)]
 struct Scratch {
     tiled: Vec<u8>,
+    read: Vec<u8>,
     tiling: victory_formats::texture::TilingCache,
 }
 
@@ -334,7 +476,9 @@ thread_local! {
 
 /// Once the list has run, tile its texels back into the same title allocation.
 pub(crate) fn land(back: &Back) {
+    let began = std::time::Instant::now();
     SCRATCH.with_borrow_mut(|scratch| land_with(back, scratch));
+    STATS[6].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
 fn land_with(back: &Back, scratch: &mut Scratch) {
@@ -351,7 +495,7 @@ fn land_with(back: &Back, scratch: &mut Scratch) {
     }
     let (at, end) = back.range();
     let size = end - at;
-    let Scratch { tiled, tiling } = scratch;
+    let Scratch { tiled, read, tiling } = scratch;
     if tiled.len() < size {
         tiled.resize(size, 0);
     }
@@ -359,6 +503,11 @@ fn land_with(back: &Back, scratch: &mut Scratch) {
     // Keep title bytes the subresources do not cover.
     if !crate::host::read_into(at as *const u8, tiled) {
         return;
+    }
+    let lean = lean();
+    if lean {
+        read.clear();
+        read.extend_from_slice(tiled);
     }
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
@@ -384,7 +533,13 @@ fn land_with(back: &Back, scratch: &mut Scratch) {
     }
     // SAFETY: mapped above.
     unsafe { back.buffer.Unmap(0, None) };
+    if lean && read[..] == tiled[..] {
+        STATS[5].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+    STATS[2].fetch_add(1, Ordering::Relaxed);
+    STATS[3].fetch_add(size as u64, Ordering::Relaxed);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
         tracing::info!(
