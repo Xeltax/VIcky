@@ -25,6 +25,8 @@ use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
 mod bvh_copy;
+#[cfg(feature = "diagnostics")]
+mod bvh_input;
 pub(crate) mod heap_pass;
 mod texture_chunk;
 
@@ -2520,6 +2522,10 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         crate::pipeline::note_ran(self.pipeline as This);
+        // The builder's rehydration programs' input against title memory
+        // (`VICTORY_BVH_INPUT_CHECK=1`).
+        #[cfg(feature = "diagnostics")]
+        self.bvh_input_check(list, p, [gx, gy, gz]);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             let parts = if gx > crate::indirect::PART && crate::indirect::parts_on() {
