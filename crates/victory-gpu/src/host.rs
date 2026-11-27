@@ -6665,6 +6665,7 @@ impl Host {
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
+            awake::sent(&self.device);
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
@@ -6709,6 +6710,7 @@ impl Host {
             unsafe {
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
+                awake::sent(&self.device);
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -8426,6 +8428,10 @@ mod inspect;
 /// `VICTORY_LATE_WATER`.
 pub(crate) mod late_water;
 
+/// VIcky: the card kept awake between submissions, `VICTORY_CARD_AWAKE`
+/// (port of foxhound 9f8838b1).
+mod awake;
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
@@ -9636,7 +9642,7 @@ impl Meter {
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB; {reaper}{texback}{water}), {draws:.0} draws/frame, \
+                 GPU; {back_ms:.1} copying back {back_mb:.1} MB; {reaper}{texback}{water}{awake}), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
@@ -9644,6 +9650,7 @@ impl Meter {
                 reaper = crate::reaper::summary(frames),
                 texback = crate::texback::summary(frames),
                 water = late_water::summary(frames),
+                awake = awake::summary(frames),
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
