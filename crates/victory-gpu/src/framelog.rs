@@ -15,7 +15,8 @@
 //!
 //! On by default in diagnostics builds, off in others;
 //! `VICTORY_FRAME_LOG=1` or `0` says otherwise. The counters themselves
-//! are plain atomic adds in every build.
+//! are adds in every build, each thread to a block of its own (VIcky,
+//! [`crate::perthread`]: they were adjacent shared atomics).
 //!
 //! VIcky: the title's turn. The frame is a loop through our submitting
 //! thread and the title's own work between two presents, and only the
@@ -115,17 +116,17 @@ pub enum T {
 }
 
 const N: usize = T::Count as usize;
-static TOTAL: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+static TOTAL: crate::perthread::Counters<N> = crate::perthread::Counters::new();
 
 /// Adds to a total.
 pub fn add(t: T, n: u64) {
-    TOTAL[t as usize].fetch_add(n, Relaxed);
+    TOTAL.add(t as usize, n);
 }
 
 /// Takes from a total (a time that was summed over threads is corrected
 /// to the time it took).
 pub fn sub(t: T, n: u64) {
-    TOTAL[t as usize].fetch_sub(n, Relaxed);
+    TOTAL.sub(t as usize, n);
 }
 
 /// What a thread did inside our calls since its last present: for the
@@ -196,9 +197,12 @@ pub fn present_called() {
 /// Frames ended so far ([`frame`]), for the list-call time of each thread
 /// by frame: the low 16 bits tag [`LONGEST`].
 static FRAME_NUMBER: AtomicU64 = AtomicU64::new(0);
-/// The most list-call time of one thread in the frame: the frame's tag in
-/// the top 16 bits, nanoseconds below.
-static LONGEST: AtomicU64 = AtomicU64::new(0);
+/// Each thread's list-call time in the frame it last recorded in: the
+/// frame's tag in the top 16 bits, nanoseconds below. The frame's longest
+/// is the most of those tagged with it, taken at [`frame`]. (VIcky: one
+/// shared word before, compared and swapped at every list call of the
+/// thread then leading, and read by all the others at theirs.)
+static LONGEST: crate::perthread::Counters<1> = crate::perthread::Counters::new();
 const LONGEST_NS: u64 = (1 << 48) - 1;
 
 thread_local! {
@@ -219,12 +223,18 @@ pub fn recorded_here(ns: u64) {
         m.set((frame, mine));
         mine.min(LONGEST_NS)
     });
-    let _ = LONGEST.fetch_update(Relaxed, Relaxed, |old| {
-        let (tag, most) = (old >> 48, old & LONGEST_NS);
+    // (Past the per-thread blocks, threads share one word, kept as before.)
+    LONGEST.set_if(0, frame << 48 | mine, |old, new| {
+        let (tag, most, frame, mine) = (old >> 48, old & LONGEST_NS, new >> 48, new & LONGEST_NS);
         // A thread still counting a frame that has ended changes nothing.
         let newer = frame.wrapping_sub(tag) & 0xFFFF;
-        ((newer != 0 && newer < 0x8000) || (newer == 0 && mine > most)).then_some(frame << 48 | mine)
+        (newer != 0 && newer < 0x8000) || (newer == 0 && mine > most)
     });
+}
+
+/// The most list-call time one thread had in frame `ended` (its tag).
+fn longest_in(ended: u64) -> u64 {
+    LONGEST.each(0).filter(|v| v >> 48 == ended).map(|v| v & LONGEST_NS).max().unwrap_or(0)
 }
 
 /// The title's turn in a frame (microseconds; list calls in nanoseconds).
@@ -695,14 +705,13 @@ pub fn frame() {
         add(T::RenderSlow, 1);
     }
     let now = std::time::Instant::now();
-    let totals: [u64; N] = std::array::from_fn(|i| TOTAL[i].load(Relaxed));
+    let totals: [u64; N] = TOTAL.totals();
     let sampled = sample();
     let here = HERE.with(|c| c.replace([0; HN]));
     // The frame's longest recording thread; list calls from here on count
     // for the next one.
     let ended = FRAME_NUMBER.fetch_add(1, Relaxed) & 0xFFFF;
-    let longest = LONGEST.load(Relaxed);
-    let longest_ns = if longest >> 48 == ended { longest & LONGEST_NS } else { 0 };
+    let longest_ns = longest_in(ended);
     // SAFETY: a plain query.
     let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -828,10 +837,10 @@ mod tests {
 
     #[test]
     fn totals_and_a_threads_own_counts_add_up() {
-        let before = TOTAL[T::DiskReads as usize].load(Relaxed);
+        let before = TOTAL.total(T::DiskReads as usize);
         add(T::DiskReads, 3);
         sub(T::DiskReads, 1);
-        assert_eq!(TOTAL[T::DiskReads as usize].load(Relaxed) - before, 2);
+        assert_eq!(TOTAL.total(T::DiskReads as usize).wrapping_sub(before), 2);
         here(H::PaceUs, 5);
         here(H::PaceUs, 6);
         assert_eq!(HERE.with(|c| c.get())[H::PaceUs as usize], 11);

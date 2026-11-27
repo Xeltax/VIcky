@@ -252,10 +252,11 @@ pub(crate) enum C {
     LightNothingNew,
 }
 const COUNTERS: usize = 128;
-static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+/// VIcky: kept per thread ([`crate::perthread`]), summed at the line.
+static COUNT: crate::perthread::Counters<COUNTERS> = crate::perthread::Counters::new();
 
 pub(crate) fn add(c: C, n: u64) {
-    COUNT[c as usize].fetch_add(n, Relaxed);
+    COUNT.add(c as usize, n);
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -398,7 +399,11 @@ pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
 /// runtime and of the driver alike (3.5 GB in run 60's gameplay, growing by
 /// some 2 MB a frame, and nothing said whose): this says which part is
 /// ours. Bigger blocks are allocations of their own in the map.
-static OWN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+///
+/// VIcky: kept per thread ([`crate::perthread`]): a block made on one
+/// thread and released on another adds on the first and takes on the
+/// second, and the sums wrap back to what is alive.
+static OWN: crate::perthread::Counters<8> = crate::perthread::Counters::new();
 
 /// The class of [`OWN`] a block of `size` bytes counts in.
 fn block_class(size: usize) -> usize {
@@ -413,11 +418,11 @@ fn block_class(size: usize) -> usize {
 fn own(size: usize, made: bool) {
     let class = block_class(size);
     if made {
-        OWN[class].fetch_add(size as u64, Relaxed);
-        OWN[4 + class].fetch_add(1, Relaxed);
+        OWN.add(class, size as u64);
+        OWN.add(4 + class, 1);
     } else {
-        OWN[class].fetch_sub(size as u64, Relaxed);
-        OWN[4 + class].fetch_sub(1, Relaxed);
+        OWN.sub(class, size as u64);
+        OWN.sub(4 + class, 1);
     }
 }
 
@@ -457,8 +462,9 @@ fn big_blocks() -> String {
     if text.is_empty() { "none".into() } else { text.join(", ") }
 }
 
-/// The system's allocator with every block counted in [`OWN`] (two atomic
-/// additions per allocation and per release: diagnostics builds only).
+/// The system's allocator with every block counted in [`OWN`] (two
+/// additions per allocation and per release, to the thread's own block of
+/// counters: diagnostics builds only).
 struct Counting;
 
 // SAFETY: every call goes to the system's allocator unchanged; only
@@ -567,10 +573,10 @@ mod own_tests {
     #[test]
     fn a_block_is_counted_while_it_lives() {
         let block = vec![1u8; 8 << 20];
-        assert!(OWN[3].load(Relaxed) >= 8 << 20);
-        assert!(OWN[7].load(Relaxed) >= 1);
+        assert!(OWN.total(3) >= 8 << 20);
+        assert!(OWN.total(7) >= 1);
         drop(block);
-        assert!(OWN[7].load(Relaxed) < u64::MAX / 2, "no count below zero");
+        assert!(OWN.total(7) < u64::MAX / 2, "no count below zero");
     }
 }
 
@@ -932,7 +938,7 @@ fn log_memory() {
     let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
     let window = crate::shadow::window_use();
     let views = crate::descriptor::views_kept();
-    let own: Vec<u64> = OWN.iter().map(|o| o.load(Relaxed)).collect();
+    let own: Vec<u64> = OWN.totals().to_vec();
     tracing::info!(
         "memory, what holds it: {} host lists alive; their scratch memory: {} chunks {:.0} MB, of          them {} chunks {:.0} MB spare ({} taken from the spare ones so far); their other upload          buffers: {} alive {:.0} MB; windows outside buffers (grid {} KiB): {:.0} MB of their          pages ever copied, {} shown by descriptor slots {:.0} MB, {} held by lists or the pass          over the heap {:.0} MB, {} asked for without a length {:.0} MB; buffer views of the heap          whose slot showed another copy than the one brought up to date (VICTORY_HEAP_PASS_SHOWN=1): {}; distinct views          kept: {} ({} free) {:.0} MB; our own allocations: {:.0} MB in {} blocks (under 4 KiB          {:.0} MB in {}, to 64 KiB {:.0} MB in {}, to 1 MiB {:.0} MB in {}, larger {:.0} MB in {})",
         alive[0],
@@ -1265,15 +1271,15 @@ fn split_clause(c: &[f64]) -> String {
 /// second or more: a 4 s frame after an unlogged 4 s frame showed two
 /// frames' counts as one's).
 pub(crate) fn log(frames: f64) {
-    let counted = COUNT[C::Frames as usize].swap(0, Relaxed);
+    // (Every counter since the last line at once: with the shared counters
+    // the frames were swapped first and read as 0 with the rest.)
+    let mut taken = COUNT.take();
+    let counted = std::mem::take(&mut taken[C::Frames as usize]);
     let frames = if counted > 0 { counted as f64 } else { frames };
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
-    let c: Vec<f64> = COUNT
-        .iter()
-        .map(|a| a.swap(0, Relaxed) as f64 / frames)
-        .collect();
+    let c: Vec<f64> = taken.iter().map(|&a| a as f64 / frames).collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
     tracing::info!(

@@ -570,12 +570,13 @@ fn fast_line(frames: f64) {
     if host::cache_size() == 0 && !host::skip_same() && !host::sync_check() {
         return;
     }
-    let per = |f: Fast| FAST[f as usize].swap(0, Relaxed) as f64 / frames;
+    let fast = FAST.take();
+    let per = |f: Fast| fast[f as usize] as f64 / frames;
     let [hits, misses, stale, unmade, other, skipped] =
         [Fast::Hits, Fast::Misses, Fast::Stale, Fast::Unmade, Fast::NotCacheable, Fast::NotesSkipped].map(per);
     let checks = [host::Check::Cache, host::Check::Lookups, host::Check::Notes]
         .map(|c| [0, 1].map(|i| CHECKS[c as usize][i].swap(0, Relaxed)));
-    let pass = crate::draw::HEAP_PASS_FAST.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames);
+    let pass = crate::draw::HEAP_PASS_FAST.take().map(|c| c as f64 / frames);
     tracing::info!(
         "heap records, fast ways per frame: VICTORY_HEAP_SYNC_CACHE: {hits:.0} buffer views copied from the cache, \
          {misses:.0} made and kept, {stale:.0} kept ones whose copies had changed, {unmade:.0} the slow way made nothing of, \

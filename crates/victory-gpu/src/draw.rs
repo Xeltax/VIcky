@@ -676,8 +676,8 @@ pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }
 /// VIcky (`VICTORY_HEAP_SYNC_CACHE`): slots of the pass over buffer views
 /// whose making and copy shared their lookups, and the lookups of host
 /// copies they made (`descriptor::host::Lookups`); since the last sync
-/// line.
-pub(crate) static HEAP_PASS_FAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// line. Kept per thread ([`crate::perthread`]): added for every slot.
+pub(crate) static HEAP_PASS_FAST: crate::perthread::Counters<2> = crate::perthread::Counters::new();
 
 /// `found`, the copy and range the pass over buffer views brings up to date
 /// for `view` with lookups shared, as it is; with `VICTORY_HEAP_SYNC_CHECK`

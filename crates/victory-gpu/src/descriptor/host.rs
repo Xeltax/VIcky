@@ -2170,7 +2170,7 @@ impl HostHeap {
         if plain && self.noted_plain(index) {
             self.note_stride(index, view.and_then(view_stride));
             self.mark_into(index, marks, sink);
-            FAST[Fast::NotesSkipped as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            FAST.add(Fast::NotesSkipped as usize, 1);
             if check_now() {
                 self.check_noted(index);
             }
@@ -3155,7 +3155,7 @@ impl HostHeap {
             return made_otherwise(view, at, lookups);
         }
         let Some(extent) = cacheable(view) else {
-            FAST[Fast::NotCacheable as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            FAST.add(Fast::NotCacheable as usize, 1);
             return made_otherwise(view, at, lookups);
         };
         // VIcky (`VICTORY_HEAP_PASS_THREADS`): the threads of the pass take
@@ -3709,7 +3709,6 @@ impl RecordCache {
         lookups: &mut Lookups,
     ) -> Option<Kept> {
         use crate::draw::heap_pass::parts;
-        use std::sync::atomic::Ordering::Relaxed;
         self.tick = self.tick.wrapping_add(1);
         if let Some(e) = self.find(key) {
             let entry = self.entries[e];
@@ -3739,19 +3738,19 @@ impl RecordCache {
                         };
                     }
                     self.entries[e].used = self.tick;
-                    FAST[Fast::Hits as usize].fetch_add(1, Relaxed);
+                    FAST.add(Fast::Hits as usize, 1);
                     parts::count(parts::Count::Hit);
                     return Some(Some(shown.buffer.clone()));
                 }
                 _ => {
-                    FAST[Fast::Stale as usize].fetch_add(1, Relaxed);
+                    FAST.add(Fast::Stale as usize, 1);
                     self.entries[e].key = 0;
                 }
             }
         }
         // Made as `make` makes it, in the entry first.
         let Some(plan) = buffer_plan(view, lookups) else {
-            FAST[Fast::Unmade as usize].fetch_add(1, Relaxed);
+            FAST.add(Fast::Unmade as usize, 1);
             return None;
         };
         let e = self.room(key);
@@ -3776,7 +3775,7 @@ impl RecordCache {
             print: if sync_check() { plan.print() } else { 0 },
             used: self.tick,
         };
-        FAST[Fast::Misses as usize].fetch_add(1, Relaxed);
+        FAST.add(Fast::Misses as usize, 1);
         Some(kept)
     }
 }
@@ -4037,7 +4036,9 @@ pub(crate) enum Fast {
     NotesSkipped,
 }
 
-pub(crate) static FAST: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// VIcky: kept per thread ([`crate::perthread`]): the heap sync, the pass's
+/// threads and the title's threads add here for every slot.
+pub(crate) static FAST: crate::perthread::Counters<6> = crate::perthread::Counters::new();
 
 /// What `VICTORY_HEAP_SYNC_CHECK` compares.
 #[derive(Clone, Copy, Debug)]

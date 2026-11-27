@@ -273,8 +273,8 @@ fn work(
             };
             parts::count(Count::Range);
             let (shadow, address, len) = if shared {
-                crate::draw::HEAP_PASS_FAST[0].fetch_add(1, Relaxed);
-                crate::draw::HEAP_PASS_FAST[1].fetch_add(lookups.asked(), Relaxed);
+                crate::draw::HEAP_PASS_FAST.add(0, 1);
+                crate::draw::HEAP_PASS_FAST.add(1, lookups.asked());
                 let _copy = enter(Part::Copy);
                 crate::draw::shared_copy_checked(&view, (shadow, address, len))
             } else {
