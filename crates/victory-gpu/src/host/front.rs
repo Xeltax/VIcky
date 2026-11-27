@@ -169,6 +169,8 @@ pub(super) fn walk(runs: &[&HostList], keep: bool) -> Walk {
                 Step::GpuWrite(shadow, ..) => Touch::Write(Arc::as_ptr(shadow) as usize),
                 Step::Copy(..) | Step::Run(_) => Touch::Title,
                 Step::Fill(..) | Step::Host(_) | Step::Texture(_) | Step::HeapPass(_) => continue,
+                #[cfg(feature = "diagnostics")]
+                Step::Inspect(..) => continue,
             });
         }
     }

@@ -2170,6 +2170,10 @@ enum Step {
     /// its refreshes in place. They take its place once it has ended,
     /// before anything reads the steps ([`HostList::join_heap_passes`]).
     HeapPass(std::sync::Arc<crate::draw::heap_pass::Pending>),
+    /// Diagnostics (`VICTORY_BVH_INPUT_CHECK=1`, [`inspect`]): work that
+    /// reads a copy once its refresh is done and writes nothing.
+    #[cfg(feature = "diagnostics")]
+    Inspect(std::sync::Arc<crate::shadow::Shadow>, Box<dyn Fn() + Send>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2969,6 +2973,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 // (A pass beside stands for refreshes: put in their place
                 // before this is asked, `HostList::join_heap_passes`.)
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) | Step::HeapPass(_) => {}
+                #[cfg(feature = "diagnostics")]
+                Step::Inspect(..) => {}
             }
         }
     }
@@ -8180,6 +8186,12 @@ impl HostList {
                     }
                     continue;
                 }
+                #[cfg(feature = "diagnostics")]
+                Step::Inspect(shadow, work) => {
+                    batch.flush_one(shadow);
+                    work();
+                    continue;
+                }
                 // Put in place at the start of the submission
                 // (`HostList::join_heap_passes`), so not met here; if it
                 // were, its refreshes are done as refresh steps are.
@@ -8326,6 +8338,10 @@ pub(crate) mod sparseknown;
 
 /// The host list's side of the texture copy-back ([`crate::texback`]).
 mod texture_back;
+
+/// VIcky: the host list's side of `VICTORY_BVH_INPUT_CHECK`.
+#[cfg(feature = "diagnostics")]
+mod inspect;
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {

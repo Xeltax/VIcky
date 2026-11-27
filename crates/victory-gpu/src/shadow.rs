@@ -26,6 +26,8 @@ use crate::watch::PAGE;
 
 pub(crate) mod cardlist;
 pub(crate) mod snapside;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod input;
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {

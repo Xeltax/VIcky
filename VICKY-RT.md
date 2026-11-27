@@ -437,6 +437,43 @@ Same window shot, builder on, `VICTORY_BVH_COPY=skip` and the recommended switch
 - To verify in a run: S2A's switches (builder on, no `VICTORY_BVH_SKIP` or `VICTORY_STORE_DROP`), the save restored: the line above in the log, no exception at `+0x108557` for 300 s or more after `the ray-tracing structure builder runs` (two runs, as for any "no crash"). Then once with `VICTORY_BVH_LINK_STORES=keep`: it should crash as S2A did.
 - Next, to find where the pointers go wrong: log, for one stray link (its address outside the structure), the dispatch's root address and the group's region the program read (4 KiB, 8 KiB for 32-bit boxes), from the host copy just before the dispatch and from title memory at the same moment.
 
+### Is the builder's rehydration input the title's bytes? `VICTORY_BVH_INPUT_CHECK=1` (diagnostics builds, off by default)
+
+The two box programs match the console on synthetic data, so the bad parent-link addresses most likely come from bad input. This switch compares, for each dispatch of the four rehydration stages, the bytes their root views read with title memory.
+
+**Run it.** Build `cargo build --profile diag -p victory --features diagnostics`. Run as in "Run" above (builder on) with the save restored, and add:
+
+- `VICTORY_BVH_INPUT_CHECK=1`
+- `VICTORY_BVH_LINK_STORES=keep` to see the crash path (the 16 parent-link stores kept; the title crashes on the chapter-1 save's loading screen). Without it (the default) the stores are left out and the title survives: the check works the same either way, since it reads the input and not the stores.
+- Optionally `VICTORY_BVH_COPY=skip`, `VICTORY_LATE_WAIT=2 VICTORY_REAPER=1` as in the runs above.
+
+It reads and compares up to 4 MiB per range, twice per dispatch, so frames get slower while it is on. Off, nothing changes.
+
+**What is compared.** The programs: 4ddd6f9702fab2a7 (DecompressHeader), 5e68767498c57eb6 (LeafRehydration), caa78b8ca62bc3d6 (Box16Rehydration), 28918b7150a7aad5 (Box32Rehydration). Per dispatch, each distinct address of their root views (roots 1 and 2 are normally one address, shown as `u1+u2`; `s` is an SRV, `u` a UAV), from the address to the end of its host copy, which is what the view reads. Two reads of the host copy's bytes against title memory:
+
+- at recording: before the list's refresh of the copy has run, so a difference is normal when `refresh_queued=true`;
+- at submission: after that refresh, which is what the card will read.
+
+**The lines.**
+
+- `VICTORY_BVH_INPUT_CHECK: a dispatch of a builder rehydration program reads a range whose host copy differs from title memory (the first 32 such dispatches)`: fields `frame`, `program`, `name`, `groups`, `ranges` (compared), `bad_ranges`, and `detail`, one entry per bad range, joined by ` | `:
+  `u1+u2 at 0xADDR (copy N[ in place| in the card's memory], 0xLEN bytes): at recording X of Y bytes differ, first at +0xOFF; at submission X of Y bytes differ, first at +0xOFF; refresh_queued=true|false pending=0xB pages_never_taken=P/Q taken_asking=LO..HI asking_now=N`
+  - A range is bad when bytes differ at submission, or at recording with no refresh queued in the list.
+  - `first at +0xOFF` is the offset from the range's address. `X bytes equal` when none differ.
+  - `copy N` is the host copy's own number (`Shadow::id`, not the 1,023 title-memory numbers).
+  - `refresh_queued`: a refresh covering the range is queued in this list. `false` means nothing in the list brings the copy up to date before the dispatch.
+  - `pending`: bytes of the range an earlier submission not yet copied back may be writing. There the copy is newer than title memory, so a difference is not a stale copy (the programs rehydrate in place, so one dispatch's output is the next one's input).
+  - `pages_never_taken=P/Q`: pages of the range the copy never took from title memory. `taken_asking=LO..HI`: the lowest and highest write-watch asking that took the others (the age: compare with `asking_now`, `not asked ahead` when the range is not in a range asked ahead).
+- `VICTORY_BVH_INPUT_CHECK, since the last line: dispatches of the builder's rehydration programs (...)`: at the first checked dispatch of a frame, for the frames since the last line (the first 200 lines, then every 100th): `dispatches`, `dispatches_with_bad_range`, `ranges`, `differ_at_recording`, `differ_at_submission`, `differ_at_recording_no_refresh_queued`, `submission_mib_compared`, `submission_bytes_differing`, `ranges_with_pending_writes`, `views_without_copy`. Submission counts lag a frame or two.
+
+**Reading it.**
+
+- `differ_at_submission` stays 0 and no detail lines: the card is given the title's bytes at submission; look at the title's memory changing between recording and submission, or at the program's own output.
+- Details with `refresh_queued=false` and `pending=0x0`: a range the dispatch reads that nothing refreshes: the stale-copy cause.
+- Details with `pages_never_taken` above 0: the copy never took those pages (they read as the title's zero or stale bytes).
+- Details with `pending` above 0 only: the earlier stage's own output not yet copied back, not stale input.
+- A `first at +0x...` offset tells where in the 4 MiB the first bad byte lies; with `VICTORY_BVH_LINK_STORES=keep` compare it with the group's region (4 KiB of input per group for 16-bit boxes, 8 KiB for 32-bit boxes).
+
 ## Roadmap: from about 3.5 fps toward 15–20
 
 **Why it is possible.** The console runs this title at 30 fps on a 12-TFLOPS RDNA2 GPU. An RTX 4080 has about 49 TFLOPS, and the title's CPU code is x86-64 that runs natively. RT10's frame is about 280 ms against the console's 33 ms: the gap is our translation, not the hardware. shadPS4 (AMD GPU, unified memory, raw command buffers) shows that this class of runtime can reach playable speeds.
