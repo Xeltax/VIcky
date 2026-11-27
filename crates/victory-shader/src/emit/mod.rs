@@ -1162,6 +1162,29 @@ mod tests {
         assert_eq!(moved.dxil, moved_plain.dxil, "a store at another offset stays");
     }
 
+    /// The ray-tracing structure builder's parent-link stores (`per_program::BVH_LINK_STORES`):
+    /// left out of the two box rehydration programs' translations by default, and only
+    /// there; `VICTORY_BVH_LINK_STORES=keep` keeps them.
+    #[test]
+    fn the_builders_parent_link_stores_are_left_out_by_default() {
+        for (hash, offsets) in per_program::BVH_LINK_STORES {
+            for at in [offsets[0], offsets[7]] {
+                // s_nop up to the store's offset
+                let body = vec![0xBF80_0000; (at - 16) / 4];
+                let was = per_program::TEST_BVH_LINK_STORES.replace(Some(None));
+                let plain = stores_v1_shader(&body).unwrap();
+                let other = for_program("0123456789abcdef", || stores_v1_shader(&body)).unwrap();
+                let dropped = for_program(hash, || stores_v1_shader(&body)).unwrap();
+                per_program::TEST_BVH_LINK_STORES.set(Some(Some("keep")));
+                let kept = for_program(hash, || stores_v1_shader(&body)).unwrap();
+                per_program::TEST_BVH_LINK_STORES.set(was);
+                assert_eq!(other.dxil, plain.dxil, "#{hash} {at:#x}: another program keeps its store");
+                assert!(dropped.dxil.len() < plain.dxil.len(), "#{hash} {at:#x}: left out by default");
+                assert_eq!(kept.dxil, plain.dxil, "#{hash} {at:#x}: kept with `keep`");
+            }
+        }
+    }
+
     /// The high dword of a wave64 mask rewritten alone (`s_mov_b32 vcc_hi`
     /// or `exec_hi`): lanes 32-63 took the mask the low dword was first
     /// written with (the compare's, EXEC's on entry). Now the store refuses;

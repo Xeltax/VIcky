@@ -5031,8 +5031,9 @@ impl<'a> Lower<'a> {
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
-        // `VICTORY_STORE_DROP` (diagnostics, per program): a store left out, as one to a null
-        // view. (A store writes no register.)
+        // `VICTORY_STORE_DROP` (diagnostics, per program) and the builder's parent-link stores
+        // (`per_program::BVH_LINK_STORES`): a store left out, as one to a null view. (A store
+        // writes no register.)
         if name.contains("_store")
             && matches!(inst.fields, Fields::Buffer { .. } | Fields::Image { .. } | Fields::Flat { .. })
             && super::store_dropped_here(offset)
