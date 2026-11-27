@@ -68,6 +68,30 @@
 //!   `CS_ShadowRenderTiledCascadesAlphaCBPPPC` (#f133e35e), to find which of
 //!   its outputs costs the characters their skin.
 //!
+//! And one for the paired form of a console wave64 compute program on a host of 32-lane
+//! waves (`lower`'s `paired`, fork pull requests #1397 and #1419 by ByFxbian): one host wave
+//! runs one console wave, each thread two of its lanes. The two water transmission programs
+//! (`CS_TransmissionVolumetrics_Tiled`, #5dc3b259 and #6f225b64) keep 64-lane waves
+//! otherwise, which an RTX 4080 refuses, so they never run; in this form they translate in
+//! waves of 32 (fork run reports: the water's colour back). Opt-in, for the listed programs
+//! only, tried before every other form and left for them when it does not translate:
+//! - `VICTORY_WAVE_PAIRS_ONLY=<hash>,...`: the listed programs; unset or `0`, none;
+//! - `VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz`: their 32-bit float sums, minimums and
+//!   maximums over the wave are replayed in the console's order (`lower`'s `paired_fp32`),
+//!   which needs that guest float mode confirmed; without it a program with one is refused;
+//! - `VICTORY_LDS_INIT_HOIST=0`: their LDS accumulators are not set at the start
+//!   (`lower`'s `lds_init`; fork commit a918163849).
+//!
+//! Only the listed programs' keys take the last two.
+//!
+//! And one for a console wave64 program whose LDS is read and written in a lane-branch region
+//! that only raises a flag there (`lower`'s `lds_flags`; fork commit c005a245f0 by fxceless,
+//! after DrTardis1963's `1b5c3a1e`): it runs as two host waves of 32, as the fork does for
+//! every program; over the fork's whole shader pack that changes only the reflection tiling
+//! program #2cc4c197, which keeps 64-lane waves otherwise (refused on an RTX 4080).
+//! - `VICTORY_LDS_FLAGS` unset or `0`: for no program; `all`: for every one (the fork's
+//!   default); `<hash>,...`: for the listed ones.
+//!
 //! The same machinery leaves out, by default, the parent-link stores of the
 //! ray-tracing structure builder's two box rehydration programs
 //! ([`BVH_LINK_STORES`]); `VICTORY_BVH_LINK_STORES=keep` keeps them. The
@@ -107,7 +131,7 @@ pub(crate) fn current() -> Option<String> {
 /// decision into its own key) and so left out of the translator's
 /// fingerprint ([`super::translation_fingerprint`]): a new list translates
 /// again only the programs whose decision it changes.
-pub(super) const PER_PROGRAM_SWITCHES: [&str; 8] = [
+pub(super) const PER_PROGRAM_SWITCHES: [&str; 12] = [
     "VICTORY_WAVE_DEEP_SKIPS_NOT",
     "VICTORY_WAVE_DEEP_SKIPS_ONLY",
     "VICTORY_SHADER_OPT_NOT",
@@ -116,7 +140,75 @@ pub(super) const PER_PROGRAM_SWITCHES: [&str; 8] = [
     "VICTORY_STORE_DROP",
     "VICTORY_WAVE_SITE_PAIRS",
     "VICTORY_BVH_LINK_STORES",
+    "VICTORY_WAVE_PAIRS_ONLY",
+    "VICTORY_WAVE_PAIRS_FP32",
+    "VICTORY_LDS_INIT_HOIST",
+    "VICTORY_LDS_FLAGS",
 ];
+
+/// Whether the program whose hash is `hash` (`None`: not known) takes LDS flag regions as two
+/// host waves (`VICTORY_LDS_FLAGS`, module notes).
+pub fn lds_flags_allowed(hash: Option<&str>) -> bool {
+    #[cfg(test)]
+    if let Some(value) = TEST_LDS_FLAGS.get() {
+        return site_pairs_decide(value, hash);
+    }
+    static VALUE: OnceLock<Option<String>> = OnceLock::new();
+    let value = VALUE.get_or_init(|| std::env::var(PER_PROGRAM_SWITCHES[11]).ok());
+    // (the same values as `VICTORY_WAVE_SITE_PAIRS`)
+    site_pairs_decide(value.as_deref(), hash)
+}
+
+/// [`lds_flags_allowed`] for the program being translated on this thread ([`for_program`]).
+pub(crate) fn lds_flags_here() -> bool {
+    lds_flags_allowed(current().as_deref())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's value of `VICTORY_LDS_FLAGS` (`Some(None)`: unset), for its thread only.
+    pub(crate) static TEST_LDS_FLAGS: std::cell::Cell<Option<Option<&'static str>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether the program whose hash is `hash` (`None`: not known) tries the paired form first
+/// (`VICTORY_WAVE_PAIRS_ONLY`, module notes).
+pub fn wave_pairs_allowed(hash: Option<&str>) -> bool {
+    #[cfg(test)]
+    if let Some(value) = TEST_WAVE_PAIRS.get() {
+        return wave_pairs_decide(value, hash);
+    }
+    static VALUE: OnceLock<Option<String>> = OnceLock::new();
+    let value = VALUE.get_or_init(|| std::env::var(PER_PROGRAM_SWITCHES[8]).ok());
+    wave_pairs_decide(value.as_deref(), hash)
+}
+
+/// [`wave_pairs_allowed`] for the program being translated on this thread ([`for_program`]).
+pub(crate) fn wave_pairs_here() -> bool {
+    wave_pairs_allowed(current().as_deref())
+}
+
+/// What a program in the paired form is translated with besides the form (module notes):
+/// `VICTORY_WAVE_PAIRS_FP32`'s and `VICTORY_LDS_INIT_HOIST`'s values, for its cache key.
+pub fn wave_pairs_settings() -> String {
+    let value = |n: usize| std::env::var(PER_PROGRAM_SWITCHES[n]).unwrap_or_default();
+    format!("{}={};{}={}", PER_PROGRAM_SWITCHES[9], value(9), PER_PROGRAM_SWITCHES[10], value(10))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's value of `VICTORY_WAVE_PAIRS_ONLY` (`Some(None)`: unset), for its thread only.
+    pub(crate) static TEST_WAVE_PAIRS: std::cell::Cell<Option<Option<&'static str>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`wave_pairs_allowed`] on the switch's value (`None`: unset). Pure, for testing.
+fn wave_pairs_decide(value: Option<&str>, hash: Option<&str>) -> bool {
+    match value.map(str::trim) {
+        None | Some("0" | "") => false,
+        Some(v) => listed(&parse_hash_list(v), hash),
+    }
+}
 
 /// The parent-link stores of the ray-tracing structure builder's box rehydration programs,
 /// 16-bit boxes (#caa78b8c, 64-byte nodes) and 32-bit boxes (#28918b71, 128-byte nodes),
@@ -622,6 +714,38 @@ mod tests {
         assert!(!for_program(A, site_pairs_here));
         assert!(!site_pairs_here(), "outside a program's translation");
         TEST_SITE_PAIRS.set(was);
+    }
+
+    #[test]
+    fn wave_pairs_are_opt_in_for_the_listed_programs() {
+        const WATER: &str = "5dc3b25986622949";
+        for hash in [Some(A), Some(WATER), None] {
+            assert!(!wave_pairs_decide(None, hash), "unset: {hash:?}");
+            assert!(!wave_pairs_decide(Some("0"), hash), "0: {hash:?}");
+        }
+        assert!(wave_pairs_decide(Some("5dc3b25986622949,6f225b641c5b0708"), Some(WATER)));
+        assert!(!wave_pairs_decide(Some("5dc3b25986622949,6f225b641c5b0708"), Some(A)));
+        // (no `all`: only the programs named)
+        assert!(!wave_pairs_decide(Some("all"), Some(WATER)));
+        let was = TEST_WAVE_PAIRS.replace(Some(Some("5dc3b259")));
+        assert!(for_program(WATER, wave_pairs_here));
+        assert!(!for_program(A, wave_pairs_here));
+        assert!(!wave_pairs_here(), "outside a program's translation");
+        TEST_WAVE_PAIRS.set(was);
+    }
+
+    #[test]
+    fn lds_flags_are_opt_in_per_program() {
+        const TILING: &str = "2cc4c197ee29e291";
+        let was = TEST_LDS_FLAGS.replace(Some(None));
+        assert!(!for_program(TILING, lds_flags_here), "unset: none");
+        TEST_LDS_FLAGS.set(Some(Some("all")));
+        assert!(for_program(A, lds_flags_here), "all: every one");
+        TEST_LDS_FLAGS.set(Some(Some("2cc4c197")));
+        assert!(for_program(TILING, lds_flags_here));
+        assert!(!for_program(A, lds_flags_here));
+        assert!(!lds_flags_here(), "outside a program's translation");
+        TEST_LDS_FLAGS.set(was);
     }
 
     #[test]

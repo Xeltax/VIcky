@@ -168,7 +168,51 @@ This work is for making the title's compute ray tracing (the BVH structure build
     - LEAN: `landed ... ms`, `superseded`, `unchanged`, `on the GPU`, and fps, ON phases against off phases;
     - AHEAD: `settles for a read of its memory` and its ms in the off phases against `such reads went ahead` in the ON phases, and fps.
     - Look at the water's surface in the captures of both phases. The boat must stay afloat in both.
-- **Not covered.** The water's picture (colour, dark tiles: the paired wave64 form of `5dc3b25986622949` and `6f225b641c5b0708`, a translator change) is separate from buoyancy. Later crashes in the same mission (title `+0x3de6491` and others, fork #1209) have no known fix.
+- **Not covered.** The water's picture (colour, dark tiles: the paired wave64 form of `5dc3b25986622949` and `6f225b641c5b0708`, a translator change, next section) is separate from buoyancy. Later crashes in the same mission (title `+0x3de6491` and others, fork #1209) have no known fix.
+
+## Water picture: the paired wave64 form for the water's programs (opt-in per program, not measured in the game yet)
+
+**What is wrong.** With ray tracing on (RTX 4080, 32-lane waves) the chapter-1 water floats the boat but its sun glint has black specks. Run V4-integ-scene2 (`d23f864a`, ANSI stripped, `refused` / `dropped` / `does not translate`):
+- The driver refuses seven compute programs translated as `WaveSize(64)` (`host pipeline refused error=... (0x80070057)`), and their dispatches are dropped every frame they come (`dropped 1.0/frame without a host pipeline: refused [compute ...]`):
+  - the water's transmission volumetrics, `5dc3b25986622949` (`water_shading:CS_TransmissionVolumetrics_Tiled`) and `6f225b641c5b0708` (`..._Tiled_LocalLights`), 45 drop lines each, from the boat scene on;
+  - the reflection tiling `2cc4c197ee29e291` (`sr_tracing:CS_Tiling_Generate_Opaque`), 66 drop lines;
+  - four that are not water: `02384a60fda6f2d0` (`vfx_triangleClip:CS_DefragHeap_ComputeRelocations`), `6b82bc7d22016cb5` (`vfx_triangleClip:CS_CollectTriangles_Meshlets`), `2da4beb386509b77` (`alphaResolve:CS_AlphTransmissionPrefilterMip`), `369cbe906ea72764` (`GpuParticleUpdate:CS_Visibility`).
+- `926c46bab3b86bd6` (`water_shading:CS_TransmissionVolumetricsSubmerged`) does not translate (`a lane mask holding lanes elsewhere read as data`, at 0x13c8) and is dropped too (0.2/frame, 2 lines).
+- Why they keep 64 lanes (`VICTORY_WAVE_WHY=1`, offline): LDS in a group over 32 lanes, read and written in one lane-branch region; for the two water programs every other form stops on a wave reduction or a first-lane read where not every lane runs, for `2cc4c197` on a lane mask exchanged where not every lane runs.
+
+**What is added (opt-in, for the listed programs only; with no switch set no translation changes, checked offline below):**
+- **The paired form** (`emit/paired.rs`, `emit/mod.rs`'s `paired`): one host wave of 32 threads runs one console wave of 64 lanes, each thread lanes n and n + 32; every per-lane branch is taken by the whole wave, so every thread runs every block and the group's barriers meet; ballots, wave reductions and prefixes, `v_readlane`, `v_readfirstlane`, `ds_bpermute` (within its 32-lane half) and the LDS accesses (bounds checked, a group barrier before each one but a read right after a read) see all 64 lanes. From fork PR #1397 (ByFxbian, after fork PR #854 by PiloteCode and darkworldhm's `840243e2`; merged by hand in fork `b1d777a807`).
+- **Ordered FP32 reductions** (`emit/paired_fp32.rs`): a whole-wave float sum, minimum or maximum is replayed step by step in the console's order on the bits (flush to zero, signed zeros, NaN priority), so the result is the console's bit for bit; an FP64 sum of one constant is counted exactly. Fork PR #1419 (ByFxbian, fork `8a32d0ba17`) with fxceless's `3ab5c12ba3` (only MODE writes that touch FP32 rounding or denormals stop it; the water programs set `hwreg(MODE, 2, 2)` only) and `e3307c7727` (exact FP64 constant sums). It needs the guest float mode confirmed: without `VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz` the three water programs are refused in the paired form (`paired FP32 reduction requires a confirmed non-IEEE RNE/FTZ guest mode`) and keep their old outcome. (The fork also writes such programs without fast-math flags; our modules never carry any.)
+- **LDS accumulators set at the start** (`emit/lds_init.rs`, fxceless `a918163849`): an LDS dword every write sets to one constant and every atomic treats as its identity (a tile's starting minimum and maximum, which one thread stores after the per-pixel early returns) is also stored by every thread first thing, behind a group barrier, so a tile whose corner thread returned early does not combine with stale LDS (the fork's "flickering dark tiles"). In the fork for every compute program; here only in the paired form. `VICTORY_LDS_INIT_HOIST=0` turns it off. It changes the three water programs' translations, not `2cc4c197`'s.
+- **LDS flag regions** (`emit/lds_flags.rs`, fxceless `c005a245f0`, after DrTardis1963 `1b5c3a1e`): a lane-branch region that only raises an LDS flag may run as two host waves of 32. In the fork on for every program (over its whole pack it changed only `2cc4c197`); here per program.
+- **Switches.** Each listed program's shader cache key takes its decision (and, in the paired form, the two settings); the lists are in no key, so changing a list translates again only the programs it adds or removes:
+  - `VICTORY_WAVE_PAIRS_ONLY=<hash>,...`: these programs try the paired form first, else the forms they had (unset or `0`: none);
+  - `VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz`: confirms the guest float mode for the ordered FP32 reductions;
+  - `VICTORY_LDS_INIT_HOIST=0`: no accumulator stores at the start in the paired form;
+  - `VICTORY_LDS_FLAGS=<hash>,...` (or `all`, the fork's default): LDS flag regions as two host waves.
+- **Suggested for a first water run:** `VICTORY_WAVE_PAIRS_ONLY=5dc3b25986622949,6f225b641c5b0708,926c46bab3b86bd6 VICTORY_WAVE_PAIRS_FP32=non-ieee-rne-ftz VICTORY_LDS_FLAGS=2cc4c197ee29e291`. (`2cc4c197` also translates in the paired form; the LDS flag form is the one on fork main, for every program, since 2026-11-26.)
+
+**Offline checks** (`victory translate --validate --pipelines` on the title's `shaders.rpf`, `VICTORY_HOST_WAVE=32 VICTORY_VIEW_LIMIT=1000000`, the RTX 4080's driver for the pipelines; no game run):
+
+| program | `d23f864a` | with the switches above |
+|---|---|---|
+| `5dc3b25986622949` | `WaveSize(64)`, validates, driver refuses | paired form, validates, pipeline created |
+| `6f225b641c5b0708` | `WaveSize(64)`, validates, driver refuses | paired form, validates, pipeline created |
+| `926c46bab3b86bd6` | does not translate (mask read as data) | paired form, validates, pipeline created (0.9 MB of DXIL: expect a long first compile) |
+| `2cc4c197ee29e291` | `WaveSize(64)`, validates, driver refuses | `VICTORY_LDS_FLAGS`: 32-lane waves (local waves, the exact idiom form, without early-outs), validates, pipeline created; in the paired form too |
+| `02384a60`, `369cbe90` | `WaveSize(64)`, refused | unchanged: the paired form refuses their LDS operations |
+| `2da4beb3` | `WaveSize(64)`, refused | unchanged: several waves per group would have to meet after a divergent exit |
+| `6b82bc7d` | `WaveSize(64)`, refused | unchanged: over 32 KiB of LDS with the paired form's counter |
+
+**Which translations change.** With none of the four switches set: none. Over the title's whole shader pack (`shaders.rpf`: 26,503 containers, 26,084 programs, same host settings), `d23f864a`'s translator and this one emit the same DXIL, byte for byte, for all 25,636 programs that emit, and refuse the same programs for the same reasons. With the switches: only the programs the lists name, as in the table.
+
+**What to grep in a run:** `WAVE64-PAIRS-ONLY #<hash> translated in the paired form (VICTORY_WAVE_PAIRS_ONLY)` once per listed program when it is translated (or `paired form refused: <why>; the other forms`); no `host pipeline refused` and no `dropped ... refused [compute <hash>]` for the four hashes; `first bind ... hash=5dc3b25986622949` still there in the boat scene. With `VICTORY_WAVE_WHY=1`, `WAVE64-LDS-FLAGS ... leaks=[]` for `2cc4c197`.
+
+**Not measured in the game yet.** Fork reports: with the two water programs paired and the FP32 switch, "the water has its green colour" (fxceless); the LDS-init fix for the dark tiles was not yet confirmed in a game run there. Nobody has run `926c46bab3b86bd6` paired that we know of. Costs to watch: a paired group has half the threads, each doing two lanes' work, with group barriers around LDS writes; what these programs cost per frame is not known here. Compare a boat-scene capture with `d23f864a`'s (the specks in the glint, the water's colour) and the fps lines.
+
+**The translator's source changed, so the shader cache key changed for every program: warm the cache again** (`victory translate --warm` with the run's switches, lists included, since the listed programs are filed under their own keys; or one rebuild run) before measuring.
+
+**Not ported:** the fork's global `VICTORY_WAVE_PAIRS=1` (the paired form as a retry for every program), `17533c5c6d` (`VICTORY_WAVE_PAIRS_SPILLED`, for the structure builder's spilled programs, which the paired form refuses here), #1397's loop-exit regions for the wave-wide form (`VICTORY_WAVE_WIDE=1` only), and the fork's hardware fixtures (`wave64_after_loop.rs`).
 
 ## Run
 
