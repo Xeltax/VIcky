@@ -241,7 +241,7 @@ fn bury(finished: u64) {
         *retired = keep;
         done
     };
-    drop(done);
+    crate::reaper::dispose(done);
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -3867,7 +3867,7 @@ pub(crate) fn settle_for_fence() {
 fn land() {
     let landed = std::mem::take(&mut line().landed);
     for (lists, order) in landed {
-        crate::list::recycle(lists, &order);
+        crate::reaper::recycle(lists, order);
     }
 }
 
@@ -6105,7 +6105,7 @@ impl Host {
     /// for reuse then, as a queue does for the lists it ran.
     pub(crate) fn execute_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
         if order.is_empty() {
-            crate::list::recycle(lists, &order);
+            crate::reaper::recycle(lists, order);
             return;
         }
         late_threads();
@@ -6115,7 +6115,7 @@ impl Host {
         };
         let Some((mut submitted, sent)) = sent else {
             // (Not reached: a submission sent ahead always comes back.)
-            crate::list::recycle(lists, &order);
+            crate::reaper::recycle(lists, order);
             return;
         };
         let told = !sent.writes.is_empty();
@@ -9529,11 +9529,12 @@ impl Meter {
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
+                 GPU; {back_ms:.1} copying back {back_mb:.1} MB; {reaper}), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
                  {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+                reaper = crate::reaper::summary(frames),
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),

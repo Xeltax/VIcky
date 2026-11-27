@@ -21,6 +21,8 @@ mod bvhcheck;
 mod capture;
 #[cfg(windows)]
 mod cardmeter;
+#[cfg(windows)]
+mod copy_ahead;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -55,6 +57,8 @@ mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 pub mod query;
+#[cfg(windows)]
+mod reaper;
 pub mod queue;
 #[cfg(windows)]
 mod queue2;
