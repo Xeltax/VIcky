@@ -123,6 +123,40 @@ This work is for making the title's compute ray tracing (the BVH structure build
 
 **Chapter-1 boat mission with ray tracing (2026-11-27, verified on an RTX 4080, Series X, RT on):** with this main, a save in the boat mission loads, the boat floats and the mission plays, with no extra switch: the texture copy-back (`VICTORY_TEXTURE_BACK`, on by default) gives the title's physics the water it computes on the card, and the builder's box rehydration programs' parent-link stores are left out by default (`VICTORY_BVH_LINK_STORES=keep` keeps them; with them the title crashed on that save's loading screen). Add `VICTORY_LATE_WAIT=2` in water scenes (at the relay's default stage 3 testers elsewhere saw the water surface vanish for single frames); `VICTORY_LATE_WATER=1` at stage 3 is the narrower wait to try instead, not measured yet (water section below). Measured: 480 s on that save, RT on, the fps set below plus `VICTORY_LATE_WAIT=2 VICTORY_REAPER=1`: no crash, 7.34 fps true mean of the last 12 lines (lines 7.8-8.5, about 122-127 ms a frame: preparing ~68, copy-back ~23-27, a wait for the card of ~17 ms that is the copy-back's read-back). The prologue cell with the same build: 5.32 fps true (a slow stretch mid-run; last lines 6.3-7.5), about level with 6.91 before the batch. `VICTORY_INPLACE_CONSTANTS` does not place the constants heap here ("view memory from several places") even without `VICTORY_FENCE_SENT`/`VICTORY_SECTION_MB`: leave it off.
 
+**Recommended since 2026-11-27 evening (lots 2-3 and the foxhound/trustno1/Belobug port batch; RTX 4080, Series X, RT on):** the fps set below plus `VICTORY_SYNC_FINE=1 VICTORY_CCD_PLACE=1`. In water scenes, use no `VICTORY_LATE_WAIT` and no water set (`VICTORY_WAVE_PAIRS_ONLY`/`VICTORY_LDS_FLAGS` for the water programs).
+
+Measured as true fps over the last 12 frame-time lines:
+
+| Scene | Settings | fps |
+|---|---|---|
+| chapter-1 boat mission | fps set + `SYNC_FINE=1` + `CCD_PLACE=1` | **9.52** (lines 8.6-10.0) |
+| chapter-1 boat mission | fps set only | 8.51 |
+| chapter-1 boat mission | fps set + `VICTORY_LATE_WAIT=2` (main of the morning) | 7.34 |
+| prologue cell | fps set + `SYNC_FINE=1` + `CCD_PLACE=alt` | 7.27 (CCD ON phases 7.5-7.6, off 6.9) |
+
+Paired `=alt` medians, one switch per run:
+
+| Switch | Scene | Paired median | Verdict |
+|---|---|---|---|
+| `CCD_PLACE` | prologue | +0.42 fps (+0.59 on top of `SYNC_FINE`) | use |
+| `SYNC_FINE` | prologue | +0.35 fps | use |
+| `TEXTURE_BACK_ASYNC` | boat | +0.39 fps (noisy, 5 phases) | optional |
+| `WIDE_THREADS` | prologue | +0.13 fps | neutral |
+| `CARD_AWAKE` | prologue | +0.12 fps | neutral |
+| `SPANS_QUICK` | prologue | +0.07 fps | neutral |
+| `LATE_WATER` | boat | -0.11 fps | neutral |
+| `PARALLEL_MIRROR` | prologue | -0.35 fps | leave off |
+
+Water picture with this build:
+
+- Without any switch, the boat renders whole and the water is right.
+- The water set's paired form for `5dc3b25986622949`/`6f225b641c5b0708` turns the water turquoise with grey tiles.
+- `926c46bab3b86bd6` with LDS flags `2cc4c197ee29e291` puts bright green specks in shore vegetation.
+
+So leave the set off. Black specks remain in the sun's glint.
+
+With `VICTORY_BVH_LINK_STORES=keep`, the boat save no longer crashed on its load.
+
 **For fps, recommended since 2026-11-27:** `VICTORY_REFRESH_FRONT=1 VICTORY_LIGHT_REFRESH=1 VICTORY_HEAP_KEPT_SPLIT=1 VICTORY_FILLS_PLAIN=1 VICTORY_TEXTURE_PASS_CHUNK=1 VICTORY_HEAP_NOTE_KIND=1` on top of the above; `VICTORY_MIRROR_TRY=2` optional (see below). RTX 4080, Series X, RT on, window scene, 420 s, no input, true fps over the last 12 frame-time lines:
 - Base (the recommended set above): 6.19 / 6.53 / 6.46 fps (medians of the last 24 fps lines 6.3 / 6.6 / 6.6).
 - The five above plus `VICTORY_MIRROR_TRY=2`: 7.04 / 6.83 / 6.60 (medians 6.9 / 6.8 / 6.8), about +0.4 fps (+7 %). The five without it: 6.72 (median 6.8) and, on `main` 6c841fb as pushed (first run of the exe), 7.01 (median 7.0).
@@ -261,6 +295,18 @@ Aimed at the RT-on frame (~137 ms of submitting thread: preparing 88, the heap s
 **Not ported:** the fork's global `VICTORY_WAVE_PAIRS=1` (the paired form as a retry for every program), `17533c5c6d` (`VICTORY_WAVE_PAIRS_SPILLED`, for the structure builder's spilled programs, which the paired form refuses here), #1397's loop-exit regions for the wave-wide form (`VICTORY_WAVE_WIDE=1` only), and the fork's hardware fixtures (`wave64_after_loop.rs`).
 
 ## Lot 4 probes (`VICTORY_LOT4_PROBE=1`, opt-in)
+
+**Results (2026-11-27, prologue, RT on, one probe run):**
+
+| Probe | Result |
+|---|---|
+| P0 | Reserved buffers up to 16 GiB work. One tile mapped at several offsets reads and writes the same, including shader stores, for heaps in the card's memory and in the PC's (with or without a CPU mapping). Tiles from a heap opened over host memory remove the device. `UpdateTileMappings` costs 1.7-2.7 us a range. Recreate-At-GPUVA is tier 0. |
+| P2 | 48.7 % of 167.7k slots a frame are buffer or constant views inside live copies, under the 60 % bar for a physical-page mirror. |
+| P4 | Placing pages at first mapping would make 14.4 % of the refused window bytes one run, but 100 % of the constants-heap-sized buffers (238 MB). |
+| P7 | Per frame, the lock waits summed over threads are `made` 165 ms and `BUFFERS` 72 ms (289k takes, a quarter waited); only 5-16 % of takes cross CCDs. |
+| P8 | Dead: the copy-queue pull is not cheaper for the typical run. |
+| P3, P6 | Sampled nothing on this scene. |
+
 
 Two measurements that decide whether lot 4 builds a physical-page mirror: the title's 64 KiB frames as tiles of one reserved buffer, each mapped at every offset the title maps it (`crates/victory-gpu/src/lot4/device.rs`; the host side's P1-P7 under "Lot 4 probes (host side)" below, same switch). Off (unset, or anything but `1`), they cost one load of a flag per refresh and per run copied. On, P0 adds a second or two to the device's creation (six short child processes) and P8 works one frame in 64: **leave it off for fps runs.** Grep `lot4 probe` (strip the colour codes first).
 
