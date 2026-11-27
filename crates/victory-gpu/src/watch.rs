@@ -3197,6 +3197,9 @@ mod tests {
             guard(view, view + 2 * BLOCK),
             Some((view / PAGE..view / PAGE + 1).collect())
         );
+        // The guards are told before the address can be mapped again by
+        // another test.
+        title_memory_remapped(view, 2 * BLOCK);
         // SAFETY: our view.
         unsafe {
             UnmapViewOfFile(
@@ -3205,7 +3208,6 @@ mod tests {
                 },
             )
         };
-        title_memory_remapped(view, 2 * BLOCK);
     }
 
     #[test]
@@ -4278,6 +4280,7 @@ mod tests {
         TEST_HOT.set(None);
         TEST_HOT_RATIO.set(None);
         TEST_FRAME.set(None);
+        title_memory_remapped(view, SIZE);
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
     }
