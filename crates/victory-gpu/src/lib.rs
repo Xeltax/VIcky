@@ -55,6 +55,8 @@ mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 pub mod query;
+#[cfg(windows)]
+mod reaper;
 pub mod queue;
 #[cfg(windows)]
 mod queue2;

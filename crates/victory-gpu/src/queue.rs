@@ -703,7 +703,7 @@ fn send_joined(joined: &mut Joined) {
         match crate::host::host() {
             Some(host) => host.execute_late(lists, order),
             // (Not reached: parts are only taken with a host.)
-            None => crate::list::recycle(lists, &order),
+            None => crate::reaper::recycle(lists, order),
         }
         joined.parts = 0;
     }
@@ -895,7 +895,7 @@ fn release_held_now(all: bool) {
                             };
                             // They have run: their host lists are used again.
                             if ran {
-                                crate::list::recycle(lists, &order);
+                                crate::reaper::recycle(lists, order);
                             }
                         }
                         if all {
