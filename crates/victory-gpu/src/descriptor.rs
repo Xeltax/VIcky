@@ -275,7 +275,9 @@ fn sync_held(asked: Option<&dyn Fn()>, started: std::time::Instant) {
         // a heap map the title slots past the identity window have: pool
         // slots, `host::HostHeap::mirrored`.)
         let mirrored_count = heap.desc.count.min(host.mirrored());
-        let ranges = written.take(start as usize, end as usize);
+        // (VIcky, `VICTORY_HEAP_SYNC_NEED=check`: the take noted as this
+        // sync's, `at_submit::ledger`.)
+        let ranges = at_submit::ledger::took(|| written.take(start as usize, end as usize));
         if asked.is_some() {
             later.push((host, ranges, (start, step), mirrored_count));
             continue;

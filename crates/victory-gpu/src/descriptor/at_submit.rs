@@ -112,6 +112,14 @@
 //! as `(VICTORY_HEAP_SYNC_AT_SUBMIT=alt): ON` / `: off, as usual`
 //! (`xcl-notes/alt-fps.sh`); the stamps are taken in both phases, and a
 //! sync started ahead in an ON phase may be taken in the off one after.
+//!
+//! VIcky (fable-2026-11-27-pf5b.md, lever 1): the same stamps serve
+//! `VICTORY_HEAP_SYNC_NEED=count|1|alt|check` ([`need`]): a submission's
+//! sync starts where it does without either switch (none while the one
+//! left running still runs and an ended one covers the lists), and is
+//! joined only when no sync that has ended covers its lists. The two
+//! switches exclude each other: with both set, `VICTORY_HEAP_SYNC_NEED` is
+//! used and no sync is started ahead ([`ahead`]).
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -119,26 +127,38 @@ use std::time::Duration;
 
 use super::beside::{self, Beside, Lane};
 
+pub(crate) mod ledger;
+pub(crate) mod need;
+
 /// The switch.
 pub(crate) static AT_SUBMIT: crate::alt::Alt = crate::alt::Alt::new(
     "VICTORY_HEAP_SYNC_AT_SUBMIT",
     "the next submission's heap sync starts while it waits in line (port of Belobug 673be0e + a609a2f)",
 );
 
-/// Whether the switch is set (`1` or `alt`) and the sync runs beside:
-/// stamps are taken and syncs started ahead only then.
+/// Whether the switch, or VIcky's `VICTORY_HEAP_SYNC_NEED` ([`need`]), is
+/// set and the sync runs beside: stamps are taken (and syncs started ahead,
+/// or joins skipped) only then.
 pub(crate) fn used() -> bool {
     static USED: OnceLock<bool> = OnceLock::new();
     *USED.get_or_init(|| {
-        if !AT_SUBMIT.set() {
+        let need = need::set();
+        if !AT_SUBMIT.set() && !need {
             return false;
         }
+        let name = if need { "VICTORY_HEAP_SYNC_NEED" } else { "VICTORY_HEAP_SYNC_AT_SUBMIT" };
         if !beside::on() {
             tracing::warn!(
-                "VICTORY_HEAP_SYNC_AT_SUBMIT is used only with VICTORY_HEAP_SYNC_BESIDE=1 (with the heap sync on, \
-                 without levels on demand): every submission starts its own sync, as without it"
+                "{name} is used only with VICTORY_HEAP_SYNC_BESIDE=1 (with the heap sync on, without levels on demand): \
+                 every submission starts its own sync and joins it, as without it"
             );
             return false;
+        }
+        if need && AT_SUBMIT.set() {
+            tracing::warn!(
+                "VICTORY_HEAP_SYNC_AT_SUBMIT and VICTORY_HEAP_SYNC_NEED exclude each other: VICTORY_HEAP_SYNC_NEED is used, \
+                 and no sync is started ahead"
+            );
         }
         true
     })
@@ -165,7 +185,9 @@ pub(crate) fn handed<'a>(lists: impl Iterator<Item = &'a AtomicU64>) {
     if !used() {
         return;
     }
-    let now = stamp();
+    // (VIcky, `VICTORY_HEAP_SYNC_NEED=check`: the heaps' pages written so
+    // far are noted first, [`ledger`].)
+    let now = ledger::stamp_noted();
     TITLE_CALL.fetch_max(now, SeqCst);
     for list in lists {
         list.fetch_max(now, SeqCst);
@@ -181,7 +203,7 @@ static PRESENTS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) fn presenting() -> Presenting {
     let on = used();
     if on {
-        TITLE_CALL.fetch_max(stamp(), SeqCst);
+        TITLE_CALL.fetch_max(ledger::stamp_noted(), SeqCst);
         PRESENTS.fetch_add(1, SeqCst);
     }
     Presenting(on)
@@ -208,7 +230,7 @@ pub(crate) fn wait_passed(floor: &AtomicU64) {
 }
 
 fn raise(floor: &AtomicU64) {
-    floor.fetch_max(stamp(), SeqCst);
+    floor.fetch_max(ledger::stamp_noted(), SeqCst);
 }
 
 /// A part is taken off a queue's line: its host lists' stamps are raised
@@ -378,7 +400,8 @@ static BEFORE_US: AtomicU64 = AtomicU64::new(0);
 /// queue's line or the title is in its present
 /// (`crate::queue::runs_waiting`).
 pub(crate) fn ahead() {
-    if !used() || !AT_SUBMIT.on() {
+    // (VIcky: not with `VICTORY_HEAP_SYNC_NEED`, which excludes it.)
+    if !used() || need::set() || !AT_SUBMIT.on() {
         return;
     }
     if !crate::queue::runs_waiting() && PRESENTS.load(SeqCst) == 0 {
@@ -399,6 +422,15 @@ pub(crate) fn before_sweep() {
     if !used() {
         return;
     }
+    // VIcky (`VICTORY_HEAP_SYNC_NEED`): a sync left running without a
+    // join ends first instead ([`need::before_sweep`]).
+    if need::set() {
+        let waited = need::before_sweep();
+        if !waited.is_zero() {
+            BEFORE_US.fetch_add(waited.as_micros() as u64, Relaxed);
+        }
+        return;
+    }
     let waited = AHEAD.before_sweep();
     if !waited.is_zero() {
         add(C::Sweeps, 1);
@@ -415,7 +447,13 @@ pub(crate) fn before_sweep() {
 /// before this place.
 pub(crate) fn start(stamps: impl Iterator<Item = u64>, settled: bool) -> Started {
     if !used() {
-        return Started { beside: beside::start(), phase: None, before: Duration::ZERO };
+        return Started { beside: Some(beside::start()), phase: None, before: Duration::ZERO, need: None };
+    }
+    // VIcky (`VICTORY_HEAP_SYNC_NEED`): the sync of its own, or the one
+    // left running, or none ([`need::start`]).
+    if need::set() {
+        let before = Duration::from_micros(BEFORE_US.swap(0, Relaxed));
+        return need::start(need(stamps), settled, before);
     }
     let phase = AT_SUBMIT.on();
     let mut before = Duration::from_micros(BEFORE_US.swap(0, Relaxed));
@@ -432,26 +470,37 @@ pub(crate) fn start(stamps: impl Iterator<Item = u64>, settled: bool) -> Started
             beside::start()
         }
     };
-    Started { beside, phase: Some(phase), before }
+    Started { beside: Some(beside), phase: Some(phase), before, need: None }
 }
 
 /// A submission's heap sync ([`start`]), joined where the sync beside is.
 pub(crate) struct Started {
-    beside: Beside,
+    /// None: VIcky (`VICTORY_HEAP_SYNC_NEED`), no sync was started, the one
+    /// left running still runs and an ended one covers the lists.
+    beside: Option<Beside>,
     /// With the switch set: whether it was ON at the submission's start.
     phase: Option<bool>,
     /// What the submission waited for before its sync's place.
     before: Duration,
+    /// VIcky (`VICTORY_HEAP_SYNC_NEED`): what the join asks ([`need::join`]).
+    need: Option<need::Joining>,
 }
 
 impl Started {
-    /// [`Beside::join`], counted by phase.
-    pub(crate) fn join(self) -> Duration {
-        let waited = self.beside.join();
+    /// [`Beside::join`], counted by phase. VIcky (`VICTORY_HEAP_SYNC_NEED`):
+    /// with that switch, skipped when the lists need nothing of the sync
+    /// ([`need::join`]). Returns the wait, and whether a sync that had ended
+    /// covered the lists at the join (with the switch, `count` included).
+    pub(crate) fn join(self) -> (Duration, bool) {
+        let (waited, covered) = match (self.beside, self.need) {
+            (beside, Some(joining)) => need::join(beside, joining),
+            (Some(beside), None) => (beside.join(), false),
+            (None, None) => (Duration::ZERO, false),
+        };
         if let Some(on) = self.phase {
             note(on, waited, self.before);
         }
-        waited
+        (waited, covered)
     }
 }
 
@@ -484,6 +533,10 @@ pub(crate) fn part(frames: f64) -> String {
         return String::new();
     }
     let counts: [u64; 15] = std::array::from_fn(|i| COUNTS[i].swap(0, Relaxed));
+    // VIcky (`VICTORY_HEAP_SYNC_NEED`): its own part, with the join by phase.
+    if need::set() {
+        return need::part(frames, &phases(&counts));
+    }
     said(&counts, frames, AT_SUBMIT.said())
 }
 
@@ -491,6 +544,26 @@ fn said(c: &[u64; 15], frames: f64, mode: &str) -> String {
     let frames = frames.max(1.0);
     let per = |i: C| c[i as usize] as f64 / frames;
     let ms = |i: C| c[i as usize] as f64 / 1000.0 / frames;
+    format!(
+        " (VICTORY_HEAP_SYNC_AT_SUBMIT {mode}: per frame {:.1} syncs started while the next submission waited in line, \
+         {:.1} taken by it, {:.1} not ({:.1} a hand-over or a wait passed after their asking, {:.1} flights settled \
+         first), {:.1} asked with nothing in line; {:.2} ms waited for those not taken and before {:.1} sweeps; the \
+         submitting thread at the join: {})",
+        per(C::Started),
+        per(C::Adopted),
+        per(C::Late) + per(C::Settled),
+        per(C::Late),
+        per(C::Settled),
+        per(C::Nothing),
+        ms(C::WaitedUs),
+        per(C::Sweeps),
+        phases(c),
+    )
+}
+
+/// The submitting thread's ms at the join by phase, per frame of each
+/// phase: `ON X ms a frame (+Y before) over N frames, off ...`.
+fn phases(c: &[u64; 15]) -> String {
     // The join by phase, per frame of that phase (none yet: n/a).
     let phase = |subs: C, join: C, before: C, seen: C| {
         let (n, f) = (c[subs as usize], c[seen as usize]);
@@ -507,18 +580,7 @@ fn said(c: &[u64; 15], frames: f64, mode: &str) -> String {
         }
     };
     format!(
-        " (VICTORY_HEAP_SYNC_AT_SUBMIT {mode}: per frame {:.1} syncs started while the next submission waited in line, \
-         {:.1} taken by it, {:.1} not ({:.1} a hand-over or a wait passed after their asking, {:.1} flights settled \
-         first), {:.1} asked with nothing in line; {:.2} ms waited for those not taken and before {:.1} sweeps; the \
-         submitting thread at the join: ON {}, off {})",
-        per(C::Started),
-        per(C::Adopted),
-        per(C::Late) + per(C::Settled),
-        per(C::Late),
-        per(C::Settled),
-        per(C::Nothing),
-        ms(C::WaitedUs),
-        per(C::Sweeps),
+        "ON {}, off {}",
         phase(C::OnSubmissions, C::OnJoinUs, C::OnBeforeUs, C::OnFrames),
         phase(C::OffSubmissions, C::OffJoinUs, C::OffBeforeUs, C::OffFrames),
     )

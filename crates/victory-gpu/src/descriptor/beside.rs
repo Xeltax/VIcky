@@ -245,6 +245,16 @@ impl Beside {
         COUNTS[1].fetch_add(asking.elapsed().as_micros() as u64, Relaxed);
     }
 
+    /// VIcky (`VICTORY_HEAP_SYNC_NEED`, `super::at_submit::need`): whether
+    /// the sync has ended, without waiting.
+    pub(super) fn done(&self) -> bool {
+        let Some(ticket) = &self.ticket else {
+            return true;
+        };
+        let (progress, _) = &*ticket.0;
+        progress.lock().unwrap_or_else(|e| e.into_inner()).done
+    }
+
     /// VIcky (`super::at_submit`, before a sweep): waits for the sync's end
     /// and returns how long, without taking it (its join is still to come,
     /// and then waits for nothing).
