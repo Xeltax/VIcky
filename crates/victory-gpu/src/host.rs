@@ -8077,7 +8077,8 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
                     }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    // In place if short, with `VICTORY_FILLS_PLAIN=1`.
+                    crate::plaincopy::fill(dst as *mut u8, src as *const u8, len);
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
