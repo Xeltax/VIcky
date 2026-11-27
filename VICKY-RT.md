@@ -192,9 +192,70 @@ Aimed at the RT-on frame (~137 ms of submitting thread: preparing 88, the heap s
 
 **Not ported, and why:**
 - **foxhound `VICTORY_RELAY_COPY`** (relay fetches on the copy queue): ours already has it as **`VICTORY_QUEUE2=1`** (bit 1: fetches of card copies' pieces on a copy queue, "sends ahead" from `Second::order_done`, later sends left out by the merge), in every rt-run with `-Fork`. Foxhound's extras (`torn` fetch checks, `had` refetch skipping) belong to its own landing code.
-- **Belobug `673be0ea` + `a609a2fc`** (the heaps' round asked at the title's submit, under `VICTORY_PORT_JOURNAL` with the journal in 64 parts, 1,200 lines): built on Belobug's round-based heap-sync thread (`SYNC_ROUNDS`), which ours is not (`HEAP_SYNC_BESIDE` starts one sync per submission after the sweep, counted as started, joined before the next sweep). An equivalent here means starting the next submission's sync at the previous join when a submission waits in line, adopting it only if it began after the title's submit call, and joining it before a due sweep: a redesign of `beside.rs` for the next batch, not a port.
+- **Belobug `673be0ea` + `a609a2fc`** (the heaps' round asked at the title's submit, under `VICTORY_PORT_JOURNAL` with the journal in 64 parts, 1,200 lines): built on Belobug's round-based heap-sync thread (`SYNC_ROUNDS`), which ours is not (`HEAP_SYNC_BESIDE` starts one sync per submission after the sweep, counted as started, joined before the next sweep). Since ported as **`VICTORY_HEAP_SYNC_AT_SUBMIT=1|alt`** on the sync beside, without the journal: next section.
 - **trustno1 `af242dab` (PR #34) `place_constant`**: it snapshots on the card the constants written earlier in the same list by `place_copy` (title buffer copies done at their place on the card, `COPIES_IN_PLACE` / `CARD_STEPS`), to end `BEHIND_PLACED` refusals. Our tree has neither `place_copy` nor card steps: our title buffer copies are CPU steps at submission, before the constant fills, so the refusal it fixes cannot happen. Our `inplace::place_constants` (`VICTORY_INPLACE_CONSTANTS`) is another thing (the constants heap opened in place) and is unchanged.
 - **trustno1 PR #18 `REFRESH_SET`** (`e0703c13`; the author's newer Kemerd/VIctory-NVIDIA-RT main `e7aadc40` has the same code): reviewed in `xcl-notes\pr18-refresh-set.md`; 700-800 lines against our `Batch`, our ~22k refresh steps a frame are already skipped by `REFRESH_FRONT`: measure the skipped steps' cost first.
+
+## The next submission's heap sync while it waits in line: `VICTORY_HEAP_SYNC_AT_SUBMIT=1|alt` (2026-11-27, `fx-main-syncatsubmit`; port of Belobug `673be0e` + `a609a2f`; opt-in, not measured yet)
+
+Aimed at the heap sync's join (roadmap item B1). On the prologue (RTX 4080, RT on) the submitting thread's frame is ~137 ms:
+- 88 ms preparing;
+- **23 ms waiting at the join** of the heap sync that runs beside it (`VICTORY_HEAP_SYNC_BESIDE=1`);
+- 21 ms waiting for the card.
+
+A submission's sync starts when its preparing starts, and the join is the sync's excess over the preparing. The `heap sync by place in the burst` line shows who carries it: the 6th and 7th syncs of a frame, and the present's own, whose preparing is short. Meanwhile the sync's thread idles between one submission's sync and the next.
+
+**What it does.** Used only with `VICTORY_HEAP_SYNC_BESIDE=1` (a warning says so otherwise).
+- When a submission's asking of title memory ends (after its steps, `watch::ask_once_end`) and a submission of the title's waits in a queue's line (or the title is in its present), the next submission's sync is given to the sync's thread at once, behind this submission's own.
+- It runs while the submitting thread takes the snapshots, sends the lists, lands flights and walks the lines.
+- The next submission takes it as its own sync, where the sync beside would start, if it asked for the heaps' pages after everything that submission must see. It is then joined where the sync beside is joined.
+- If not, the submission waits for its end and starts a sync of its own, as without the switch.
+
+Code: `crates/victory-gpu/src/descriptor/at_submit.rs` (its doc comment holds the whole argument). Hooks: `host.rs` (`Host::submit`), `queue.rs` (hand-overs, waits passed, `runs_waiting`), `descriptor/beside.rs` (the lane shared, a give without the wait for the asking).
+
+**What a submission must see.** Stamps come from one counter, taken with a full fence.
+- The title's records written before it handed the lists over: each host list is stamped by the title's own execute call (`HostList::handed`).
+- For a part behind a wait the title's own hand may have met, the records written before our thread passed the wait (Belobug `a609a2f`'s floor per queue). A fence wait, or a memory value found in memory, raises the queue's floor, and the parts taken behind it carry it. A value wait passed for a write of a flight in the air, or of a part joined before it, is the card's order and raises nothing.
+- Lists of ours (the present's copy, our checks) carry no stamp: they need a sync asked after the title's latest call, its present included.
+
+A sync ahead is also not taken by a submission that settled flights before its sync's place: a waited-for submission, one whose preparing reads what flights write, or the sweep's forced settle. Those landings come before the sync without the switch. A sweep that is due waits for a sync ahead to end first, and the submission may still take it (sync, then sweep: the order without the sync beside).
+
+**Why not Belobug's whole design.**
+- Belobug's sync thread runs numbered rounds asked at any moment. Its journal of written pages was cut into 64 parts with locks of their own, so a round may ask while a submission's asking stands. Ours may not (fxceless/victory-fork#410: a page found written then gets a number above that asking's, and a host copy holding it is copied again at every refresh). Our journal has moved far from Belobug's (light refresh, reservations, guards), so the rework does not port. Here the sync ahead asks only once the asking before it has ended, and the next submission waits for that asking before its own.
+- Belobug's rounds may be shared by several submissions. That is `VICTORY_HEAP_SYNC_BURST`, measured on 2026-11-27 (SB1/SB2): the same slots mirrored by fewer syncs that overlap less, and the join rose from 28 to 44 ms. Here each submission keeps a sync of its own, only begun earlier.
+- Belobug's `prep_wrote` (our steps writing a heap's memory) is not needed: the steps of the submission before are done when its asking ends, and a submission's own steps follow its sync with or without the switch.
+- Unlike `VICTORY_HEAP_SYNC_AHEAD` (an extra sync between submissions, stopped at every submission's start: measured neutral, the stop cost 5.85 ms 4.6 times a frame), nothing stops a sync ahead: it is the next submission's own.
+
+**Same descriptor results.** The slots a submission's lists read are mirrored from records written before its hand-over (and its waits), as with the sync at its start.
+- Test `syncs_started_ahead_leave_the_slots_as_the_usual_syncs` (needs a device) runs three submissions over a placed, write-watched sampler heap. It runs them once with a sync at each submission's start, and once with syncs started ahead (taken, not taken, taken). The host slots are the same after each join.
+- The other tests check that a sync ahead is taken only if it asked after the hand-over and nothing was settled first, that one not taken ends before the own sync asks, that a sweep waits for it and may still take it, the floors, and the line.
+
+**What changes, and the risk.**
+- What the title writes after handing a submission over, and before that submission's own sync would have asked, goes to the next sync instead. That window is at most the few ms between the asking ahead and the submission's start. `VICTORY_ASYNC_SUBMIT=1` already assumes it: title memory a submission reads is not rewritten between its submit call and its preparing.
+- The lists of the submission whose asking just ended may meet, between their join and their `ExecuteCommandLists`, a slot mirrored by the next submission's sync. Its record was written after those lists were handed over: a race the title does not run on the console.
+- Landings of flights stay unordered with the sync, as with the relay without the switch.
+
+**Compatible with:**
+- `VICTORY_SYNC_FINE`, `VICTORY_SPANS_QUICK`, `VICTORY_HEAP_NOTE_KIND`, `VICTORY_PARALLEL_MIRROR`, `VICTORY_HEAP_SYNC_LEAN`: inside each sync, unchanged;
+- `VICTORY_MIRROR_TRY`: each sync, ahead or not, drains its lists;
+- `VICTORY_FENCE_SENT`: the frame-begin signal is no wait; waits for fences pass on their landing, and raise the floor;
+- `VICTORY_CCD_PLACE`, `VICTORY_HELPER_PRIORITY`: the syncs ahead run on the same `victory-heap-sync` thread, placed and raised as before;
+- `VICTORY_SNAPSHOT_BESIDE`.
+
+Not with levels on demand (the sync beside is off there).
+
+**Grep.**
+- At start: `the next submission's heap sync starts while it waits in line (port of Belobug 673be0e + a609a2f) (VICTORY_HEAP_SYNC_AT_SUBMIT=1)`.
+- On the heap sync line (`descriptor records the title copied`), after the `VICTORY_HEAP_SYNC_BESIDE` part: `(VICTORY_HEAP_SYNC_AT_SUBMIT <mode>: per frame N syncs started while the next submission waited in line, N taken by it, N not (N a hand-over or a wait passed after their asking, N flights settled first), N asked with nothing in line; X ms waited for those not taken and before N sweeps; the submitting thread at the join: ON X ms a frame (+Y before) over N frames, off X ms a frame (+Y before) over N frames)`. "Before" is what the submission waited for a sync ahead before its sync's place.
+- The sync beside's own part counts the syncs ahead that were not taken among its syncs, with their own time.
+- `=alt`: `... (VICTORY_HEAP_SYNC_AT_SUBMIT=alt): ON` / `: off, as usual`, for `xcl-notes\alt-fps.sh`. The stamps are taken in both phases, and a sync started ahead in an ON phase may be taken by the first submission of the off phase after it.
+
+**What must move**, in this order:
+1. "taken by it" close to "syncs started", and few "not";
+2. the ON join well under the off one, and with it the beside part's `ms at the join after the snapshots` and `ms waited` on the line by place in the burst;
+3. `at work` on the frame line, then the present, then the fps (`alt-fps.sh`'s paired median).
+
+The sync's own ms should stay the same: each changed slot is still mirrored once. If many syncs are "not" taken for "a hand-over or a wait passed", the next refinement is the floor of fence waits: it is raised at the pass, as Belobug's, and could be raised to the fence's landing instead. Memory traffic beside the snapshots may eat some of the gain (the `SYNC_BURST` lesson).
 
 ## Water and boats: textures shaders write are copied back (on by default, `VICTORY_TEXTURE_BACK`)
 
