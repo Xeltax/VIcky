@@ -2726,6 +2726,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 pub fn title_memory_remapped(at: usize, len: usize) {
     // Holes found there are no longer known (`VICTORY_SPARSE_KNOWN`).
     crate::host::sparseknown::forget(at, len);
+    crate::texback::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
