@@ -250,8 +250,17 @@ pub(crate) enum C {
     LightGuards,
     LightFilled,
     LightNothingNew,
+    /// The write watch's asking: every `GetWriteWatch` call (failed ones
+    /// too), their microseconds, the 4 KiB pages they were asked about,
+    /// the allocation queries of `VICTORY_WATCH_RESERVATION`, and the looks
+    /// at the journal (a lookup of a range's pages).
+    WatchCalls,
+    WatchCallUs,
+    WatchPages,
+    WatchRegions,
+    JournalLooks,
 }
-const COUNTERS: usize = 128;
+const COUNTERS: usize = 144;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1243,7 +1252,8 @@ fn split_clause(c: &[f64]) -> String {
         "copies split: fills {:.2} ms, title copies {:.2} ms, askings ahead {:.2} ms, {:.0} updates of host copies \
          {:.2} ms ({:.0} before a shader write {:.2} ms{front}; inside them {:.0} askings of the journal or the guards \
          {:.2} ms, pages found written copied {:.2} ms); of all askings (textures' too) {:.0} answered by the journal, \
-         collecting its pages {:.2} ms{light}",
+         collecting its pages {:.2} ms; write watch: {:.0} GetWriteWatch calls {:.2} ms over {:.0} pages, \
+         {:.0} allocation queries, {:.0} journal lookups{light}",
         ms(c[C::FillUs as usize]),
         ms(c[C::CopyStepUs as usize]),
         ms(c[C::AskAheadUs as usize]),
@@ -1256,6 +1266,11 @@ fn split_clause(c: &[f64]) -> String {
         c[C::CopyStaleNs as usize] / 1e6,
         c[C::WritesJournal as usize],
         c[C::WritesCollectNs as usize] / 1e6,
+        c[C::WatchCalls as usize],
+        ms(c[C::WatchCallUs as usize]),
+        c[C::WatchPages as usize],
+        c[C::WatchRegions as usize],
+        c[C::JournalLooks as usize],
     )
 }
 

@@ -2863,15 +2863,61 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
 /// `ranges` with `more`, in order, joined where they overlap or touch.
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
+    merge_ranges(ranges);
+}
+
+/// Joins valid ranges in place, so the next flight reuses their storage
+/// (after ScarlettPort fbf382d1).
+fn merge_ranges(ranges: &mut Vec<(usize, usize)>) {
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for &(from, to) in ranges.iter() {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    ranges.dedup_by(|next, previous| {
+        if next.0 <= previous.1 {
+            previous.1 = previous.1.max(next.1);
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// What the flights among `items` may still write in title memory, into
+/// `written` and `texture_written` in place (their storage reused): every
+/// flight's shader and read-back ranges into `written`, its texture
+/// copy-backs' too while `hold` ([`crate::texback::holding`], i.e. unless
+/// `VICTORY_TEXTURE_BACK_AHEAD`), and the copy-backs' alone into
+/// `texture_written`; both joined. Returns the host lists in the flights.
+fn in_the_air(
+    items: &[Late],
+    hold: bool,
+    written: &mut Vec<(usize, usize)>,
+    texture_written: &mut Vec<(usize, usize)>,
+) -> usize {
+    written.clear();
+    texture_written.clear();
+    let mut lists = 0;
+    for item in items {
+        if let Late::Run(flight) = item {
+            lists += flight.order.len().max(1);
+            written.extend(
+                flight
+                    .back
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(flight.texture_back_ranges.iter().copied().filter(|_| hold))
+                    .filter(|&(from, to)| from < to),
+            );
+            texture_written.extend(
+                flight
+                    .texture_back_ranges
+                    .iter()
+                    .copied()
+                    .filter(|&(from, to)| from < to),
+            );
         }
     }
-    *ranges = out;
+    merge_ranges(written);
+    merge_ranges(texture_written);
+    lists
 }
 
 /// Whether anything is in the air.
@@ -4298,7 +4344,41 @@ fn late_line(frames: f64) {
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{Flight, Late, continues, in_the_air, join_ranges, touches};
+
+    /// What is in the air: the texture copy-backs' ranges join `written`
+    /// only while held (without `VICTORY_TEXTURE_BACK_AHEAD`), and
+    /// `texture_written` always; empty ranges are left out, what was there
+    /// before is cleared, and both keep their storage.
+    #[test]
+    fn copy_backs_join_written_only_while_held() {
+        let flight = |number: u64, order: Vec<usize>, ranges: Vec<(usize, usize)>| {
+            Late::Run(Flight {
+                number,
+                fence: number,
+                lists: Vec::new(),
+                order,
+                card: None,
+                back: Vec::new(),
+                texture_back_ranges: ranges,
+            })
+        };
+        let items = [
+            flight(1, vec![0, 1], vec![(0x3000, 0x4000), (0x1000, 0x2000)]),
+            Late::Signal(0x100, 1),
+            flight(2, Vec::new(), vec![(0x2000, 0x2800), (0x5000, 0x5000)]),
+        ];
+        let (mut written, mut textures) = (Vec::with_capacity(8), Vec::with_capacity(8));
+        written.push((0x9000, 0xa000));
+        let storage = (written.as_ptr(), textures.as_ptr());
+        assert_eq!(in_the_air(&items, true, &mut written, &mut textures), 3);
+        assert_eq!(written, [(0x1000, 0x2800), (0x3000, 0x4000)]);
+        assert_eq!(textures, written);
+        assert_eq!(in_the_air(&items, false, &mut written, &mut textures), 3);
+        assert!(written.is_empty());
+        assert_eq!(textures, [(0x1000, 0x2800), (0x3000, 0x4000)]);
+        assert_eq!((written.as_ptr(), textures.as_ptr()), storage);
+    }
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -4323,11 +4403,13 @@ mod late_tests {
     /// range that only touches another's end does not touch it.
     #[test]
     fn ranges_touch_where_they_overlap() {
-        let mut ranges = Vec::new();
+        let mut ranges = Vec::with_capacity(8);
+        let storage = ranges.as_ptr();
         join_ranges(&mut ranges, [(40, 50), (10, 20), (20, 25), (45, 60), (7, 7)]);
         assert_eq!(ranges, [(10, 25), (40, 60)]);
         join_ranges(&mut ranges, [(25, 40)]);
         assert_eq!(ranges, [(10, 60)]);
+        assert_eq!(ranges.as_ptr(), storage);
         let ranges = [(10usize, 25usize), (40, 60), (100, 101)];
         for (from, to, hit) in [
             (0, 10, false),
@@ -5913,23 +5995,8 @@ impl Host {
             kept.extend(landed);
             in_hand.clear();
             // What is still in the air, from the flights that are.
-            written.clear();
-            texture_written.clear();
-            *lists = 0;
             *backs = late_water::carrying(items);
-            let (mut ranges, mut textures) = (Vec::new(), Vec::new());
-            for item in items.iter() {
-                if let Late::Run(flight) = item {
-                    *lists += flight.order.len().max(1);
-                    ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
-                    textures.extend(flight.texture_back_ranges.iter().copied());
-                }
-            }
-            if crate::texback::holding() {
-                ranges.extend(textures.iter().copied());
-            }
-            join_ranges(written, ranges);
-            join_ranges(texture_written, textures);
+            *lists = in_the_air(items, crate::texback::holding(), written, texture_written);
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
@@ -8508,13 +8575,8 @@ impl Batch {
         let ahead = self.refreshes.len() > 1;
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = self
-                .refreshes
-                .iter()
-                .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
-                .collect();
-            crate::watch::ask_ahead(&ranges);
+            let ranges = self.refreshes.iter().filter(|r| !r.0.unwatched()).map(|r| (r.1, r.2));
+            crate::watch::ask_ahead(ranges);
             let us = started.elapsed().as_micros() as u64;
             preparing(0, us);
             #[cfg(feature = "diagnostics")]

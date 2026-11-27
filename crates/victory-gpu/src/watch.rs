@@ -61,17 +61,80 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
+/// Page number → the asking that last found it written, of the pages ever
+/// found written: in pieces of [`PIECE`] pages, each made when a page of it
+/// is first written. A look at a range of pages is a lookup for each piece
+/// it lies in.
+///
+/// It was a tree of every page ever written (some 80,000-150,000 in a
+/// cell): its lookups, under the journal's lock, some 10,000 a frame from
+/// the refreshes' looks ([`nothing_new`]) and their askings, walked it
+/// twice down to the range's ends; 111 ns a look at a range of a few pages
+/// in the tree, 20 ns in pieces (Biskwit/VIctory-reloaded 27b7a9002).
+struct Written {
+    pieces: HashMap<usize, Box<[u64; PIECE]>, BuildHasherDefault<WordHash>>,
+}
+
+/// Pages to a piece of [`Written`]: 4 MiB of title memory.
+const PIECE: usize = 64;
+
+impl Written {
+    const fn new() -> Written {
+        Written {
+            pieces: HashMap::with_hasher(BuildHasherDefault::new()),
+        }
+    }
+
+    /// `page` was found written by asking `now` (not 0); the asking that
+    /// found it written before (0: none).
+    fn insert(&mut self, page: usize, now: u64) -> u64 {
+        let piece = self.pieces.entry(page / PIECE).or_insert_with(|| Box::new([0; PIECE]));
+        std::mem::replace(&mut piece[page % PIECE], now)
+    }
+
+    /// The asking that last found `page` written, if one did.
+    #[cfg(test)]
+    fn get(&self, page: usize) -> Option<u64> {
+        self.pieces.get(&(page / PIECE)).map(|piece| piece[page % PIECE]).filter(|&w| w != 0)
+    }
+
+    /// `page` is not written, as far as the journal knows (the tests').
+    #[cfg(test)]
+    fn remove(&mut self, page: usize) {
+        if let Some(piece) = self.pieces.get_mut(&(page / PIECE)) {
+            piece[page % PIECE] = 0;
+        }
+    }
+
+    /// The pages of `[first, last)` ever found written, in order, each with
+    /// the asking that last found it written.
+    fn range(&self, first: usize, last: usize) -> impl Iterator<Item = (usize, u64)> + '_ {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::JournalLooks, 1);
+        let pieces = if first < last { first / PIECE..(last - 1) / PIECE + 1 } else { 0..0 };
+        pieces.filter_map(|n| self.pieces.get(&n).map(|piece| (n, piece))).flat_map(move |(n, piece)| {
+            let (from, to) = ((n * PIECE).max(first), ((n + 1) * PIECE).min(last));
+            (from..to).filter_map(move |page| {
+                let write = piece[page % PIECE];
+                (write != 0).then_some((page, write))
+            })
+        })
+    }
+}
+
+mod reservation;
+
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
     /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
+    written: Written,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
-    ahead: Vec<(usize, usize)>,
+    ahead: Ahead,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
@@ -79,11 +142,64 @@ struct Journal {
     kept: bool,
 }
 
+/// Page ranges `[a, b)` asked ahead, by start, each as asked (none merged):
+/// whether one of them holds a range is asked at every refresh of a
+/// submission (thousands a frame) and at every range of [`ask_once`], where
+/// a scan of all of them made the submission's asking quadratic in its
+/// ranges. `reach[i]` is the furthest end of `ranges[..=i]`, so "some range
+/// with `a <= first` ends at `last` or later", which is "one range holds
+/// `[first, last)`", is one binary search (after ScarlettPort 50a9f7c5; the
+/// answers are the scan's).
+struct Ahead {
+    ranges: Vec<(usize, usize)>,
+    reach: Vec<usize>,
+}
+
+impl Ahead {
+    const fn new() -> Ahead {
+        Ahead {
+            ranges: Vec::new(),
+            reach: Vec::new(),
+        }
+    }
+
+    /// Whether one range asked holds all of `[first, last)`.
+    fn holds(&self, first: usize, last: usize) -> bool {
+        let i = self.ranges.partition_point(|&(a, _)| a <= first);
+        i > 0 && self.reach[i - 1] >= last
+    }
+
+    fn push(&mut self, range: (usize, usize)) {
+        let i = self.ranges.partition_point(|&r| r <= range);
+        self.ranges.insert(i, range);
+        self.reach_from(i);
+    }
+
+    /// `reach` again from range `i` on.
+    fn reach_from(&mut self, i: usize) {
+        self.reach.truncate(i);
+        let mut far = i.checked_sub(1).map_or(0, |i| self.reach[i]);
+        for &(_, b) in &self.ranges[i..] {
+            far = far.max(b);
+            self.reach.push(far);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
+        self.reach.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+}
+
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
-    written: BTreeMap::new(),
+    written: Written::new(),
     found: Vec::new(),
-    ahead: Vec::new(),
+    ahead: Ahead::new(),
     ahead_asked: 0,
     kept: false,
 });
@@ -102,11 +218,16 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
-pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+pub(crate) fn ask_ahead(ranges: impl Iterator<Item = (usize, usize)>) {
+    // The submission's one asking stands ([`ask_once`]): what it does not
+    // hold is left to `writes`, and no plan is made (nor any range Vec
+    // built: the ranges are not consumed). After ScarlettPort 23870346.
+    if JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).kept {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
-        .iter()
         .filter(|r| r.0 < r.1)
-        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .map(|(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
         return;
@@ -114,8 +235,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     pieces.sort_unstable();
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
+    // Asked for while the first look was being made.
     if j.kept {
         return;
     }
@@ -175,6 +295,16 @@ fn slow(us: u64) {
 #[cfg(feature = "diagnostics")]
 pub(crate) static AHEAD_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// A `GetWriteWatch` call over `pages` 4 KiB pages made at `started`, failed
+/// or not (the copies line: calls, their microseconds, pages asked).
+#[cfg(feature = "diagnostics")]
+fn called(started: std::time::Instant, pages: usize) {
+    use crate::copystat::{C, add};
+    add(C::WatchCalls, 1);
+    add(C::WatchCallUs, started.elapsed().as_micros() as u64);
+    add(C::WatchPages, pages as u64);
+}
+
 /// [`SLOW`], taken.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn slow_asks() -> [u64; 3] {
@@ -227,7 +357,13 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)], mut view: impl FnMut(usize)) {
         look_at_holes(HOLES_A_LOOK);
     }
     ask_once_end();
-    ask_ahead(ranges);
+    let _timed = reservation::timed();
+    // By reservation (`VICTORY_WATCH_RESERVATION`), unless the runtime is
+    // changing a mapping.
+    if reservation::on() && reservation::ask(ranges, &mut view) {
+        return;
+    }
+    ask_ahead(ranges.iter().copied());
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if j.ahead.is_empty() {
@@ -255,7 +391,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)], mut view: impl FnMut(usize)) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
+        if !j.ahead.holds(first, last) && ask_kernel(j, first, last) {
             j.ahead.push((first, last));
         }
     }
@@ -312,7 +448,7 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
     if j.kept || !j.ahead.is_empty() {
         j.ahead_asked = now;
     }
-    let before = j.written.insert(page, now).unwrap_or(0);
+    let before = j.written.insert(page, now);
     for &other in others {
         if other != page {
             j.written.insert(other, now);
@@ -350,6 +486,9 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let pages = count;
+    reservation::count_kernel(count);
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -361,6 +500,8 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             &mut granularity,
         )
     } != 0;
+    #[cfg(feature = "diagnostics")]
+    called(started, pages);
     if failed {
         return false;
     }
@@ -394,16 +535,15 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 pub(crate) fn ahead_now(start: usize, end: usize) -> Option<u64> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then_some(j.ahead_asked)
+    j.ahead.holds(first, last).then_some(j.ahead_asked)
 }
 
 fn asked_inner(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+        .holds(first, last)
+        .then(|| (j.ahead_asked, j.written.range(first, last).collect()))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -442,10 +582,10 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if j.ahead.holds(first, last) {
         #[cfg(feature = "diagnostics")]
         let collecting = std::time::Instant::now();
-        let written = j.written.range(first..last).map(|(&p, &w)| (p, w)).collect();
+        let written = j.written.range(first, last).collect();
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -462,7 +602,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     if guarded && light == 2 && published(j, first * PAGE, last * PAGE) {
         light_count(0);
         j.asked += 1;
-        return Some((j.asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
+        return Some((j.asked, j.written.range(first, last).collect()));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -473,6 +613,8 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
     let known_view = guarded && known_view(first * PAGE);
+    #[cfg(feature = "diagnostics")]
+    let pages = count;
     // SAFETY: the answer buffer holds `count` entries.
     let failed = known_view
         || unsafe {
@@ -485,6 +627,10 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
                 &mut granularity,
             )
         } != 0;
+    #[cfg(feature = "diagnostics")]
+    if !known_view {
+        called(started, pages);
+    }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         if known_view {
@@ -534,7 +680,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     }
     #[cfg(feature = "diagnostics")]
     let collecting = std::time::Instant::now();
-    let written = j.written.range(first..last).map(|(&p, &w)| (p, w)).collect();
+    let written = j.written.range(first, last).collect();
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::WritesCollectNs, collecting.elapsed().as_nanos() as u64);
     Some((now, written))
@@ -1954,11 +2100,11 @@ fn nothing_noted(start: usize, end: usize, base: usize, copied: &[u64]) -> bool 
     }
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     // The bits first, then the journal, both under its lock ([`published`]).
-    let by_bits = !j.ahead.iter().any(|&(a, b)| a <= first && last <= b);
+    let by_bits = !j.ahead.holds(first, last);
     if by_bits && !published(&j, first * PAGE, last * PAGE) {
         return false;
     }
-    let same = j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first]);
+    let same = j.written.range(first, last).all(|(page, write)| write <= taken[page - first]);
     if same && by_bits {
         light_count(0);
     }
@@ -2601,6 +2747,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    reservation::completed_write(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -2724,6 +2871,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    reservation::remapped();
     // Holes found there are no longer known (`VICTORY_SPARSE_KNOWN`).
     crate::host::sparseknown::forget(at, len);
     crate::texback::remapped(at, len);
@@ -2736,18 +2884,18 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
-    let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
+    let absent: Vec<usize> = g.absent.range(range).copied().collect();
     for block in absent {
         g.absent.remove(&block);
         forget_hole(&mut g, block);
     }
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
-    for block in blocks {
-        g.protected.remove(&block);
-        g.clean.remove(block);
-        // What it shows is new ([`PUBLISHED`]).
-        PUBLISHED.clear(block);
-    }
+    // Back to read-write before the guard is forgotten: the title can write
+    // its view as soon as the runtime has given it the word, and a block left
+    // read-only with no guard to open it would fault into no handler (the
+    // same window `look_at_holes` avoids by taking the mapping lock). What it
+    // shows is new ([`PUBLISHED`], cleared there too). After
+    // fxceless/victory-fork#1447.
+    open_here(&mut g, at, at.saturating_add(len));
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
@@ -2847,6 +2995,117 @@ fn writable(at: usize) -> bool {
 }
 
 #[cfg(test)]
+mod written_tests {
+    use super::{BTreeMap, PIECE, Written};
+
+    /// The pieces answer for any range what a tree of the same pages does
+    /// (the notes and removals random, in two clusters, one across pieces'
+    /// ends; after Biskwit/VIctory-reloaded 27b7a9002's test).
+    #[test]
+    fn the_pieces_say_what_a_tree_of_the_pages_says() {
+        let mut written = Written::new();
+        let mut tree = BTreeMap::new();
+        let mut seed = 0x9e37_79b9_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        for now in 1..5000u64 {
+            let page = if now % 3 == 0 { 1_000_000 + next() % 300 } else { 10 * PIECE - 150 + next() % 300 };
+            assert_eq!(written.insert(page, now), tree.insert(page, now).unwrap_or(0));
+            if now % 50 == 0 {
+                let gone = page + next() % 3;
+                written.remove(gone);
+                tree.remove(&gone);
+            }
+        }
+        for _ in 0..2000 {
+            let first = [0, 1_000_000 - 50, 10 * PIECE - 200][next() % 3] + next() % 400;
+            let last = first + [0, 1, 2, 63, 64, 65, 500][next() % 7];
+            let want: Vec<(usize, u64)> = tree.range(first..last).map(|(&p, &w)| (p, w)).collect();
+            assert_eq!(written.range(first, last).collect::<Vec<_>>(), want, "{first}..{last}");
+            assert_eq!(written.get(first), tree.get(&first).copied());
+        }
+        assert_eq!(written.range(5, 5).count(), 0);
+        assert_eq!(written.range(9, 5).count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod ahead_tests {
+    use super::Ahead;
+
+    /// What the journal asked before: one asked range that holds the range.
+    fn scanned(ranges: &[(usize, usize)], first: usize, last: usize) -> bool {
+        ranges.iter().any(|&(a, b)| a <= first && last <= b)
+    }
+
+    /// A xorshift, so the ranges are the same every run.
+    fn numbers(mut x: u64) -> impl FnMut(usize) -> usize {
+        move |below| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % below as u64) as usize
+        }
+    }
+
+    /// Ranges overlapping, nested, touching, repeated and empty, pushed one
+    /// by one (as [`super::ask_once`] does): the answer is the scan's for
+    /// every range, those that span two touching ranges among them (no
+    /// single range holds those, and none is merged). After ScarlettPort
+    /// 50a9f7c5's test.
+    #[test]
+    fn holds_answers_as_the_scan_did() {
+        let mut next = numbers(0x9e37_79b9_7f4a_7c15);
+        for round in 0..200 {
+            let count = next(40);
+            let ranges: Vec<(usize, usize)> = (0..count)
+                .map(|_| {
+                    let a = next(300);
+                    (a, a + next(60))
+                })
+                .collect();
+            let mut pushed = Ahead::new();
+            for (n, &range) in ranges.iter().enumerate() {
+                pushed.push(range);
+                for _ in 0..20 {
+                    let first = next(380);
+                    let last = first + next(80);
+                    assert_eq!(
+                        pushed.holds(first, last),
+                        scanned(&ranges[..=n], first, last),
+                        "round {round}: [{first}, {last}) after {:?}",
+                        &ranges[..=n]
+                    );
+                }
+            }
+            for first in 0..380 {
+                for last in first..first + 80 {
+                    assert_eq!(
+                        pushed.holds(first, last),
+                        scanned(&ranges, first, last),
+                        "round {round}: [{first}, {last}) in {ranges:?}"
+                    );
+                }
+            }
+        }
+        let mut touching = Ahead::new();
+        touching.push((20, 30));
+        touching.push((10, 20));
+        assert!(touching.holds(10, 20) && touching.holds(20, 30) && touching.holds(12, 12));
+        assert!(!touching.holds(15, 25), "two ranges hold it, one does not");
+        assert!(!Ahead::new().holds(0, 0));
+        let mut cleared = Ahead::new();
+        cleared.push((0, 100));
+        cleared.clear();
+        assert!(cleared.is_empty() && !cleared.holds(1, 2));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{
@@ -2862,9 +3121,8 @@ mod tests {
     fn forget_written(start: usize, end: usize) {
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
         let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-        let pages: Vec<usize> = j.written.range(first..last).map(|(&page, _)| page).collect();
-        for page in pages {
-            j.written.remove(&page);
+        for page in first..last {
+            j.written.remove(page);
         }
     }
 
@@ -2950,6 +3208,9 @@ mod tests {
             guard(view, view + 2 * BLOCK),
             Some((view / PAGE..view / PAGE + 1).collect())
         );
+        // The guards are told before the address can be mapped again by
+        // another test (a guard they kept, or opened late, is a view's).
+        title_memory_remapped(view, 2 * BLOCK);
         // SAFETY: our view.
         unsafe {
             UnmapViewOfFile(
@@ -2958,7 +3219,6 @@ mod tests {
                 },
             )
         };
-        title_memory_remapped(view, 2 * BLOCK);
     }
 
     #[test]
@@ -3277,6 +3537,47 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// The submission's one asking stands: a further asking ahead makes no
+    /// plan and consumes no range (ScarlettPort 23870346).
+    #[test]
+    fn a_kept_asking_consumes_no_other_range_plan() {
+        let _one = one_at_a_time();
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        forget_written(p, p + 4 * PAGE);
+        ask_once(&[(p, p + 2 * PAGE), (p + 2 * PAGE, p + 4 * PAGE)], |_| {});
+        assert!(JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).kept);
+        ask_ahead(std::iter::from_fn(|| panic!("a kept asking must not consume another range plan")));
+        ask_once_end();
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A guard made between a view's mapping and the runtime's word about it
+    /// is forgotten by that word; the page must get its write access back in
+    /// the same step, or the title's next plain write to its own view faults
+    /// with no guard to open it (fxceless/victory-fork#1447).
+    #[test]
+    fn a_guard_forgotten_by_the_remap_gives_its_page_back() {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        const SIZE: usize = BLOCK;
+        let (section, view, other) = two_views(SIZE);
+        assert_eq!(guard(view, view + SIZE), Some(vec![view / PAGE]));
+        // The runtime mapped the pages and only now tells the guard.
+        title_memory_remapped(view, SIZE);
+        crate::inplace::title_memory_view(view, SIZE, section, 0);
+        // SAFETY: plain data, filled in by the query about the mapped view.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(view as *const _, &mut info, size_of_val(&info)) };
+        assert_eq!(n, size_of_val(&info));
+        assert_eq!(info.Protect, PAGE_READWRITE);
+        drop_views(section, &[view, other], SIZE);
     }
 
     /// A write of the runtime's own, told at one view of the pages
@@ -3990,6 +4291,7 @@ mod tests {
         TEST_HOT.set(None);
         TEST_HOT_RATIO.set(None);
         TEST_FRAME.set(None);
+        title_memory_remapped(view, SIZE);
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
     }
