@@ -251,6 +251,10 @@ fn say() {
 /// flights' account of title memory (`Shadow::gpu_writes`), so whatever
 /// reads or writes it on the CPU at a later submission (a title copy into
 /// it, a texture's memory, a step of ours) waits for them as before.
+/// Indirect executions whose arguments or count lie in it are clamped
+/// alone, right before they run, never ahead in a window or a list's
+/// prelude (`crate::draw`'s `in_place_order`,
+/// `VICTORY_INPLACE_CONSTANTS_ORDER`).
 ///
 /// Not with `VICTORY_FENCE_SENT=1` while submissions are sent ahead
 /// (`crate::host::late`): the frame-begin value is then told to the title

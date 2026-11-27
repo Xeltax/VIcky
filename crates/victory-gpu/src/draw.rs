@@ -361,6 +361,110 @@ pub(crate) fn window_line(frames: f64) {
     );
 }
 
+/// Whether an indirect execution whose arguments or count lie in title
+/// memory the card reads in place (`crate::inplace`: the constants heap
+/// with `VICTORY_INPLACE_CONSTANTS=1`, or `VICTORY_INPLACE`) is clamped
+/// alone, right before it runs: never read from a window ([`windows`]),
+/// never gathered for its list's prelude ([`gathers`]), and it opens no
+/// window. On by default, so it comes with the memory in place;
+/// `VICTORY_INPLACE_CONSTANTS_ORDER=0`: as any other execution. (Port of
+/// avatarmanz/VIctory-7900XTX 631400f598, 3e04ca0afa and 15c3d0ea7e,
+/// `VICTORY_PORT_CONSTANTS_ORDER`, GPL-3.0.)
+///
+/// A window or a gathered record is clamped ahead: in the pass recorded
+/// where the window was opened, or in the list's prelude, before the
+/// commands between it and the execution that reads the record. For a host
+/// copy the bytes are the title's of the submission. Where the card reads
+/// the title's memory in place, the records the title's culling passes
+/// write between the two can be read before they are written: the
+/// execution draws the records of an earlier frame, or none. In avatarmanz'
+/// runs with the constants heap in place, palms and trees were missing for
+/// runs of frames while the camera moved (pop-5, pop-11 to pop-13) and eyes
+/// were drawn wrong; clamped alone they stayed (pop-14). A batch opened
+/// after the last shader that may write buffers (their
+/// `VICTORY_PORT_CONSTANTS_ORDER_ALONE=0`, which is what our windows and
+/// gathering already keep to) was not enough (pop-15), so only the alone
+/// form is here. What it costs: one clamp pass of ours per such execution.
+fn in_place_order() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_INPLACE_CONSTANTS_ORDER").is_none_or(|v| v != "0");
+        if on {
+            tracing::info!(
+                "indirect executions whose arguments or count the card reads in place are clamped alone, right before they run, not in \
+                 windows or gathered (VICTORY_INPLACE_CONSTANTS_ORDER; =0: as any other)"
+            );
+        } else {
+            tracing::warn!(
+                "indirect executions whose arguments or count the card reads in place are clamped in windows and gathered as any other \
+                 (VICTORY_INPLACE_CONSTANTS_ORDER=0): their records may be read before the title's passes write them"
+            );
+        }
+        on
+    })
+}
+
+/// Diagnostics of [`in_place_order`] since the last line: indirect
+/// executions with arguments or count in place, those clamped alone for
+/// it; and by 1 MiB of their arguments' addresses, the draws (and indexed
+/// draws), dispatches and mesh draws.
+#[cfg(feature = "diagnostics")]
+static IN_PLACE_INDIRECT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(feature = "diagnostics")]
+static IN_PLACE_RANGES: std::sync::Mutex<std::collections::BTreeMap<u64, [u64; 3]>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// An indirect execution of `kind` with its arguments at `arguments`, or
+/// its count, in place; `alone` if clamped alone for it.
+#[cfg(feature = "diagnostics")]
+fn in_place_indirect(arguments: u64, kind: u32, alone: bool) {
+    IN_PLACE_INDIRECT[0].fetch_add(1, Ordering::Relaxed);
+    IN_PLACE_INDIRECT[1].fetch_add(u64::from(alone), Ordering::Relaxed);
+    // The kinds as `State::execute_indirect` numbers them: 2 dispatch, 10
+    // mesh.
+    let slot = match kind {
+        2 => 1,
+        10 => 2,
+        _ => 0,
+    };
+    let mut ranges = IN_PLACE_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    ranges.entry(arguments >> 20).or_default()[slot] += 1;
+}
+
+/// The line of [`in_place_order`], per frame over `frames` frames (with
+/// [`window_line`]); nothing if no such execution was seen since the last.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn in_place_indirect_line(frames: f64) {
+    let frames = frames.max(1.0);
+    let [all, alone] = [0, 1].map(|i| IN_PLACE_INDIRECT[i].swap(0, Ordering::Relaxed));
+    let ranges = std::mem::take(&mut *IN_PLACE_RANGES.lock().unwrap_or_else(|e| e.into_inner()));
+    if all == 0 {
+        return;
+    }
+    let mut by: Vec<(u64, [u64; 3])> = ranges.into_iter().collect();
+    by.sort_by_key(|(_, n)| std::cmp::Reverse(n.iter().sum::<u64>()));
+    let top: Vec<String> = by
+        .iter()
+        .take(6)
+        .map(|(mb, n)| {
+            format!(
+                "{:#x}+1MiB: {:.0} draws {:.0} dispatches {:.0} mesh",
+                mb << 20,
+                n[0] as f64 / frames,
+                n[1] as f64 / frames,
+                n[2] as f64 / frames
+            )
+        })
+        .collect();
+    tracing::info!(
+        "  indirect executions with arguments or count in place per frame: {:.0}, of them {:.0} clamped alone right before they ran \
+         (VICTORY_INPLACE_CONSTANTS_ORDER); from {} ranges of 1 MiB, the busiest: {}",
+        all as f64 / frames,
+        alone as f64 / frames,
+        by.len(),
+        top.join("; ")
+    );
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -3324,6 +3428,15 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // Arguments (or their count) the card reads in title memory in
+        // place: clamped alone, right before the execution, never ahead in
+        // a window or the list's prelude ([`in_place_order`]).
+        let in_place = args.in_place() || counter.as_ref().is_some_and(|(s, _)| s.in_place());
+        let alone = in_place && in_place_order();
+        #[cfg(feature = "diagnostics")]
+        if in_place {
+            in_place_indirect(arguments, kind, alone);
+        }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
         // buffer. Anything else ends the window: it uses the scratch buffer
@@ -3371,25 +3484,29 @@ impl State {
         } else {
             None
         };
-        let windowed = windows()
+        let could = windows()
             && kind != DISPATCH
             && max == 1
             && count.is_none()
             && !p.stages.iter().any(|stage| stage.translated().stores);
+        // Clamped alone ([`in_place_order`]): the window ends (its clamp
+        // goes into the same scratch buffer), the list goes on gathering.
+        let windowed = could && !alone;
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
         let first_on_list = list.first_use(WINDOW_USE);
         if !windowed || first_on_list {
             self.window = None;
         }
-        if !windowed {
+        if !could {
             // A dispatch, or shaders that store to buffers: arguments may
             // be written from here on.
             list.gather_close();
         }
-        // Diagnostics: why this command gets a pass of ours, if it does.
+        // Diagnostics: why this command gets a pass of ours, if it does
+        // (one clamped alone for being in place: on its own line).
         #[cfg(feature = "diagnostics")]
-        let why_not = if !windows() {
+        let why_not = if !windows() || alone {
             usize::MAX
         } else if kind == DISPATCH {
             1
