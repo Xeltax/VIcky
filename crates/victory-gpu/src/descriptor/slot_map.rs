@@ -171,6 +171,25 @@ impl SlotMap {
         Some(host)
     }
 
+    /// [`SlotMap::free`] in two steps (VIcky, `VICTORY_HEAP_SYNC_LEAN`):
+    /// mapped title slot `title` has no host slot from now on; its host
+    /// slot, if it had one, is the caller's to give to
+    /// [`SlotMap::quarantine`].
+    pub(crate) fn unset(&self, title: u32) -> Option<u32> {
+        let at = title.checked_sub(self.window)?;
+        let slot = self.entries.get(at as usize)?;
+        let host = decode(slot.load(Relaxed))?;
+        slot.store(0, Relaxed);
+        Some(host)
+    }
+
+    /// The second step of [`SlotMap::unset`]: `hosts`, in order,
+    /// quarantined until the submissions `started` so far finish.
+    pub(crate) fn quarantine(&self, hosts: impl IntoIterator<Item = u32>, started: u64) {
+        let mut pool = self.state();
+        pool.quarantine.extend(hosts.into_iter().map(|host| (started, host)));
+    }
+
     /// The title slots that hold a host slot, with it, in title order.
     pub(crate) fn mapped(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
         self.entries

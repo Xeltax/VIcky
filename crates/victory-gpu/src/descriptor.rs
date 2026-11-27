@@ -229,6 +229,7 @@ pub(crate) fn sync_heaps_told(asked: Option<&dyn Fn()>) {
     let one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     // VIcky: the phases of the `alt` switches of the heap sync's slots.
     host::note_kind::tick();
+    host::sync_lean::tick();
     #[cfg(feature = "diagnostics")]
     host::note_kind::syncing(true);
     sync_held(asked, started);
@@ -295,6 +296,7 @@ fn sync_held(asked: Option<&dyn Fn()>, started: std::time::Instant) {
         count.fetch_add(n, Relaxed);
     }
     host::note_kind::synced(us, mirrored + drained);
+    host::sync_lean::synced(us, mirrored + drained);
     // VIcky: for the line by place in the burst.
     #[cfg(feature = "diagnostics")]
     burst::synced(us, mirrored + drained);
@@ -423,8 +425,10 @@ static WIDE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::Ato
 /// prints are this walk's alone; whether a slot was a table's lately is
 /// the draws' to change). Only the moments differ: every page is read
 /// before the first slot is mirrored, and each slot's record is read
-/// again when it is mirrored, as before. Returns the pages read, the
-/// records looked at, and the slots mirrored.
+/// again when it is mirrored, as before (VIcky, `VICTORY_HEAP_SYNC_LEAN`,
+/// `host::sync_lean`: not; each is made from the record its page's copy
+/// held). Returns the pages read, the records looked at, and the slots
+/// mirrored.
 #[cfg(windows)]
 fn sync_wide(
     host: &host::HostHeap,
@@ -447,7 +451,10 @@ fn sync_wide(
         return [0; 3];
     }
     let started = std::time::Instant::now();
-    type Found = Option<(u64, Vec<(u32, u64)>)>;
+    // VIcky (`VICTORY_HEAP_SYNC_LEAN`, `host::sync_lean`): the slots
+    // mirrored in lean chunks, each from its record as the page held it.
+    let lean = host::sync_lean::now();
+    type Found = Option<(u64, Vec<(u32, u64)>, Vec<[u32; 3]>)>;
     let pages = Arc::new(pages);
     let found: Arc<Vec<Mutex<Found>>> = Arc::new((0..pages.len()).map(|_| Mutex::new(None)).collect());
     let groups = threads.clamp(1, pages.len());
@@ -468,8 +475,10 @@ fn sync_wide(
                     bytes.resize(to - from, 0);
                     if crate::host::read_into(from as *const u8, &mut bytes) {
                         let slots = changed_slots(from, to, start as usize, step, mirrored_count);
-                        let due = host.copied_due(slots, (start, step), from, &bytes);
-                        *found[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(due);
+                        let mut records = Vec::new();
+                        let (seen, due) =
+                            host.copied_due_with(slots, (start, step), from, &bytes, lean.is_some().then_some(&mut records));
+                        *found[i].lock().unwrap_or_else(|e| e.into_inner()) = Some((seen, due, records));
                     }
                 }
             }) as Box<dyn FnOnce() + Send>
@@ -485,13 +494,16 @@ fn sync_wide(
     let read = started.elapsed();
     let (mut pages_read, mut looked, mut mirrored) = (0, 0, 0);
     for page in found.iter() {
-        let Some((seen, due)) = page.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        let Some((seen, due, records)) = page.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             continue;
         };
         pages_read += 1;
         looked += seen;
         mirrored += due.len() as u64;
-        host.mirror_due(&due);
+        match lean {
+            Some(check) => host.mirror_due_lean(&due, &records, check),
+            None => host.mirror_due(&due),
+        }
     }
     WIDE[0].fetch_add(read.as_micros() as u64, Relaxed);
     WIDE[1].fetch_add((started.elapsed() - read).as_micros() as u64, Relaxed);
@@ -511,7 +523,7 @@ pub(crate) fn sync_line(frames: f64) {
     // heap page changed.)
     let tried = mirror_try::part(frames);
     // (VIcky: the sync's slots by kind, and the switches of its notes.)
-    let kinds = host::note_kind::part(frames);
+    let kinds = host::note_kind::part(frames) + &host::sync_lean::part(frames);
     if pages > 0 || !tried.is_empty() {
         tracing::info!(
             "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \

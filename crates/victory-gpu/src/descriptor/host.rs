@@ -19,6 +19,7 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 pub(crate) mod note_kind;
+pub(crate) mod sync_lean;
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -2653,9 +2654,23 @@ impl HostHeap {
     pub(crate) fn copied_due(
         &self,
         slots: std::ops::Range<u64>,
+        at: (u64, u64),
+        from: usize,
+        page: &[u8],
+    ) -> (u64, Vec<(u32, u64)>) {
+        self.copied_due_with(slots, at, from, page, None)
+    }
+
+    /// [`HostHeap::copied_due`]; with `records` (VIcky,
+    /// `VICTORY_HEAP_SYNC_LEAN`, [`sync_lean`]) also each due slot's record
+    /// (its first three words) as the page held it, in the same order.
+    pub(crate) fn copied_due_with(
+        &self,
+        slots: std::ops::Range<u64>,
         (start, step): (u64, u64),
         from: usize,
         page: &[u8],
+        mut records: Option<&mut Vec<[u32; 3]>>,
     ) -> (u64, Vec<(u32, u64)>) {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
@@ -2695,6 +2710,10 @@ impl HostHeap {
                 }
                 *last = print;
                 due.push((index as u32, handle));
+                if let Some(records) = records.as_deref_mut() {
+                    let word = |w: usize| u32::from_le_bytes([0, 1, 2, 3].map(|b| record.get(w * 4 + b).copied().unwrap_or(0)));
+                    records.push([word(0), word(1), word(2)]);
+                }
             }
         }
         (looked, due)
