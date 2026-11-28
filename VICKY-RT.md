@@ -123,6 +123,19 @@ This work is for making the title's compute ray tracing (the BVH structure build
 
 **Chapter-1 boat mission with ray tracing (2026-11-27, verified on an RTX 4080, Series X, RT on):** with this main, a save in the boat mission loads, the boat floats and the mission plays, with no extra switch: the texture copy-back (`VICTORY_TEXTURE_BACK`, on by default) gives the title's physics the water it computes on the card, and the builder's box rehydration programs' parent-link stores are left out by default (`VICTORY_BVH_LINK_STORES=keep` keeps them; with them the title crashed on that save's loading screen). Add `VICTORY_LATE_WAIT=2` in water scenes (at the relay's default stage 3 testers elsewhere saw the water surface vanish for single frames); `VICTORY_LATE_WATER=1` at stage 3 is the narrower wait to try instead, not measured yet (water section below). Measured: 480 s on that save, RT on, the fps set below plus `VICTORY_LATE_WAIT=2 VICTORY_REAPER=1`: no crash, 7.34 fps true mean of the last 12 lines (lines 7.8-8.5, about 122-127 ms a frame: preparing ~68, copy-back ~23-27, a wait for the card of ~17 ms that is the copy-back's read-back). The prologue cell with the same build: 5.32 fps true (a slow stretch mid-run; last lines 6.3-7.5), about level with 6.91 before the batch. `VICTORY_INPLACE_CONSTANTS` does not place the constants heap here ("view memory from several places") even without `VICTORY_FENCE_SENT`/`VICTORY_SECTION_MB`: leave it off, or try it with `VICTORY_PAGE_PLACE=1` and without `VICTORY_FENCE_SENT` (roadmap B2, section "Physical pages placed at their first mapping").
 
+**Structural stage 1 measured (2026-11-28 morning, RT on, full recommended set).** `VICTORY_TABLE_BOUND=alt`, paired medians:
+
+| Scene | Paired median | Frame time ON vs off | ON phases above their off neighbours | Run mean |
+|---|---|---|---|---|
+| boat mission | **+1.66 fps** | -26 ms (ON phases up to 11.2 fps) | 6 of 7 | 10.48 fps |
+| prologue cell | **+1.18 fps** | -21 ms | 4 of 4 | |
+
+Stage 2's stop criterion passes: 64-68 % of the sync's mirrored records and 71-72 % of the pass's slots would be left to the draws (bar: 50 %).
+
+**Not recommended yet: it brings back the clothing mosaic.** Streamed textures read through tables leave the texture queue and are made by their draws in place, so the staleness fixes (recheck, `PAGE_WRITES=all`, fallback) no longer re-upload them. The passenger's shirt is a mosaic again in ON-phase captures.
+
+Next: make draw-made texture slots honour the same staleness checks, then stage 2 (buffer slots left to the draws with a hold that keeps the copies).
+
 **Streamed texture staleness measured (2026-11-28 night, boat mission save, RT on).** Recommended set plus `VICTORY_FACE_D16=1`; the diagnostic `VICTORY_STALE_SLOTS=1` compared about 3,100 sampled slots per 5 s line with title memory.
 
 | Settings | fps | Slots that differ | Of them out of the queue | Passenger's patterned shirt |

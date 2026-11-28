@@ -91,6 +91,8 @@ Lot 6's always-on SSE2 `changed_runs` and per-thread counts: picture clean, 9.41
 
 | **Picture: clothing / streamed textures** | `NO_WAIT_FALLBACK` + `DS_HOLD` + `PAGE_WRITES=all` + `BCPACK_FIXES` + `RECHECK_PARTLY` + `HEAP_RECHECK_MIPS` (every 960) | Never-re-uploaded stale slots 82 → 3-15 per sample; shirt clean; no fps cost | Recommended |
 
+| **Structural stage 1** | `VICTORY_TABLE_BOUND` | **+1.66 fps boat (10.48 fps run), +1.18 prologue**; stage-2 criterion passes (64-72 %) | Opt-in: streamed textures read through tables skip the staleness fixes (clothing mosaic); fix that next |
+
 **Since 2026-11-28 the priority is picture fidelity**: textures, faces and mouths, resolution, water and vegetation. After that comes a structural rework of the descriptor path for fps (the submitting thread and the buffer-view pass are two equal walls), instead of more small levers.
 
 Next focus: the submitting thread itself, ~137 ms. In order:
