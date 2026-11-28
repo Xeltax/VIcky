@@ -95,9 +95,11 @@ Lot 6's always-on SSE2 `changed_runs` and per-thread counts: picture clean, 9.41
 
 | **Structural stage 2** | `VICTORY_TABLES_LEFT` | **+0.72 fps prologue (-14 % frame time)**, neutral on the boat; 0 check violations; heap sync 33 -> 19-28 ms, pass 49-58 -> 26-28 ms, copies flat; picture clean | Optional. Profiled (wall2): the boat frame is the submitting thread's own work. Since `fx-main-lanes`: holds swap key and copy together (a fix); `TABLES_LEFT_HEAL_SPREAD=1` spreads the heal (opt-in) |
 
-| **Structural stage 3** | `VICTORY_SUBMIT_LANES` | Not measured yet. Texture refreshes on the wide threads, joined before the card's copies; the sweep's last drops on the reaper after the send. Expected: mission stretch S -15..-25 ms, settled -4..-8 | Opt-in. Run `=alt` on the boat and the prologue |
+| **Structural stage 3** | `VICTORY_SUBMIT_LANES` | **+0.42 fps boat (-9 % frame time), +0.13 prologue** (paired, on `TABLES_LEFT=1`); refresh on the submitting thread 29-46 -> 5-26 ms; picture clean | Optional, passes Fable's stop rule narrowly; confirm without alt |
 
-| **Stage 4 counter** | `VICTORY_MADE_READ` line (always on) | Not measured yet. Share of the draws' heap-mirror calls that only look | Stage 4 goes ahead at 70 % or more |
+| **Stage 4 counter** | `VICTORY_MADE_READ` line (always on) | Draws 40 % (bar 70 %), the title's view calls 78 % | Stage 4 for draws not built; a `mirror_tried`-only variant stays possible |
+
+| **Stage 5** | `VICTORY_HEAP_SYNC_NEED=alt` on `TABLES_LEFT=1` | -0.02 fps (prologue) | Dropped |
 
 **Since 2026-11-28 the priority is picture fidelity**: textures, faces and mouths, resolution, water and vegetation. After that comes a structural rework of the descriptor path for fps (the submitting thread and the buffer-view pass are two equal walls), instead of more small levers.
 

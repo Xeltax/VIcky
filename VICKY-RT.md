@@ -123,6 +123,41 @@ This work is for making the title's compute ray tracing (the BVH structure build
 
 **Chapter-1 boat mission with ray tracing (2026-11-27, verified on an RTX 4080, Series X, RT on):** with this main, a save in the boat mission loads, the boat floats and the mission plays, with no extra switch: the texture copy-back (`VICTORY_TEXTURE_BACK`, on by default) gives the title's physics the water it computes on the card, and the builder's box rehydration programs' parent-link stores are left out by default (`VICTORY_BVH_LINK_STORES=keep` keeps them; with them the title crashed on that save's loading screen). Add `VICTORY_LATE_WAIT=2` in water scenes (at the relay's default stage 3 testers elsewhere saw the water surface vanish for single frames); `VICTORY_LATE_WATER=1` at stage 3 is the narrower wait to try instead, not measured yet (water section below). Measured: 480 s on that save, RT on, the fps set below plus `VICTORY_LATE_WAIT=2 VICTORY_REAPER=1`: no crash, 7.34 fps true mean of the last 12 lines (lines 7.8-8.5, about 122-127 ms a frame: preparing ~68, copy-back ~23-27, a wait for the card of ~17 ms that is the copy-back's read-back). The prologue cell with the same build: 5.32 fps true (a slow stretch mid-run; last lines 6.3-7.5), about level with 6.91 before the batch. `VICTORY_INPLACE_CONSTANTS` does not place the constants heap here ("view memory from several places") even without `VICTORY_FENCE_SENT`/`VICTORY_SECTION_MB`: leave it off, or try it with `VICTORY_PAGE_PLACE=1` and without `VICTORY_FENCE_SENT` (roadmap B2, section "Physical pages placed at their first mapping").
 
+**Stage 3 measured (2026-11-28 morning, RT on, full recommended set + `VICTORY_TABLES_LEFT=1` in both phases).** `VICTORY_SUBMIT_LANES=alt`:
+
+| Scene | Paired median | Frame time ON vs off |
+|---|---|---|
+| boat mission | **+0.42 fps over 7 ON phases** | -13.3 ms (-9 %) |
+| prologue cell | +0.13 fps over 5 ON phases | -5.4 ms (-5 %) |
+
+Boat, per frame, from the stage's own summary lines:
+
+- Preparing a submission: 100.6 ms off against 77.8 ON in one pair, with 124 and 77 uploads a frame. In a busier pair it was 112.9 off against 105.7 ON, with 193 and 223 uploads.
+- Texture refreshes on the submitting thread: 29-46 ms off, 5-26 ON.
+- The wide threads take 42-168 ms of refresh work, with a 1-2 ms wait at the joins.
+- In ON phases, 1,300-2,400 objects a frame are dropped on the reaper.
+
+The picture is clean in ON phases: the hull, faces, water and the passenger's printed shirt.
+
+Fable's stop rule asks preparing to fall by at least 6 ms when uploads are over 80 a frame. The busier pair cleared it by 1 ms (-7 ms), so `SUBMIT_LANES` passes, narrowly. It stays optional until a non-alternating confirmation.
+
+**Stage 4 counter (same boat run).** Per frame:
+
+- Draws (`bind_attempt`): about 4,100 heap-mirror calls; **40 %** found their slot already made from the record.
+- The title's view calls and copies (`mirror_tried`): about 4,600 calls; **78 %**.
+
+The draws are under the 70 % bar, so stage 4 as designed (a shared-lock path for draws) is not worth building. A narrower version for `mirror_tried` alone stays possible.
+
+**Stage 5 measured (prologue, `VICTORY_TABLES_LEFT=1`).** `VICTORY_HEAP_SYNC_NEED=alt`: paired median **-0.02 fps over 6 ON phases**, frame time +0.2 ms. Dropped.
+
+**`TABLES_LEFT=1` without alternation (prologue).** These runs kept `VICTORY_TABLES_LEFT=1` in both phases, and the prologue settled at **9.6-10.4 fps**. The same scene gave 7.2-7.4 without the switch (R2, C2), and 7.3-8.4 under `=alt` (S3a), where every flip clears the holds. A same-exe pair without `=alt` is next, to confirm it.
+
+**Picture fixes from Cuebert b98ac3d1c: not merged.** Five switches were ported on a side branch (`fx-main-cuepic` 7946ad6e1): `HELPER_OWN` (upstream #908), `BAKE_EXACT`, `COPY_OVER_TITLE`, `TEXTURE_AWAY_MS` and `RECHECK_SOON`.
+
+- With all five on, the passenger's printed shirt was a mosaic again in 2 of 2 boat runs. The same exe without them gave a clean shirt (stale samples 36-60 differing against 60-96 with them).
+- On the prologue they cost nothing (7.36 fps against 7.16), and the refused programs were unchanged.
+- Which switch causes the mosaic is not known. The 1080p-to-1440p part of that commit patches the title's code in memory, which this project does not do.
+
 **Stage 2 measured (2026-11-28 morning, RT on, full recommended set).** `VICTORY_TABLES_LEFT`:
 
 | Scene | Mode | Result |
@@ -1763,7 +1798,7 @@ Stage 1's line gives both shares, in the off phases.
 - **The grace** (opt-in): shaders that pick a constant or placed buffer by index see it 4 frames late.
 - **Not measured in the game.** Unit tests only so far.
 
-### Stage 3: preparation on lanes, `VICTORY_SUBMIT_LANES` (`fx-main-lanes`; opt-in, not measured in the game yet)
+### Stage 3: preparation on lanes, `VICTORY_SUBMIT_LANES` (`fx-main-lanes`; opt-in, measured 2026-11-28, see the stage 3 table above)
 
 The revised plan's stage 3 (`xcl-notes\fable-2026-11-28-wall2.md`, section 3). The old stage 3, `HEAP_SYNC_NOTHING`, is dropped: the join it aimed at is 11.6 ms in all after stage 2.
 
