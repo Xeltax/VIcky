@@ -130,6 +130,8 @@ fn translation(cache: Option<&Cache>, container: &[u8], ran: &AtomicBool) -> Res
                     .then(emit::wave_pairs_settings);
                 let flags = emit::lds_flags_allowed(Some(&hash)) && emit::wave64_program(container);
                 let key = program_key(&build(), off, opt_off(&hash), copies, pairs, flags, paired.as_deref(), &dropped);
+                // (one program's: `emit::water_tile_slots_here` parses the container, so last)
+                let key = if emit::water_tile_slots_here(container) { water_slots_key(&key) } else { key };
                 cached(cache, &key, container, translate)
             }
             None => translate(container),
@@ -194,6 +196,20 @@ fn attempts<T>(
 /// So the lists are in no key: changing one translates again only the
 /// programs whose decision it changes, and a program the lists leave alone
 /// keeps the key it had without any list.
+///
+/// One more decision is mixed in by [`water_slots_key`], for the one program
+/// it can change.
+/// The key of the water light's tile-list program when it is rewritten to take a slot a lane
+/// (`VICTORY_WATER_TILE_SLOTS=1` on a host of 32-lane waves:
+/// `victory_shader::emit::water_tile_slots_here`): `key` mixed with that decision. Turning
+/// the switch on or off translates that program alone again.
+fn water_slots_key(key: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(key);
+    h.update(b"VICTORY_WATER_TILE_SLOTS on for this program");
+    *h.finalize().as_bytes()
+}
+
 #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)] // one per switch, each mixed in on its own
 fn program_key(
     build: &[u8; 32],
@@ -582,6 +598,17 @@ mod tests {
             cached(&cache, &program_key(&build, false, false, false, false, false, None, &[]), c, translate).unwrap();
         }
         assert_eq!(runs.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn the_rewritten_water_tile_program_has_a_key_of_its_own() {
+        let build = [7u8; 32];
+        let key = program_key(&build, false, false, false, false, false, None, &[]);
+        assert_ne!(water_slots_key(&key), key);
+        assert_eq!(water_slots_key(&key), water_slots_key(&key), "the same decision, the same key");
+        assert_ne!(water_slots_key(&[8; 32]), water_slots_key(&key), "and still the build's");
+        // Off by default: no container is named, so every key is as before.
+        assert!(!victory_shader::emit::water_tile_slots_here(b"program a"));
     }
 
     #[test]

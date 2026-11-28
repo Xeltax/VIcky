@@ -112,6 +112,7 @@ mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
+mod water_tile_slots;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -126,6 +127,7 @@ pub use per_program::{
     wave_pairs_settings, with_mask_copies,
 };
 pub(crate) use per_program::{current as program_hash, mask_copies_here, site_pairs_here, store_dropped_here};
+pub use water_tile_slots::water_tile_slots_here;
 #[cfg(test)]
 pub(crate) use per_program::{TEST_MASK_COPIES, TEST_SITE_PAIRS};
 pub use rect::rect_list_gs;
@@ -389,9 +391,24 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     }
 }
 
+/// Brings a console program into the form this host translates, where one differs from the
+/// program as the title has it: on a host of 32-lane waves, with `VICTORY_WATER_TILE_SLOTS=1`,
+/// the water light's tile lists take a slot a lane ([`water_tile_slots`], fxceless cd9355206).
+/// [`translate`] does this itself; a caller that parses the container and calls [`emit`] calls
+/// this first. Returns whether the program changed.
+pub fn host_form(c: &Container, native: &mut NativeProgram) -> bool {
+    lower::host_max_wave() == 32
+        && c.digest == water_tile_slots::CONTAINER
+        && water_tile_slots::on()
+        && water_tile_slots::rewrite(native)
+}
+
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let native = main_program(&c)?;
+    let mut native = main_program(&c)?;
+    // The water light's tile lists on a host of 32-lane waves, when asked for: a slot a lane
+    // ([`water_tile_slots`]), so no tile is lost between the two host waves of a group.
+    host_form(&c, &mut native);
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
