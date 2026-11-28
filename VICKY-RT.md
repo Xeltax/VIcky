@@ -123,6 +123,17 @@ This work is for making the title's compute ray tracing (the BVH structure build
 
 **Chapter-1 boat mission with ray tracing (2026-11-27, verified on an RTX 4080, Series X, RT on):** with this main, a save in the boat mission loads, the boat floats and the mission plays, with no extra switch: the texture copy-back (`VICTORY_TEXTURE_BACK`, on by default) gives the title's physics the water it computes on the card, and the builder's box rehydration programs' parent-link stores are left out by default (`VICTORY_BVH_LINK_STORES=keep` keeps them; with them the title crashed on that save's loading screen). Add `VICTORY_LATE_WAIT=2` in water scenes (at the relay's default stage 3 testers elsewhere saw the water surface vanish for single frames); `VICTORY_LATE_WATER=1` at stage 3 is the narrower wait to try instead, not measured yet (water section below). Measured: 480 s on that save, RT on, the fps set below plus `VICTORY_LATE_WAIT=2 VICTORY_REAPER=1`: no crash, 7.34 fps true mean of the last 12 lines (lines 7.8-8.5, about 122-127 ms a frame: preparing ~68, copy-back ~23-27, a wait for the card of ~17 ms that is the copy-back's read-back). The prologue cell with the same build: 5.32 fps true (a slow stretch mid-run; last lines 6.3-7.5), about level with 6.91 before the batch. `VICTORY_INPLACE_CONSTANTS` does not place the constants heap here ("view memory from several places") even without `VICTORY_FENCE_SENT`/`VICTORY_SECTION_MB`: leave it off, or try it with `VICTORY_PAGE_PLACE=1` and without `VICTORY_FENCE_SENT` (roadmap B2, section "Physical pages placed at their first mapping").
 
+**Stage 1b measured (2026-11-28 morning, RT on, full recommended set).** `VICTORY_TABLE_BOUND=alt` with `VICTORY_TABLE_BOUND_FRESH` (on by default), paired medians:
+
+| Scene | Paired median | Stage 1 without FRESH |
+|---|---|---|
+| boat mission | +0.17 fps over 8 phases | +1.66 |
+| prologue cell | +0.39 fps over 4 phases | +1.18 |
+
+With FRESH the picture stays clean: the boat's stale samples are 35-57 differing, 5-12 out of the queue, the level of the recommended texture set, and the printed shirt is clean in ON phases.
+
+So most of stage 1's speed came from no longer refreshing table-spanned texture slots, which is what left them stale. `TABLE_BOUND` (with FRESH) stays optional, a small clean gain. The structural gain has to come from stage 2: buffer slots left to the draws, with a hold that keeps their copies.
+
 **Structural stage 1 measured (2026-11-28 morning, RT on, full recommended set).** `VICTORY_TABLE_BOUND=alt`, paired medians:
 
 | Scene | Paired median | Frame time ON vs off | ON phases above their off neighbours | Run mean |
