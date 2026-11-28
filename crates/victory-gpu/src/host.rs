@@ -9707,8 +9707,8 @@ impl Meter {
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB; {reaper}{texback}{water}{awake}), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
-                 textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+                 textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB){recheck}, \
+                 {picked_waiting} waiting, {picked_away} passed over unmapped{interior}; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
                 reaper = crate::reaper::summary(frames),
                 texback = crate::texback::summary(frames),
                 water = late_water::summary(frames),
@@ -9717,6 +9717,8 @@ impl Meter {
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
                 picked_away = crate::draw::HEAP_TEXTURES_AWAY.load(Ordering::Relaxed),
+                interior = crate::texture::interior_summary(),
+                recheck = crate::draw::recheck_every_summary(),
                 du0 = crate::resource::DEPTH_UNORDERED[0].load(Ordering::Relaxed),
                 du1 = crate::resource::DEPTH_UNORDERED[1].load(Ordering::Relaxed),
                 du2 = crate::resource::DEPTH_UNORDERED[2].load(Ordering::Relaxed),

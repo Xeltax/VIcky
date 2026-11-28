@@ -131,7 +131,7 @@ pub(crate) fn current() -> Option<String> {
 /// decision into its own key) and so left out of the translator's
 /// fingerprint ([`super::translation_fingerprint`]): a new list translates
 /// again only the programs whose decision it changes.
-pub(super) const PER_PROGRAM_SWITCHES: [&str; 12] = [
+pub(super) const PER_PROGRAM_SWITCHES: [&str; 13] = [
     "VICTORY_WAVE_DEEP_SKIPS_NOT",
     "VICTORY_WAVE_DEEP_SKIPS_ONLY",
     "VICTORY_SHADER_OPT_NOT",
@@ -144,6 +144,8 @@ pub(super) const PER_PROGRAM_SWITCHES: [&str; 12] = [
     "VICTORY_WAVE_PAIRS_FP32",
     "VICTORY_LDS_INIT_HOIST",
     "VICTORY_LDS_FLAGS",
+    // (one program's: `water_tile_slots`, in that program's key as `program_key`'s `water_slots`)
+    "VICTORY_WATER_TILE_SLOTS",
 ];
 
 /// Whether the program whose hash is `hash` (`None`: not known) takes LDS flag regions as two
