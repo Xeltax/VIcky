@@ -378,8 +378,90 @@ fn no_wait() -> bool {
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
 /// through the kernel because title memory was being remapped, and those
-/// left for the next refresh because a page was not there.
-pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// left for the next refresh because a page was not there; and with
+/// [`no_wait_fallback`], of the latter the ones read around the missing
+/// pages instead (counted with the former too).
+pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// VIcky (`VICTORY_NO_WAIT_FALLBACK=1`; off by default, as before): what a
+/// refresh that did not wait ([`no_wait`]) does when a page of the texture
+/// is not there.
+///
+/// Before, nothing was taken: the staging buffer kept what it held, and
+/// the list had recorded its copy already, so a texture that had never been
+/// filled went to the card as zeros. A texture picked by index has no
+/// staging buffer after the pass records its upload (`unstage`), so "read at
+/// its next refresh" never came: the slot waited for more of its memory to
+/// be mapped (uploaded in part) or was looked at again against a memory
+/// fingerprint that had not changed (whole), and stayed black. Every run
+/// with `VICTORY_TEXTURE_NO_WAIT=1` left 200-500 refreshes a frame so.
+///
+/// With the switch: a staging buffer never filled is read around the
+/// missing pages (zeros there) and detiled (port of 83a5593b66, fork PR
+/// #1392), and after any such read that failed, read around or found
+/// nothing, the slots of placed textures in that memory are due again at
+/// the next pass (`crate::descriptor::host::remapped`), which uploads them
+/// anew once the page is back.
+pub(crate) fn no_wait_fallback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NO_WAIT_FALLBACK").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "a texture refresh that did not wait and found a page missing reads around it when the texture was never filled, \
+                 and makes its slots due again (VICTORY_NO_WAIT_FALLBACK=1; counts on the 'did not wait' line and the \
+                 VICTORY_NO_WAIT_FALLBACK line)"
+            );
+        }
+        on
+    })
+}
+
+/// What a refresh that did not wait got ([`unlocked_read`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unlocked {
+    /// All of the texture read (detiled if it changed).
+    Read,
+    /// A page was missing; the staging buffer, never filled, was filled
+    /// from what is there ([`no_wait_fallback`]).
+    FellBack,
+    /// A page was missing: nothing taken.
+    Failed,
+    /// A page was missing, and what is there is all zeros: nothing taken.
+    Nothing,
+}
+
+/// The read of [`Staging::refresh_unlocked`], apart for testing: `size`
+/// bytes of title memory at `memory`, through the kernel; `detile` takes
+/// them if they changed since `last`. With `fallback`, a staging buffer
+/// never filled (`last.hash` none) is filled from the mapped pages when a
+/// page is missing (port of 83a5593b66, fork PR #1392, there on by default).
+fn unlocked_read(memory: *const u8, last: &mut Last, size: usize, fallback: bool, detile: impl FnOnce(&[u8])) -> Unlocked {
+    with_read(size, |read| {
+        if crate::host::read_into(memory, read) {
+            let hash = blake3::hash(read);
+            if last.hash != Some(hash) {
+                last.hash = Some(hash);
+                detile(read);
+            }
+            return Unlocked::Read;
+        }
+        if !fallback || last.hash.is_some() {
+            return Unlocked::Failed;
+        }
+        // A partly mapped streamed texture would otherwise stay all zeros
+        // when `no_wait` misses the remap lock: its mapped pages are read
+        // around the missing ones instead.
+        crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
+        if read.iter().all(|&b| b == 0) {
+            return Unlocked::Nothing;
+        }
+        last.hash = Some(blake3::hash(read));
+        last.partial = Some(crate::frame::current());
+        detile(read);
+        Unlocked::FellBack
+    })
+}
 
 /// Since the last frame-rate line, of texture refreshes on every thread, in
 /// microseconds: waiting for the texture's own lock (another thread is
@@ -1122,28 +1204,39 @@ impl Staging {
     /// the texture is read through the kernel, which fails if a page of it
     /// is not there at this moment. Then nothing is taken and the texture
     /// is looked at again at its next refresh (what was learnt about writes
-    /// to it is forgotten, so that it is not passed over as unwritten).
-    /// Returns the bytes read.
+    /// to it is forgotten, so that it is not passed over as unwritten);
+    /// with [`no_wait_fallback`] see there. Returns the bytes read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
-        let read = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
-                return false;
+        let fallback = no_wait_fallback();
+        let got = unlocked_read(self.memory, last, size, fallback, |bytes| self.detile(bytes));
+        if fallback && got != Unlocked::Read {
+            let what = match got {
+                Unlocked::FellBack => 1,
+                Unlocked::Nothing => 2,
+                _ => 0,
+            };
+            crate::texstale::FALLBACK[what].fetch_add(1, Relaxed);
+            // Read again once the page is back: a texture picked by index
+            // has no staging buffer for a next refresh.
+            crate::texstale::FALLBACK[3].fetch_add(1, Relaxed);
+            crate::descriptor::host::remapped(self.memory as usize, size);
+        }
+        match got {
+            Unlocked::Read => {
+                UNLOCKED[0].fetch_add(1, Relaxed);
+                size
             }
-            let hash = blake3::hash(read);
-            if last.hash != Some(hash) {
-                last.hash = Some(hash);
-                self.detile(read);
+            Unlocked::FellBack => {
+                UNLOCKED[0].fetch_add(1, Relaxed);
+                UNLOCKED[2].fetch_add(1, Relaxed);
+                size
             }
-            true
-        });
-        if read {
-            UNLOCKED[0].fetch_add(1, Relaxed);
-            size
-        } else {
-            UNLOCKED[1].fetch_add(1, Relaxed);
-            last.asked = 0;
-            0
+            Unlocked::Failed | Unlocked::Nothing => {
+                UNLOCKED[1].fetch_add(1, Relaxed);
+                last.asked = 0;
+                0
+            }
         }
     }
 
@@ -1207,27 +1300,88 @@ pub(crate) fn unstage(resource: This) {
     }
 }
 
-/// Where a staged title texture's memory is: address and bytes.
-pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
+/// Where a staged title texture's memory is ([`staged_memory`]).
+pub(crate) struct StagedMemory {
+    /// Address and bytes.
+    pub(crate) at: u64,
+    pub(crate) len: u64,
+    /// The ranges of it (offsets from the address, bytes) that
+    /// [`fingerprint`] reads besides its three windows: the start of every
+    /// mip of every slice ([`victory_formats::texture::Layout::sample_ranges`]).
+    pub(crate) mips: Option<crate::descriptor::host::Mips>,
+    /// Each mip's whole range (offsets, bytes), for `crate::texstale`'s
+    /// sampled look; empty unless asked for.
+    pub(crate) spans: Vec<(u64, u64)>,
+}
+
+/// Where a staged title texture's memory is ([`StagedMemory`]). `mips`
+/// with [`recheck_mips`] or `every_mip` (`VICTORY_RECHECK_PARTLY`, whose
+/// textures miss their large mips, which the three windows alone never
+/// see); none otherwise: the three windows alone, as before. `spans` if
+/// asked for (`VICTORY_STALE_SLOTS`).
+pub(crate) fn staged_memory(resource: This, every_mip: bool, spans: bool) -> Option<StagedMemory> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
-    Some((at as u64, len as u64))
+    let staging = map.as_ref()?.get(&(resource as usize))?;
+    let (at, len) = staging.memory();
+    let mips = (every_mip || recheck_mips()).then(|| staging.layout.sample_ranges(MIP_WINDOW, MIP_RANGES).into());
+    let spans = if spans { staging.layout.mip_ranges(MIP_RANGES) } else { Vec::new() };
+    Some(StagedMemory { at: at as u64, len: len as u64, mips, spans })
+}
+
+/// Bytes [`fingerprint`] reads at the start of each mip, and the most mips
+/// it reads of one texture (spread over its slices and mips when it has
+/// more). A 4096-square texture with all its mips: 10 reads, 12 KiB; a cube
+/// map with 10 mips: 40 reads, 52 KiB (262625e33).
+const MIP_WINDOW: u64 = 1 << 10;
+const MIP_RANGES: usize = 64;
+
+/// VIcky: whether [`fingerprint`] also reads the start of every mip of every
+/// slice for the looks at textures picked by index after their whole upload
+/// (`VICTORY_HEAP_RECHECK_MIPS=1`; off by default: the three windows alone,
+/// as before). Port of 262625e33 (fork PR #559), there on by default. The
+/// three windows of 16 KiB at the start, the middle and the end see the
+/// smallest mips and mip 0 of a plain texture, and two slices of an array
+/// or a cube map: a mip 1 to 3 that streamed in alone after the upload
+/// changed none of them, and the host copy kept what was there before
+/// (VICKY-RT.md, "Streamed texture staleness"). Use with
+/// `VICTORY_HEAP_RECHECK_EVERY`, or the looks end 576 frames after the
+/// upload.
+pub(crate) fn recheck_mips() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_HEAP_RECHECK_MIPS").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "the looks at textures picked by index after their upload read the start of every mip of every slice too, \
+                 at most {MIP_RANGES} of {MIP_WINDOW} bytes (VICTORY_HEAP_RECHECK_MIPS=1)"
+            );
+        }
+        on
+    })
 }
 
 /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
-/// it up to 48 KiB, else of 16 KiB at its start, its middle and its end
-/// (a texture streams in whole mips; the small ones lie first). Read
-/// through the kernel, so pages not there count as zeros.
-pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
+/// it up to 48 KiB, else of 16 KiB at its start, its middle and its end,
+/// and of the ranges `mips` (offsets from `at`, bytes; see
+/// [`staged_memory`]). A texture streams in whole mips, and the three
+/// windows alone see only the smallest mips and mip 0 of a plain texture,
+/// and only two slices of an array or cube map: a mip or slice that
+/// arrived after the upload elsewhere was not seen. Read through the
+/// kernel, so pages not there count as zeros. (The ranges: port of
+/// 262625e33, fork PR #559.)
+pub(crate) fn fingerprint(at: u64, len: u64, mips: &[(u64, u64)]) -> u64 {
     const WINDOW: usize = 16 << 10;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
+    let started = std::time::Instant::now();
     let len = len as usize;
     let mut hasher = blake3::Hasher::new();
+    let mut ranges = 0u64;
     READ.with(|read| {
         let mut read = read.borrow_mut();
-        read.resize(3 * WINDOW, 0);
+        let longest = mips.iter().map(|&(_, n)| n as usize).max().unwrap_or(0);
+        read.resize((3 * WINDOW).max(longest), 0);
         let mut take = |from: usize, bytes: usize| {
             read[..bytes].fill(0);
             crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
@@ -1239,8 +1393,16 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
             take(0, WINDOW);
             take((len / 2) & !0xfff, WINDOW);
             take(len - WINDOW, WINDOW);
+            for &(from, bytes) in mips {
+                let from = from as usize;
+                if from < len {
+                    take(from, (bytes as usize).min(len - from));
+                    ranges += 1;
+                }
+            }
         }
     });
+    crate::texstale::printed(ranges, started.elapsed().as_micros() as u64);
     let hash = hasher.finalize();
     let mut first = [0u8; 8];
     first.copy_from_slice(&hash.as_bytes()[..8]);
@@ -1775,6 +1937,79 @@ mod title_memory_tests {
             });
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
+    }
+
+    /// `VICTORY_NO_WAIT_FALLBACK` (after 83a5593b66's test): when the read
+    /// through the kernel fails on a missing page, a staging buffer never
+    /// filled is filled from the mapped pages (zeros for the rest) with the
+    /// switch, and nothing is taken without it, as before; once filled, a
+    /// failed read takes nothing either way; memory all zeros where it is
+    /// mapped takes nothing; all of it mapped is read whole.
+    #[test]
+    fn no_wait_falls_back_for_a_never_filled_partly_mapped_texture_with_the_switch() {
+        use super::{Last, Unlocked, unlocked_read};
+        use windows_sys::Win32::System::Memory::*;
+        const MAPPED: usize = 0x1000;
+        const SIZE: usize = 0x4000;
+        // SAFETY: a private reservation of our own; the committed head is
+        // written in place, the uncommitted tail makes the kernel's read fail.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), MAPPED, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            // Mapped but all zeros: nothing to take.
+            let mut last = Last::default();
+            assert_eq!(unlocked_read(base, &mut last, SIZE, true, |_| panic!("zeros detiled")), Unlocked::Nothing);
+            assert!(last.hash.is_none());
+            base.write_bytes(0x3c, MAPPED);
+            // Without the switch: nothing taken, as before.
+            let mut last = Last { asked: 7, ..Default::default() };
+            assert_eq!(unlocked_read(base, &mut last, SIZE, false, |_| panic!("detiled without the switch")), Unlocked::Failed);
+            assert!(last.hash.is_none());
+            // With it: filled from the mapped page.
+            let mut detiled = Vec::new();
+            assert_eq!(unlocked_read(base, &mut last, SIZE, true, |b| detiled = b.to_vec()), Unlocked::FellBack);
+            assert!(last.hash.is_some() && last.partial.is_some());
+            assert_eq!(detiled.len(), SIZE);
+            assert!(detiled[..MAPPED].iter().all(|&b| b == 0x3c));
+            assert!(detiled[MAPPED..].iter().all(|&b| b == 0));
+            // Filled: a failed read does not overwrite it.
+            assert_eq!(unlocked_read(base, &mut last, SIZE, true, |_| panic!("detiled again")), Unlocked::Failed);
+            // All of it there now, with other bytes: read whole and detiled.
+            assert_eq!(VirtualAlloc(base.cast(), SIZE, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            base.add(MAPPED).write_bytes(0x11, SIZE - MAPPED);
+            let mut whole = false;
+            assert_eq!(unlocked_read(base, &mut last, SIZE, true, |_| whole = true), Unlocked::Read);
+            assert!(whole);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// `VICTORY_HEAP_RECHECK_MIPS` (port of 262625e33): a change at the
+    /// start of a mip that none of the three windows covers changes the
+    /// fingerprint only when the mip ranges are read; memory of 48 KiB or
+    /// less is read whole either way.
+    #[test]
+    fn the_fingerprint_sees_a_mip_between_its_windows_only_with_the_ranges() {
+        use super::fingerprint;
+        const SIZE: usize = 0x10_0000;
+        let mut memory = vec![0x21u8; SIZE];
+        // A mip at 256 KiB: not in the first, the middle (512 KiB) or the
+        // last 16 KiB.
+        let mips = [(0x4_0000u64, 1024u64)];
+        let at = memory.as_ptr() as u64;
+        let (plain, ranged) = (fingerprint(at, SIZE as u64, &[]), fingerprint(at, SIZE as u64, &mips));
+        assert!(plain != 0 && ranged != 0 && plain != ranged);
+        memory[0x4_0000 + 10] = 0x99;
+        let at = memory.as_ptr() as u64;
+        assert_eq!(fingerprint(at, SIZE as u64, &[]), plain, "the windows do not see it");
+        assert_ne!(fingerprint(at, SIZE as u64, &mips), ranged, "the mip's range does");
+        // 48 KiB or less: all of it, the ranges add nothing.
+        let mut small = vec![0u8; 0xc000];
+        let before = fingerprint(small.as_ptr() as u64, 0xc000, &[]);
+        assert_eq!(fingerprint(small.as_ptr() as u64, 0xc000, &[(0x8000, 1024)]), before);
+        small[0x8100] = 1;
+        assert_ne!(fingerprint(small.as_ptr() as u64, 0xc000, &[]), before);
     }
 
     /// The texture both device-loss runs named last (16 texels wide, 4 or 8

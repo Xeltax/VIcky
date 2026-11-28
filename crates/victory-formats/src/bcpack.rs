@@ -100,6 +100,28 @@ pub struct Tables {
     bc5: Vec<Plain>,
     bc6: Vec<(Bc6Ep, Bc6Ix)>,
     bc7: Vec<(Bc7Ep, Bc7Ix)>,
+    /// VIcky (`VICTORY_BCPACK_FIXES=1`, [`Tables::parse_with`]): the three
+    /// decoder fixes of other trees, off by default (the decoder as before):
+    /// the first BC7 dictionary entry keeps all 32 of its indices (after
+    /// cd4402f405, fork PR #374); a lane that has delivered its last symbol
+    /// and its payload starts no header, leaving the bytes after it to its
+    /// peers (after Marvisak PR #2648, fbf875e073); a refill that a
+    /// fragment's last byte leaves below 2^24 is kept across the fragment's
+    /// end and drained for one step (after Marvisak PR #2649, 422797364e).
+    fixes: bool,
+}
+
+/// VIcky: since the start, with [`Tables`] made with the fixes on: streams
+/// decoded; lanes that had delivered their last symbol and would have taken
+/// a byte meant for a peer (Marvisak PR #2648); refills kept across a
+/// fragment's end that the decoder before dropped (PR #2649); BC7 blocks
+/// whose indices build on the first dictionary entry (cd4402f405).
+pub static FIX_COUNTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn fix_count(what: usize, n: u64) {
+    if n != 0 {
+        FIX_COUNTS[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -121,7 +143,23 @@ impl Reader<'_> {
 impl Tables {
     /// The tables VIctory ships with.
     pub fn builtin() -> Result<Tables, Error> {
-        Tables::parse(include_bytes!("bcpack-tables.bin"))
+        Tables::builtin_with(false)
+    }
+
+    /// [`Tables::builtin`], with the decoder fixes ([`Tables::parse_with`])
+    /// if `fixes`.
+    pub fn builtin_with(fixes: bool) -> Result<Tables, Error> {
+        Tables::parse_with(include_bytes!("bcpack-tables.bin"), fixes)
+    }
+
+    /// [`Tables::parse_with`] without the fixes: the decoder as before.
+    pub fn parse(bytes: &[u8]) -> Result<Tables, Error> {
+        Tables::parse_with(bytes, false)
+    }
+
+    /// Whether these tables decode with the fixes ([`Tables::parse_with`]).
+    pub fn fixes(&self) -> bool {
+        self.fixes
     }
 
     /// Reads the table file: 128 x 9 u16 model frequencies (per bucket, the
@@ -129,9 +167,15 @@ impl Tables {
     /// alpha 64 B and colour 256 B, BC4 64 B, BC5 64 B), 512 u16 BC7 control
     /// words, then 255 dictionary entries per format in format order: BC1
     /// 6 + 16 B, BC3 8 + 32 B, BC4 2 + 16 B, BC5 4 + 32 B, BC6H (u8 mode,
-    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, 2 u8, 2 B,
-    /// 16 + 15 i16). Little-endian, no padding. Every model must tile 65536.
-    pub fn parse(bytes: &[u8]) -> Result<Tables, Error> {
+    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, 2 u8, then 32
+    /// i16 in the first entry, the 2 u8 again and 16 + 15 i16 in the
+    /// others). Little-endian, no padding. Every model must tile 65536.
+    ///
+    /// Without `fixes` the first BC7 entry is read as the others are (its
+    /// first index taken for the widths again, the rest one place early),
+    /// and the decoder keeps its lane schedule and refill as before; with
+    /// `fixes`, the three fixes of [`Tables`]' `fixes` field.
+    pub fn parse_with(bytes: &[u8], fixes: bool) -> Result<Tables, Error> {
         if bytes.len() != TABLES_SIZE {
             return Err(Error("table file has the wrong size"));
         }
@@ -210,7 +254,7 @@ impl Tables {
             })
             .collect();
         let bc7 = (0..DICTIONARY)
-            .map(|_| {
+            .map(|entry| {
                 let mut ep = Bc7Ep {
                     ctrl: r.u16(),
                     ..Default::default()
@@ -222,10 +266,17 @@ impl Tables {
                     bits: [r.u8(), r.u8()],
                     ..Default::default()
                 };
-                // Unused: the widths again in all entries but the first.
-                r.u16();
-                // Only 15 slots for set 1, which no entry uses (0 bits).
-                for v in &mut ix.ix.as_flattened_mut()[..31] {
+                // The first entry's 32 indices follow its widths; the others
+                // repeat the widths first (unused), leaving 15 slots for set
+                // 1, which none of them uses (0 bits). Without the fixes the
+                // first entry skips two bytes too, as before (cd4402f405).
+                let slots = if fixes && entry == 0 {
+                    32
+                } else {
+                    r.u16();
+                    31
+                };
+                for v in &mut ix.ix.as_flattened_mut()[..slots] {
                     *v = r.u16() as i16;
                 }
                 (ep, ix)
@@ -248,6 +299,7 @@ impl Tables {
             bc5,
             bc6,
             bc7,
+            fixes,
         })
     }
 }
@@ -276,6 +328,9 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
     let stride = widths.len() * per;
     let mut records = vec![0u8; blocks * stride];
     let mut next = src.iter().copied();
+    if tables.fixes {
+        fix_count(0, 1);
+    }
     lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
     let records = records.chunks_exact(stride);
     let out = dst.chunks_exact_mut(block);
@@ -344,9 +399,8 @@ impl Lane {
             return Ok(());
         }
         let mut x = self.x;
-        if x < LOW
-            && let Some(b) = self.latch.take()
-        {
+        let refill = if x < LOW { self.latch.take() } else { None };
+        if let Some(b) = refill {
             self.left = self.left.wrapping_sub(1);
             x = x << 8 | u32::from(b);
         }
@@ -374,12 +428,22 @@ impl Lane {
             // At exactly 2^24 the lane neither reads nor decodes again; only a
             // lane that has delivered its symbols may end up there.
             self.x = x;
+        } else if t.fixes && refill.is_some() && x < LOW {
+            // With the fixes (Marvisak PR #2649): a final byte that still
+            // leaves x below 2^24 goes through the drain phase for one step
+            // before this lane asks for a header; the refill is kept.
+            fix_count(2, 1);
+            self.x = x;
         } else {
-            // The fragment ends; a byte read in this step does not reach the carried state.
+            // The fragment ends. Before the fixes a byte read in this step
+            // does not reach the carried state; with them it does (PR #2649).
             self.phase = 0;
             self.need = self.latch.is_none();
             if self.reset {
                 self.x = 0;
+            } else if t.fixes && self.x != x {
+                fix_count(2, 1);
+                self.x = x;
             }
         }
         Ok(())
@@ -425,13 +489,26 @@ fn lanes(
     let (mut pos, mut done, mut idle) = (0, 0u32, 0);
     // Where symbol `pos` of lane 0 goes; lane j's is `per * j` further on.
     let mut at = 0;
-    while pos < blocks * per {
+    let symbols = blocks * per;
+    // With the fixes: the lanes that had finished and would have asked for
+    // a byte meant for a peer (each counted once per decode).
+    let mut kept = 0u32;
+    while pos < symbols {
         let (mut taken, mut moved) = (0, false);
         for (j, lane) in lanes.iter_mut().enumerate() {
             let bit = 1 << j;
             let before = taken;
             if !lane.stalled {
                 lane.step(t)?;
+            }
+            // With the fixes (Marvisak PR #2648): a lane may still need the
+            // tail of its current payload after its last symbol. Once both
+            // are exhausted it cannot start a header.
+            if t.fixes && pos + 1 == symbols && done & bit != 0 && lane.left == 0 {
+                if lane.need && taken < ROUND_BYTES {
+                    kept |= bit;
+                }
+                continue;
             }
             let waiting = lane.out.is_some() && done & bit != 0;
             if lane.need && !waiting && taken < ROUND_BYTES {
@@ -466,6 +543,7 @@ fn lanes(
             return Err(Error("the stream ends early or is corrupt"));
         }
     }
+    fix_count(1, u64::from(kept.count_ones()));
     Ok(())
 }
 
@@ -773,8 +851,13 @@ fn bc7<'a>(
 ) -> Result<(), Error> {
     let mut history = vec![(Bc7Ep::default(), Bc7Ix::default()); HISTORY];
     let zero = (Bc7Ep::default(), Bc7Ix::default());
+    // With the fixes: blocks whose indices build on dictionary entry 0.
+    let mut first_entry = 0u64;
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, true);
+        if t.fixes && ix_ref == i + 1 {
+            first_entry += 1;
+        }
         let ctrl = t.ctrl7[usize::from(s[31] & 15) << 5 | usize::from(s[30] & 31)];
         if ctrl == 0 {
             return Err(Error("unused BC7 control code"));
@@ -853,6 +936,7 @@ fn bc7<'a>(
         history[i % HISTORY] = (ep, ix);
         bc7_pack(&ep, &ix, prec, block);
     }
+    fix_count(3, first_entry);
     Ok(())
 }
 
@@ -1240,6 +1324,13 @@ mod tests {
     /// that has finished still asks: a filler fragment (two payload bytes)
     /// brings its state to 2^24 with a byte latched, which parks it for good.
     fn stream(t: &Tables, widths: &[u8], per: usize, records: &[Vec<u8>]) -> Vec<u8> {
+        stream_with(t, widths, per, records, true)
+    }
+
+    /// [`stream`], with the filler fragments only if `filler`: without them
+    /// the stream ends with the lanes' last bytes, which only the decoder
+    /// with the fixes (Marvisak PR #2648) reads without asking past them.
+    fn stream_with(t: &Tables, widths: &[u8], per: usize, records: &[Vec<u8>], filler: bool) -> Vec<u8> {
         let stride = widths.len() * per;
         let mut queues: Vec<std::collections::VecDeque<u8>> = (0..widths.len())
             .map(|j| {
@@ -1248,7 +1339,9 @@ mod tests {
                     .flat_map(|r| r[j * per..j * per + per].to_vec())
                     .collect();
                 let mut bytes = fragment(widths[j], &syms);
-                bytes.extend([0, 1, 0, 0]);
+                if filler {
+                    bytes.extend([0, 1, 0, 0]);
+                }
                 bytes.into()
             })
             .collect();
@@ -1257,7 +1350,7 @@ mod tests {
         let fetch = |j: usize| {
             let b = queues[j]
                 .pop_front()
-                .expect("a parked lane asked for input");
+                .expect("a lane read past its fragment");
             out.push(b);
             Some(b)
         };
@@ -1703,11 +1796,141 @@ mod tests {
     /// 0 index bits holds no indices, and pixel 0 is the anchor (top bit clear).
     #[test]
     fn bc7_dictionary_indices_line_up() {
-        let t = Tables::builtin().unwrap();
-        for (k, (_, ix)) in t.bc7.iter().enumerate() {
-            let anchor = 0..1 << (ix.bits[0] - 1);
-            let ok = (ix.bits[1] != 0 || ix.ix[1] == [0; 16]) && anchor.contains(&ix.ix[0][0]);
-            assert!(ok, "entry {k}: {:?}", ix.ix);
+        for t in [Tables::builtin().unwrap(), Tables::builtin_with(true).unwrap()] {
+            for (k, (_, ix)) in t.bc7.iter().enumerate() {
+                let anchor = 0..1 << (ix.bits[0] - 1);
+                let ok = (ix.bits[1] != 0 || ix.ix[1] == [0; 16]) && anchor.contains(&ix.ix[0][0]);
+                assert!(ok, "entry {k}: {:?}", ix.ix);
+            }
         }
+    }
+
+    // VIcky: `VICTORY_BCPACK_FIXES=1` (`Tables::parse_with`).
+
+    /// After cd4402f405 (fork PR #374): the first BC7 dictionary entry has
+    /// no repeated widths. With the fixes its indices start at once (2, 1,
+    /// 0, ...); without them two bytes are skipped there as before, which
+    /// lost the 2 and moved the rest one place early. Every other entry
+    /// reads the same either way.
+    #[test]
+    fn the_first_bc7_dictionary_entry_keeps_its_first_index_with_the_fixes() {
+        let fixed = Tables::builtin_with(true).unwrap();
+        let before = Tables::builtin().unwrap();
+        assert!(fixed.fixes() && !before.fixes());
+        let (ep, ix) = &fixed.bc7[0];
+        assert_eq!((ep.ctrl, ix.bits), (0, [4, 0]));
+        assert_eq!(ix.ix[0][..3], [2, 1, 0]);
+        assert_eq!(before.bc7[0].1.ix[0][..15], fixed.bc7[0].1.ix[0][1..16]);
+        for k in 1..DICTIONARY {
+            assert_eq!(before.bc7[k].1.ix, fixed.bc7[k].1.ix, "entry {k}");
+            assert_eq!(before.bc7[k].0.rows, fixed.bc7[k].0.rows, "entry {k}");
+        }
+    }
+
+    /// After Marvisak PR #2648 (fbf875e073): one zero symbol per BC4 lane,
+    /// with the uniform 6-bit alphabet. Symbol 0 has frequency 1023 and
+    /// starts at 1; inverting the rANS step from 2^24 gives the four
+    /// big-endian payload bytes. The feeder serves eight lanes per round and
+    /// these fragments ask for a byte every round, so lanes 0..8 finish
+    /// before 8..12 start: a finished lane must leave the next bytes to
+    /// them. Without the fixes the same stream does not decode so.
+    #[test]
+    fn finished_lanes_leave_the_remaining_payload_for_their_peers() {
+        let state = ((LOW / 1023) << 16) + (LOW % 1023) + 1;
+        let mut src = Vec::new();
+        for batch in [0..8, 8..12] {
+            src.extend(batch.clone().map(|lane| if lane < 4 { 0x90 } else { 0x10 }));
+            src.extend(std::iter::repeat_n(3, batch.len()));
+            for byte in state.to_be_bytes() {
+                src.extend(std::iter::repeat_n(byte, batch.len()));
+            }
+        }
+        let mut dst = [0xff; 8];
+        decode(4, &src, &mut dst, &Tables::parse_with(&tables(), true).unwrap()).unwrap();
+        assert_eq!(dst, [128, 128, 0, 0, 0, 0, 0, 0]);
+        // (Counted since the start, over every test: only ever more.)
+        let counted = |i: usize| FIX_COUNTS[i].load(std::sync::atomic::Ordering::Relaxed);
+        assert!(counted(0) > 0 && counted(1) > 0);
+        let mut before = [0xff; 8];
+        let old = decode(4, &src, &mut before, &Tables::parse(&tables()).unwrap());
+        assert!(old.is_err() || before != dst, "the decoder before decodes it too: {before:?}");
+    }
+
+    /// After Marvisak PR #2648: lane 0 produces 0 and 31 in one fragment and
+    /// keeps the two trailing zero bytes that refill its state to 2^24. Lane
+    /// 1 produces its two zeros in separate fragments. If lane 0 stopped as
+    /// soon as it emitted 31, lane 1 would take the second zero as its
+    /// fragment length.
+    #[test]
+    fn a_last_symbol_can_precede_its_final_payload_bytes() {
+        let src = [0x1c, 0x10, 5, 3, 1, 0x20, 0x3c, 4, 0x0c, 0, 0x28, 5, 0, 0x10, 0, 3, 0x20, 4, 0, 5];
+        let tables = Tables::builtin_with(true).unwrap();
+        let mut bytes = src.into_iter();
+        let mut got = [0; 4];
+        lanes(&tables, &[4, 4], 1, 2, |_| bytes.next(), &mut got).unwrap();
+        assert_eq!(got, [0, 0, 31, 0]);
+        assert_eq!(bytes.next(), None);
+    }
+
+    /// After Marvisak PR #2649 (422797364e): both lanes decode 31 at state
+    /// 0x0100ffff, leaving 0x100. They need two bytes to reach 0x0100fffe
+    /// and decode 30. Lane 0 takes the first byte before its fragment
+    /// boundary and drains for a step; lane 1 takes both after its
+    /// boundary. The different boundaries make an early header request
+    /// change the byte order. Without the fixes the records come out wrong.
+    #[test]
+    fn unflushed_fragments_can_split_a_refill() {
+        let src = [0x0c, 0x0c, 4, 3, 1, 1, 0, 0, 255, 255, 255, 255, 255, 0x1d, 0x1d, 1, 0, 255, 254, 254];
+        let mut bytes = src.into_iter();
+        let mut got = [0; 4];
+        lanes(&Tables::builtin_with(true).unwrap(), &[4, 4], 1, 2, |_| bytes.next(), &mut got).unwrap();
+        assert_eq!(got, [31, 31, 30, 30]);
+        assert_eq!(bytes.next(), None);
+        assert!(FIX_COUNTS[2].load(std::sync::atomic::Ordering::Relaxed) > 0);
+        let mut bytes = src.into_iter();
+        let mut before = [0; 4];
+        let old = lanes(&Tables::builtin().unwrap(), &[4, 4], 1, 2, |_| bytes.next(), &mut before);
+        assert!(old.is_err() || before != got, "the decoder before decodes it too: {before:?}");
+    }
+
+    /// With the fixes, every format's lane layout decodes streams that end
+    /// with the lanes' last bytes (no filler a finished lane could park on),
+    /// to the same records; and the streams with filler still decode the
+    /// same with the fixes as without them. A BC7 block decodes the same
+    /// both ways.
+    #[test]
+    fn every_layout_round_trips_with_the_fixes_and_without_filler() {
+        let fixed = Tables::parse_with(&tables(), true).unwrap();
+        let before = Tables::parse(&tables()).unwrap();
+        let layouts: [(&[u8], usize); 6] = [
+            (&[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1),
+            (&[3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7], 2),
+            (&BC4_LANES, 1),
+            (&[3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 2),
+            (&[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2),
+            (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
+        ];
+        for (widths, per) in layouts {
+            for blocks in [1, 2, 17, 300] {
+                let records = random_records(widths, per, blocks, false);
+                for (t, filler) in [(&fixed, false), (&fixed, true), (&before, true)] {
+                    let src = stream_with(t, widths, per, &records, filler);
+                    let mut got = vec![0u8; records.concat().len()];
+                    let mut next = src.iter().copied();
+                    lanes(t, widths, per, blocks, |_| next.next(), &mut got).unwrap();
+                    assert_eq!(got, records.concat(), "{widths:?} x{per}, {blocks} blocks, filler {filler}");
+                }
+            }
+        }
+        let mut s = vec![0u8; 32];
+        s[4] = zigzag(0x55);
+        s[5] = zigzag(-1);
+        s[6] = zigzag(3);
+        s[10] = zigzag(0x7f >> 1);
+        let widths = [3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4];
+        let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+        decode(7, &stream_with(&fixed, &widths, 2, std::slice::from_ref(&s), false), &mut a, &fixed).unwrap();
+        decode(7, &stream(&before, &widths, 2, &[s]), &mut b, &before).unwrap();
+        assert_eq!(a, b);
     }
 }

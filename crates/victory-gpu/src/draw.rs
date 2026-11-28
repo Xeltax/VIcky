@@ -2097,6 +2097,9 @@ impl State {
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
+        // VIcky (`VICTORY_STALE_SLOTS`): some uploaded slots looked at
+        // against their memory, once a frame.
+        crate::texstale::sweep(heap, host, frame);
         // Levels on demand: the slots of textures whose first level with
         // memory changed since the last pass are made again from it.
         host.texture_views_remade();
@@ -2234,11 +2237,28 @@ impl State {
         // may fill the texture's memory itself only afterwards, with
         // no descriptor write and nothing from the runtime to tell of
         // it. The host copy then kept what the memory held at the
-        // first look for the rest of the run. The look reads 48 KiB;
-        // only a changed texture is uploaded again.
+        // first look for the rest of the run. The look reads 48 KiB
+        // (and with `VICTORY_HEAP_RECHECK_MIPS=1` the start of every mip,
+        // `texture::fingerprint`); only a changed texture is uploaded again.
         // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
-        if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-            if crate::texture::fingerprint(at, len) == print {
+        // VIcky (`VICTORY_RECHECK_PARTLY=1`): a slot uploaded in part is
+        // asked its fingerprint too (within a budget a frame); changed, it
+        // is uploaded although no more of it is mapped.
+        let mut part_changed = false;
+        if let Some(((at, len, print, looks, uploaded), mips, part)) = host.texture_slot_checked(index) {
+            let mips_read = mips.as_deref().unwrap_or_default();
+            // (Without the switch a slot in part with a fingerprint, one
+            // uploaded whole before, is looked at as before.)
+            if part > 0 && crate::texstale::recheck_partly() {
+                if !crate::texstale::partly_budget(frame) {
+                    crate::texstale::PARTLY[3].fetch_add(1, Ordering::Relaxed);
+                } else if crate::texture::fingerprint(at, len, mips_read) == print {
+                    crate::texstale::PARTLY[1].fetch_add(1, Ordering::Relaxed);
+                } else {
+                    crate::texstale::PARTLY[2].fetch_add(1, Ordering::Relaxed);
+                    part_changed = true;
+                }
+            } else if crate::texture::fingerprint(at, len, mips_read) == print {
                 HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                 if looks == RECHECK_EVERY_LOOK {
                     HEAP_TEXTURES_RECHECKED_EVERY[0].fetch_add(1, Ordering::Relaxed);
@@ -2247,25 +2267,28 @@ impl State {
                 // many frames for as long as the slot shows the texture
                 // (`recheck_every`), or never again.
                 match next_recheck(looks, frame, recheck_every()) {
-                    Some((due, looks)) => host.texture_slot_recheck(index, write, due, (at, len), print, looks, uploaded),
+                    Some((due, looks)) => {
+                        host.texture_slot_recheck(index, write, due, (at, len), mips, print, looks, uploaded)
+                    }
                     None => host.texture_slot_done(index, write, None),
                 }
                 return Look::Skip;
-            }
-            if looks == RECHECK_EVERY_LOOK {
-                HEAP_TEXTURES_RECHECKED_EVERY[1].fetch_add(1, Ordering::Relaxed);
-            }
-            let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
-            if n < 200 || n.is_multiple_of(1000) {
-                tracing::warn!(
-                    slot = index,
-                    address = format_args!("{at:#x}"),
-                    bytes = len,
-                    frames_after_upload = frame.saturating_sub(uploaded),
-                    looks,
-                    changed = n + 1,
-                    "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
-                );
+            } else {
+                if looks == RECHECK_EVERY_LOOK {
+                    HEAP_TEXTURES_RECHECKED_EVERY[1].fetch_add(1, Ordering::Relaxed);
+                }
+                let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
+                if n < 200 || n.is_multiple_of(1000) {
+                    tracing::warn!(
+                        slot = index,
+                        address = format_args!("{at:#x}"),
+                        bytes = len,
+                        frames_after_upload = frame.saturating_sub(uploaded),
+                        looks,
+                        changed = n + 1,
+                        "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
+                    );
+                }
             }
         }
         let mut partly = None;
@@ -2280,8 +2303,22 @@ impl State {
                 host.texture_slot_later(index, write, frame, most);
                 return Look::Skip;
             }
+            // VIcky (`VICTORY_DS_HOLD=1`): a DirectStorage write is under
+            // way into this memory. Uploaded now, the host copy would take
+            // what the pages held before it (a recycled block's last
+            // texture, or zeros), and nothing would upload it again: held
+            // for a frame instead, a bounded number of times
+            // (`texstale::DS_HOLD_MOST`), and uploaded once the write is
+            // done.
+            if crate::texstale::ds_hold() && crate::texstale::write_pending(address, address.saturating_add(len)) {
+                if host.texture_slot_ds_hold(index, write, frame + 1, crate::texstale::DS_HOLD_MOST) {
+                    crate::texstale::HOLD[1].fetch_add(1, Ordering::Relaxed);
+                    return Look::Skip;
+                }
+                crate::texstale::HOLD[2].fetch_add(1, Ordering::Relaxed);
+            }
             if mapped < len {
-                if mapped <= host.texture_slot_mapped(index) {
+                if mapped <= host.texture_slot_mapped(index) && !part_changed {
                     HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
                     host.texture_slot_later(index, write, frame, most);
                     return Look::Skip;
@@ -2412,6 +2449,7 @@ impl State {
             // detile and upload all of it once more.
             HEAP_TEXTURES_TABLED.fetch_add(1, Ordering::Relaxed);
             host.texture_slot_done(index, write, again);
+            crate::texstale::forget(index);
             return true;
         }
         // Uploaded: the list holds the staging buffer until it has run;
@@ -2419,8 +2457,14 @@ impl State {
         // yet, makes it anew. (Kept for those until now: every partly
         // streamed texture of the heap held a staging buffer of its full
         // size for good.)
-        let memory = if again.is_none() && heap_recheck() {
-            crate::texture::staged_memory(resource)
+        // VIcky: a placed texture uploaded in part is looked at again with
+        // its fingerprint too (`VICTORY_RECHECK_PARTLY=1`, every mip read);
+        // and `VICTORY_STALE_SLOTS` watches what each upload took.
+        let partly_recheck = partly.is_some() && crate::texstale::recheck_partly();
+        let recheck = heap_recheck() && (again.is_none() || partly_recheck);
+        let watch = crate::texstale::stale_slots() > 0;
+        let memory = if recheck || watch {
+            crate::texture::staged_memory(resource, partly_recheck, watch)
         } else {
             None
         };
@@ -2433,13 +2477,22 @@ impl State {
         }
         HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
         HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
-        match memory {
+        if watch && let Some(m) = &memory {
+            crate::texstale::uploaded(index, m.at, m.len, &m.spans, frame);
+        }
+        match (memory.filter(|_| recheck), again) {
             // Whole and uploaded: looked at again (see above).
-            Some((at, len)) => {
-                let print = crate::texture::fingerprint(at, len);
-                host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+            (Some(m), None) => {
+                let print = crate::texture::fingerprint(m.at, m.len, m.mips.as_deref().unwrap_or_default());
+                host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (m.at, m.len), m.mips, print, 0, frame);
             }
-            None => host.texture_slot_done(index, write, again),
+            // In part, with `VICTORY_RECHECK_PARTLY` (see above).
+            (Some(m), Some((due, mapped))) => {
+                crate::texstale::PARTLY[0].fetch_add(1, Ordering::Relaxed);
+                let print = crate::texture::fingerprint(m.at, m.len, m.mips.as_deref().unwrap_or_default());
+                host.texture_slot_recheck_partly(index, write, due, (m.at, m.len), m.mips, print, frame, mapped);
+            }
+            (None, again) => host.texture_slot_done(index, write, again),
         }
         true
     }
@@ -2844,9 +2897,12 @@ impl State {
             Some(h) => h.texture_slot_state(index, crate::frame::current()),
             None => "no host heap".into(),
         };
+        // (Last, after the fields older readers know: with
+        // `VICTORY_STALE_SLOTS`, its last upload against its memory now.)
         format!(
-            "\n    ~slot from={from}+{at:#x} slot={index} title=[{}] host=[{host}] queue=[{queue}]",
-            view_state(title.as_ref())
+            "\n    ~slot from={from}+{at:#x} slot={index} title=[{}] host=[{host}] queue=[{queue}] stale=[{}]",
+            view_state(title.as_ref()),
+            crate::texstale::describe(index)
         )
     }
 

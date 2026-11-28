@@ -9588,11 +9588,22 @@ impl Meter {
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
             }
-            let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [through, left, fell] =
+                [0, 1, 2].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left > 0.0 {
+                // VIcky (`VICTORY_NO_WAIT_FALLBACK=1`): of those read, the ones
+                // read around a missing page; the line as before without it.
+                let fallback = if crate::texture::no_wait_fallback() {
+                    format!(
+                        " ({fell:.1} of the ones read were read around a missing page, VICTORY_NO_WAIT_FALLBACK=1; the slots of \
+                         all that missed a page made due again)"
+                    )
+                } else {
+                    String::new()
+                };
                 tracing::info!(
                     "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
-                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
+                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there){fallback}"
                 );
             }
         }
@@ -9675,6 +9686,9 @@ impl Meter {
                     if mode & 2 != 0 { "made due again" } else { "left as they were" }
                 );
             }
+            // VIcky: the streamed texture staleness switches that are on
+            // (VICKY-RT.md, "Streamed texture staleness").
+            crate::texstale::lines();
             #[cfg(feature = "diagnostics")]
             tracing::info!(
                 "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",

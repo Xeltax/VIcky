@@ -998,7 +998,7 @@ fn tabled_out() -> bool {
 }
 
 /// What the queue of textures picked by index knows of a title slot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Waiting {
     /// The frame from which the slot is due.
     due: u64,
@@ -1017,8 +1017,27 @@ struct Waiting {
     /// ([`TextureQueue::recheck`]): where its memory is (address, bytes),
     /// the fingerprint it had at the upload, how many looks found it
     /// unchanged, and the frame of the upload. A fingerprint of 0: none.
+    /// VIcky (`VICTORY_RECHECK_PARTLY`): also for a slot uploaded in part
+    /// (`mapped` not 0, [`TextureQueue::recheck_partly`]).
     checked: (u64, u64, u64, u8, u64),
+    /// The ranges of its memory the fingerprint reads at the start of its
+    /// mips (`crate::texture::staged_memory`), with `checked` (262625e33).
+    mips: Option<Mips>,
+    /// VIcky (`VICTORY_DS_HOLD`): looks held back because a DirectStorage
+    /// write was pending under its memory ([`TextureQueue::ds_hold`]).
+    holds: u8,
 }
+
+impl Waiting {
+    /// A slot written in `frame`, write `write` of the queue, due from `due`,
+    /// nothing known of it yet.
+    fn new(due: u64, frame: u64, write: u64) -> Waiting {
+        Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), mips: None, holds: 0 }
+    }
+}
+
+/// Ranges of a texture's memory (offsets, bytes) read for its fingerprint.
+pub(crate) type Mips = std::sync::Arc<[(u64, u64)]>;
 
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
@@ -1044,7 +1063,7 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting::new(due, frame, write));
     }
 
     fn remove(&mut self, index: u32) {
@@ -1142,6 +1161,12 @@ impl TextureQueue {
     /// not all of it: looked at again from frame `due`.
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
         if let Some(w) = self.same(index, write) {
+            // VIcky: the fingerprint of an earlier upload in part
+            // ([`TextureQueue::recheck_partly`], only ever noted with
+            // `VICTORY_RECHECK_PARTLY`) is not this upload's.
+            if w.mapped > 0 && w.checked.2 != 0 {
+                (w.checked, w.mips) = ((0, 0, 0, 0, 0), None);
+            }
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
         }
     }
@@ -1150,18 +1175,74 @@ impl TextureQueue {
     /// with fingerprint `print`: looked at again from frame `due`, for a
     /// title that fills a texture's memory after it wrote the view (the
     /// `looks`-th such look; `uploaded` is the upload's frame).
+    /// `mips`: the ranges the fingerprint read besides its windows.
     #[allow(clippy::too_many_arguments)]
-    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
+    fn recheck(
+        &mut self,
+        index: u32,
+        write: u64,
+        due: u64,
+        at: (u64, u64),
+        mips: Option<Mips>,
+        print: u64,
+        looks: u8,
+        uploaded: u64,
+    ) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
+            w.mips = mips;
         }
     }
 
-    /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
-    /// waiting for such a look.
-    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
-        self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
+    /// VIcky (`VICTORY_RECHECK_PARTLY`): slot `index` was uploaded with
+    /// `mapped` bytes of its memory there, not all ([`TextureQueue::partly`],
+    /// whose part this keeps), and that memory had fingerprint `print`
+    /// (`at`, `mips` and `uploaded` as for [`TextureQueue::recheck`]): its
+    /// looks also ask the fingerprint, so bytes that land in pages mapped
+    /// already are uploaded too, not only more pages mapped.
+    #[allow(clippy::too_many_arguments)]
+    fn recheck_partly(
+        &mut self,
+        index: u32,
+        write: u64,
+        due: u64,
+        at: (u64, u64),
+        mips: Option<Mips>,
+        print: u64,
+        uploaded: u64,
+        mapped: u64,
+    ) {
+        if let Some(w) = self.same(index, write) {
+            (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
+            w.checked = (at.0, at.1, print, 0, uploaded);
+            w.mips = mips;
+        }
+    }
+
+    /// What [`TextureQueue::recheck`] or [`TextureQueue::recheck_partly`]
+    /// noted of slot `index`, if it is waiting for such a look, with the
+    /// ranges the fingerprint read and the bytes that were mapped at the
+    /// upload (0: it was uploaded whole).
+    fn checked(&self, index: u32) -> Option<((u64, u64, u64, u8, u64), Option<Mips>, u64)> {
+        self.slots.get(&index).filter(|w| w.checked.2 != 0).map(|w| (w.checked, w.mips.clone(), w.mapped))
+    }
+
+    /// VIcky (`VICTORY_DS_HOLD`): a DirectStorage write is pending under slot
+    /// `index`'s memory: not handed out before frame `due`, at most `most`
+    /// times for this write of the slot. False once it was held that often
+    /// (it is uploaded now, so that nothing waits for good); true also for a
+    /// slot written again meanwhile (the new write is due as written).
+    fn ds_hold(&mut self, index: u32, write: u64, due: u64, most: u8) -> bool {
+        let Some(w) = self.same(index, write) else {
+            return true;
+        };
+        if w.holds >= most {
+            return false;
+        }
+        w.holds += 1;
+        w.due = w.due.max(due);
+        true
     }
 
     /// The memory slot `index`'s texture lies in was mapped, unmapped or
@@ -1172,7 +1253,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting::new(due, frame, write));
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1951,17 +2032,48 @@ impl HostHeap {
         write: u64,
         due: u64,
         at: (u64, u64),
+        mips: Option<Mips>,
         print: u64,
         looks: u8,
         uploaded: u64,
     ) {
         let mut textures = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures);
-        textures.recheck(index, write, due, at, print, looks, uploaded);
+        textures.recheck(index, write, due, at, mips, print, looks, uploaded);
+    }
+
+    /// Title slot `index` was uploaded in part: see
+    /// [`TextureQueue::recheck_partly`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn texture_slot_recheck_partly(
+        &self,
+        index: u32,
+        write: u64,
+        due: u64,
+        at: (u64, u64),
+        mips: Option<Mips>,
+        print: u64,
+        uploaded: u64,
+        mapped: u64,
+    ) {
+        let mut textures = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures);
+        textures.recheck_partly(index, write, due, at, mips, print, uploaded, mapped);
     }
 
     /// See [`TextureQueue::checked`].
-    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
+    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<((u64, u64, u64, u8, u64), Option<Mips>, u64)> {
         crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures).checked(index)
+    }
+
+    /// See [`TextureQueue::ds_hold`].
+    pub(crate) fn texture_slot_ds_hold(&self, index: u32, write: u64, due: u64, most: u8) -> bool {
+        crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures).ds_hold(index, write, due, most)
+    }
+
+    /// VIcky (`VICTORY_STALE_SLOTS`): whether title slot `index` is in the
+    /// queue (due, or waiting for a later look): something will look at it
+    /// again.
+    pub(crate) fn texture_slot_queued(&self, index: u32) -> bool {
+        crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures).slots.contains_key(&index)
     }
 
     /// Nothing to upload at title slot `index` now (its memory is not
@@ -2059,6 +2171,8 @@ impl HostHeap {
         slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
         PAGE_WRITES[2].fetch_add(held as u64, Relaxed);
         PAGE_WRITES[3].fetch_add(slots.len() as u64, Relaxed);
+        // VIcky (`VICTORY_STALE_SLOTS`): their uploads had a write after them.
+        crate::texstale::written_under(&slots);
         if !due {
             return [held, slots.len(), 0];
         }
@@ -3671,12 +3785,13 @@ impl HostHeap {
         match textures.slots.get(&index) {
             None => "not queued".into(),
             Some(w) => format!(
-                "queued due={} written@{} looks={} part_mapped={} recheck={}",
+                "queued due={} written@{} looks={} part_mapped={} recheck={} ds_holds={}",
                 if w.due <= frame { "now".to_string() } else { format!("@{}", w.due) },
                 w.written,
                 w.looks,
                 w.mapped,
-                w.checked.2 != 0
+                w.checked.2 != 0,
+                w.holds
             ),
         }
     }
@@ -6079,6 +6194,55 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// VIcky: the looks after a whole upload carry the ranges the
+    /// fingerprint read (262625e33); with `VICTORY_RECHECK_PARTLY` an upload
+    /// in part keeps its part and has its fingerprint noted too, which a
+    /// look that finds no more mapped keeps and a new write forgets; with
+    /// `VICTORY_DS_HOLD` a slot is held at most so often for one write of
+    /// it (then uploaded), an old write is passed over, and memory mapped
+    /// under it again starts the count anew.
+    #[test]
+    fn rechecks_carry_their_ranges_parts_keep_theirs_and_holds_are_bounded() {
+        let mut q = TextureQueue::default();
+        q.written(1, 1, 0, false);
+        let w1 = q.due(1, 10)[0].1;
+        let mips: Mips = vec![(0x1000, 1024), (0x8000, 1024)].into();
+        q.recheck(1, w1, 5, (0x10_0000, 0x2_0000), Some(mips.clone()), 77, 0, 1);
+        let (checked, got, mapped) = q.checked(1).unwrap();
+        assert_eq!(checked, (0x10_0000, 0x2_0000, 77, 0, 1));
+        assert_eq!(got.as_deref(), Some(&*mips));
+        assert_eq!(mapped, 0);
+        assert!(q.due(4, 10).is_empty());
+        // In part: due as `partly` makes it, its part kept, the print noted.
+        q.written(2, 2, 0, false);
+        let w2 = q.due(2, 10).iter().find(|d| d.0 == 2).unwrap().1;
+        q.recheck_partly(2, w2, 3, (0x20_0000, 0x4_0000), Some(mips.clone()), 99, 2, 0x1_0000);
+        assert_eq!(q.mapped(2), 0x1_0000);
+        let (checked, _, mapped) = q.checked(2).unwrap();
+        assert_eq!((checked.2, mapped), (99, 0x1_0000));
+        assert_eq!(q.census(3)[3], 1, "counted as uploaded in part");
+        assert_eq!(q.due(3, 10)[0].0, 2, "looked at before the slots never looked at");
+        q.later(2, w2, 3, 16);
+        assert_eq!(q.checked(2).map(|c| c.2), Some(0x1_0000));
+        // Uploaded in part again without one (a table's): it is forgotten.
+        q.partly(2, w2, 4, 0x2_0000);
+        assert!(q.checked(2).is_none());
+        assert_eq!(q.mapped(2), 0x2_0000);
+        q.written(2, 4, 0, false);
+        assert!(q.checked(2).is_none());
+        // Held while a write is pending: three times for this write, then not.
+        let w2 = q.due(4, 10).iter().find(|d| d.0 == 2).unwrap().1;
+        for k in 0..3 {
+            assert!(q.ds_hold(2, w2, 5 + k, 3));
+            assert!(!q.due(4 + k, 10).iter().any(|d| d.0 == 2));
+        }
+        assert!(!q.ds_hold(2, w2, 9, 3));
+        assert!(q.ds_hold(2, w2 + 1000, 9, 3), "a write the slot no longer has");
+        q.changed(2, 10, 11);
+        let w2 = q.due(11, 10).iter().find(|d| d.0 == 2).unwrap().1;
+        assert!(q.ds_hold(2, w2, 12, 3));
     }
 
     /// Slots held back for lack of room on the card are not handed out

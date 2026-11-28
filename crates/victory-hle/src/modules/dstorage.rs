@@ -923,6 +923,11 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     if request.source.is_null() || request.destination.is_null() {
         return Err(fail(E_INVALIDARG, "no source or destination"));
     }
+    // VIcky (`VICTORY_DS_HOLD=1`): from here until the bytes are there and
+    // the GPU side was told (`into_destination`), the texture pass holds the
+    // slots of placed textures in the destination instead of uploading what
+    // the pages held before. Nothing without the switch.
+    let _pending = victory_gpu::title_memory_write_pending(|| destination_ranges(request));
     let bc = ((options & BCPACK) >> 1) as u8;
     let size = request.destination_size as usize;
     if options & (ZLIB | BCPACK) == 0 {
@@ -974,6 +979,32 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         "dstorage: request done"
     );
     Ok(())
+}
+
+/// VIcky (`VICTORY_DS_HOLD`): the title addresses (address, bytes) `request`
+/// writes: its destination, or with `PAGE_DESTINATION` every address that
+/// shows its pages now (`xmem::shown_at`, as `xmem::pages_written` tells
+/// them once written). The bytes: the source's for a plain read, the
+/// destination's for one that inflates or unpacks (as `execute` writes).
+fn destination_ranges(request: &Request) -> Vec<(usize, usize)> {
+    let len = if request.options & (ZLIB | BCPACK) == 0 {
+        request.source_size
+    } else {
+        request.destination_size
+    } as usize;
+    if len == 0 {
+        return Vec::new();
+    }
+    if request.options & PAGE_DESTINATION == 0 {
+        return vec![(request.destination as usize, len)];
+    }
+    let offset = (request.page_offset & 0xffff) as usize;
+    // SAFETY: the title passes a page number per 64 KiB of destination, as
+    // `into_destination` reads them.
+    let pages = unsafe {
+        std::slice::from_raw_parts(request.destination.cast::<usize>(), (offset + len).div_ceil(PAGE))
+    };
+    super::xmem::shown_at(pages, offset, len)
 }
 
 /// Inflates a zlib stream into `out`, returning the bytes written. A stream
@@ -1041,10 +1072,25 @@ fn bcpack_tables() -> Result<&'static Tables, HRESULT> {
     }
 }
 
-/// The tables VIctory ships with.
+/// The tables VIctory ships with. VIcky (`VICTORY_BCPACK_FIXES=1`; off by
+/// default, the decoder as before): with the three decoder fixes of other
+/// trees (`Tables::parse_with`): the first BC7 dictionary entry keeps its
+/// first index (after cd4402f405, fork PR #374), a lane that has finished
+/// leaves the bytes after it to its peers (after Marvisak PR #2648), and a
+/// refill split by a fragment's end is kept (after Marvisak PR #2649). Each
+/// is deterministic: the same stream decodes the same in every run. Counts
+/// on the GPU side's line (`victory_formats::bcpack::FIX_COUNTS`).
 #[cfg(not(test))]
 fn load_bcpack_tables() -> Result<Tables, String> {
-    Tables::builtin().map_err(|e| format!("the built-in BCPack tables: {e}"))
+    let fixes = std::env::var_os("VICTORY_BCPACK_FIXES").is_some_and(|v| v == "1");
+    if fixes {
+        tracing::info!(
+            "dstorage: BCPack decodes with the fixes: the first BC7 dictionary entry keeps its first index (cd4402f405), \
+             finished lanes leave their peers' bytes (Marvisak PR #2648), a split refill is kept (PR #2649) \
+             (VICTORY_BCPACK_FIXES=1; counts on the 'BCPack decoder fixes' line)"
+        );
+    }
+    Tables::builtin_with(fixes).map_err(|e| format!("the built-in BCPack tables: {e}"))
 }
 
 /// Tests decode streams made against tables of their own, from this folder.

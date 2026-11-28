@@ -91,6 +91,8 @@ mod stripes;
 mod tiles;
 pub mod signature;
 #[cfg(windows)]
+mod texstale;
+#[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 mod watch;
@@ -105,6 +107,8 @@ pub use host::on_failure;
 pub use inplace::{
     title_memory_freeing, title_memory_placement, title_memory_section, title_memory_section_closed, title_memory_view,
 };
+#[cfg(windows)]
+pub use texstale::{WritePending, title_memory_write_pending};
 #[cfg(windows)]
 pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
