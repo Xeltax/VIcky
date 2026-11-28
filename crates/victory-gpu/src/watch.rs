@@ -1701,6 +1701,14 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
     crate::lot4::locks::mutex(crate::lot4::locks::Lock::Guards, &GUARDS)
 }
 
+/// VIcky (`VICTORY_SUBMIT_LANES`, `crate::host::lanes`): whether a block of
+/// `[at, at + len)` is known to show a physical page that other addresses
+/// show too (its guard was set with theirs, `Guards::aliased`): a write
+/// there may change memory read at another address.
+pub(crate) fn shown_elsewhere(at: usize, len: usize) -> bool {
+    guards().aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).next().is_some()
+}
+
 /// [`guards`] for an asking of [`guard`]. With diagnostics a wait for the
 /// lock (a title thread's write fault holds it while it opens a block, or
 /// another asking while it walks) is counted and timed.

@@ -69,6 +69,20 @@ fn reaper() -> Option<&'static Sender<Job>> {
     if !on() {
         return None;
     }
+    static SAID: std::sync::Once = std::sync::Once::new();
+    let tx = thread();
+    if tx.is_some() {
+        SAID.call_once(|| {
+            tracing::info!("VICTORY_REAPER=1: landed host lists are reset and retired objects dropped on the thread victory-reaper");
+        });
+    }
+    tx
+}
+
+/// The reaper thread's queue, the thread made on first use (with
+/// `VICTORY_REAPER=1`, or for `VICTORY_SUBMIT_LANES`' drops without it);
+/// `None` if no thread could be made.
+fn thread() -> Option<&'static Sender<Job>> {
     static REAPER: OnceLock<Option<Sender<Job>>> = OnceLock::new();
     REAPER
         .get_or_init(|| {
@@ -79,10 +93,7 @@ fn reaper() -> Option<&'static Sender<Job>> {
                 }
             });
             match made {
-                Ok(_) => {
-                    tracing::info!("VICTORY_REAPER=1: landed host lists are reset and retired objects dropped on the thread victory-reaper");
-                    Some(tx)
-                }
+                Ok(_) => Some(tx),
                 Err(e) => {
                     tracing::warn!(error = %e, "no reaper thread: host lists are reset where they land");
                     None
@@ -131,6 +142,30 @@ pub(crate) fn dispose<T: 'static>(objects: T) {
         DROPS[c].fetch_add(1, Relaxed);
         DROP_US[c].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
     });
+}
+
+/// VIcky (`VICTORY_SUBMIT_LANES`, `crate::host::lanes`): drops `objects` on
+/// the reaper thread whether `VICTORY_REAPER` is set or not (here if no
+/// thread could be made), counted as [`dispose`] counts; `timed` is told
+/// the microseconds the drop took there.
+pub(crate) fn dispose_away<T: 'static>(objects: T, timed: impl FnOnce(u64) + 'static) {
+    let work = move || {
+        let started = std::time::Instant::now();
+        drop(objects);
+        let us = started.elapsed().as_micros() as u64;
+        let c = class();
+        DROPS[c].fetch_add(1, Relaxed);
+        DROP_US[c].fetch_add(us, Relaxed);
+        timed(us);
+    };
+    match thread() {
+        Some(tx) => {
+            if let Err(std::sync::mpsc::SendError(Job(work))) = tx.send(Job(Box::new(work))) {
+                work();
+            }
+        }
+        None => work(),
+    }
 }
 
 /// With the frame line: per thread, over `frames`, the lists reset and the

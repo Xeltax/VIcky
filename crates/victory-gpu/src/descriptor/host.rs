@@ -20,6 +20,7 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 pub(crate) mod made_first;
+pub(crate) mod made_read;
 pub(crate) mod note_kind;
 pub(crate) mod par_mirror;
 pub(crate) mod sync_lean;
@@ -3634,7 +3635,12 @@ impl HostHeap {
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         let record = self.record_at(index, handle, for_draw)?;
         let made = self.made_alone();
-        self.mirror_made(&made, true, (index, handle, for_draw, true), record, &mut Lookups::each())
+        // VIcky (stage 4's counter, [`made_read`]): whether the making only
+        // looked, by caller.
+        let caller = made_read::begin();
+        let view = self.mirror_made(&made, true, (index, handle, for_draw, true), record, &mut Lookups::each());
+        made_read::end(caller);
+        view
     }
 
     /// [`HostHeap::mirror`] (not for a draw) of a descriptor the title
@@ -3943,6 +3949,7 @@ impl HostHeap {
             }
         } else {
             count(Count::Same);
+            made_read::same();
             #[cfg(feature = "diagnostics")]
             note_kind::slot(note_kind::Slot::Same);
         }

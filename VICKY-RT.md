@@ -1499,7 +1499,7 @@ Read for each: the stale line (S, O), the `writes behind the guards` line, the `
 
 ## Structural: tables left to the draws (2026-11-28; opt-in, not measured in the game yet)
 
-The design is `xcl-notes\fable-2026-11-28-structural.md`. A draw already makes every entry of the tables it makes afresh in dynamic slots of its own (`draw.rs` `State::tables`). The heap sync, the pass over buffer views and the texture pass then make the same title slots again, for shaders that pick views by index. That second making is most of the join, most of the pass and most of the texture pass. The project stops it in four stages, one branch and one switch each, each with an `=alt`. This section has stage 1 (with 1b, `TABLE_BOUND_FRESH`) and stage 2, which re-lands the dropped commit 7b66261e (`VICTORY_TABLES_LEFT`, buffer slots left to the draws) with a hold that keeps their host copies.
+The design is `xcl-notes\fable-2026-11-28-structural.md`. A draw already makes every entry of the tables it makes afresh in dynamic slots of its own (`draw.rs` `State::tables`). The heap sync, the pass over buffer views and the texture pass then make the same title slots again, for shaders that pick views by index. That second making is most of the join, most of the pass and most of the texture pass. The project stops it in four stages, one branch and one switch each, each with an `=alt`. This section has stage 1 (with 1b, `TABLE_BOUND_FRESH`) and stage 2, which re-lands the dropped commit 7b66261e (`VICTORY_TABLES_LEFT`, buffer slots left to the draws) with a hold that keeps their host copies. After stage 2's profile (`xcl-notes\fable-2026-11-28-wall2.md`) the plan was revised: stage 3 is now preparation on lanes (`VICTORY_SUBMIT_LANES`), stage 4 waits for its counter (`VICTORY_MADE_READ`), and stage 2 got two fixes. All three are at the end of this section.
 
 ### Stage 1: the table bound, `VICTORY_TABLE_BOUND=1|alt` (`fx-main-tablebound`)
 
@@ -1668,13 +1668,13 @@ Credits (reimplemented here, no code copied):
   - It takes the place of the host slot and the pass's kept range, which held that copy without the switch.
   - A hold goes when the title writes another record in its slot (the sync sees it, `Holds::release_other`), when its slot's mark is 240 frames old (the heal), or at the flip to off.
   - No copy lives longer than without the switch, where the slot held it as long as the record stayed.
-  - The table is a pointer and a record key per title slot, swapped atomically with no lock: 16 bytes a slot (about 20 MB), with the switch only. A draw that reads the same record again takes nothing new.
+  - The table is a pointer and a record key per title slot: 16 bytes a slot (about 20 MB), with the switch only. There is no table lock. Since `fx-main-lanes` a slot's key and pointer change together under a lock of that slot alone, the pointer's low bit (see "Stage 2 fixes" below). A draw that reads the same record again takes nothing new.
   - `VICTORY_TABLES_LEFT_HOLD=0` turns the holds off, to tell in one run whether they matter.
 - **The grace** (`VICTORY_TABLES_LEFT_GRACE=1`, **off by default**): the design's rule 2.
   - A new constant or placed buffer record in a slot without a mark waits 4 frames, its print noted.
   - It is then mirrored, unless a draw's table claimed the slot meanwhile; then it is left as if it had been left when found.
   - Off by default because it makes a shader that picks such a buffer by index see it 4 frames late. A constant buffer view written in a new place each frame would always be 4 frames old. Try it in one run with `=check`, which counts what it would leave stale.
-- **The heal**, in ON phases, once in 64 frames: some slots are left with an expired mark (and no texture mark leaves them). Their record is mirrored if it is not the one last noted. Without this, a slot no draw reads any more, whose page the title never writes again, would keep the view it showed before.
+- **The heal**, in ON phases, once in 64 frames: some slots are left with an expired mark (and no texture mark leaves them). Their record is mirrored if it is not the one last noted. Without this, a slot no draw reads any more, whose page the title never writes again, would keep the view it showed before. `VICTORY_TABLES_LEFT_HEAL_SPREAD=1` (opt-in) spreads it over the 64 frames (see "Stage 2 fixes" below).
 - **Without the switch** the runtime does what it did: one empty-vector check per new record in the sync, one per pass call.
 
 **`=alt`.** Twenty seconds off, twenty on, with the `... (VICTORY_TABLES_LEFT=alt): ON` / `off, as usual` lines that `alt-fps.sh` reads. The phase is taken at the start of each heap sync.
@@ -1735,7 +1735,7 @@ Stage 1's line gives both shares, in the off phases.
 - The paired median is under +0.5 fps on the boat although the join and the pass's wait fell by 25 ms or more: the time went somewhere the lines do not show. Profile; do not stack stage 3 on it.
 
 **Tests.**
-- `descriptor::left::tests::{stage_2_leaves_holds_or_mirrors, stage_2_modes, waiting_records_come_out_after_four_frames, left_bits_are_taken_once, the_summary_is_said}`.
+- `descriptor::left::tests::{stage_2_leaves_holds_or_mirrors, stage_2_modes, waiting_records_come_out_after_four_frames, left_bits_are_taken_once, the_summary_is_said}`, and since `fx-main-lanes` `a_hold_keeps_its_key_with_its_copy_under_racing_takes` and `the_spread_heal_covers_every_slot_once_in_64_frames`.
 - `descriptor::host::tables_left_tests::marked_buffer_and_constant_records_are_left_and_the_rest_mirrored`. The sync leaves a buffer or constant view in a marked slot, and finds it again with its page. It mirrors a texture view there, a record of no view, a slot whose mark expired, and everything in the off phase. The pass takes the marked slots out of its list in ON phases only.
 - `descriptor::host::tables_left_tests::the_grace_holds_new_buffer_records_until_a_draw_claims_them`.
 - `descriptor::host::tables_left_tests::the_hold_keeps_copies`, through the real `let_go_idle` (a test-only hook takes one copy as idle, `shadow::TEST_IDLE`):
@@ -1762,6 +1762,110 @@ Stage 1's line gives both shares, in the off phases.
 - **Left slots whose record becomes all zeros.** The sync never noted their print, so it takes such a slot for one never written. The heal (64 frames after the mark expires) and the flip mirror them.
 - **The grace** (opt-in): shaders that pick a constant or placed buffer by index see it 4 frames late.
 - **Not measured in the game.** Unit tests only so far.
+
+### Stage 3: preparation on lanes, `VICTORY_SUBMIT_LANES` (`fx-main-lanes`; opt-in, not measured in the game yet)
+
+The revised plan's stage 3 (`xcl-notes\fable-2026-11-28-wall2.md`, section 3). The old stage 3, `HEAP_SYNC_NOTHING`, is dropped: the join it aimed at is 11.6 ms in all after stage 2.
+
+**Why.** Profile PB1 (boat, `TABLES_LEFT=1`, full recommended set): the frame (167.7 ms) is bound by the submitting thread's own work, 128 ms busy. The title's render thread waits 126 ms at present for that thread's burst. Of the 128 ms:
+- texture refreshes (`texture::Staging::refresh`) take 31.3 ms, 24 of them in ReadProcessMemory;
+- `let_go_idle` and the sweep take 10 ms, about 6 of them destroying the card's objects.
+
+Meanwhile the wide threads (`victory-wide-N`) are idle 92 % of the time. In the mission stretch the texture streaming is the largest item, 21-36 ms with 90-155 uploads a frame, and the tables cannot touch it.
+
+**What the switch does** (`host/lanes.rs`):
+- **Texture refreshes on the wide threads.** At a list's texture step (once a submission per staging buffer, until a step writes title memory) the refresh goes to the wide threads instead of running in turn. The jobs sit behind the threads' shared work, like the snapshots of `VICTORY_SNAPSHOT_BESIDE`, and are queued 4 at a time and at the end of each list's steps. Each staging buffer is its own: a refresh reads title memory and the write watch, and writes its staging buffer and its state under its own lock. The submitting thread goes on meanwhile with the rest of the steps, the refreshes of host copies, the snapshots and the heap sync's join.
+- **The order the picture depends on is kept:**
+  - Before a `Run` step, which may write title memory anywhere, every refresh given is done.
+  - Before a title buffer copy, only the refreshes whose texture shares a 64 KiB journal page (`watch::PAGE`, also the guards' block) with the copy's destination must be done. The copy writes none of the other textures' bytes, and neither its note in the write-watch journal nor a guard it trips touches their pages. If the destination is known to show physical pages that other addresses show too (`watch::shown_elsewhere`, the guards' aliased blocks), every refresh is done first. The boat's frame has some 24 such parts of submissions (copy line, PB1), so joining them all at every copy would leave little to overlap.
+  - So a refresh reads what it would have read in turn, and the texture's later steps check it again after the write, as before.
+  - Before a step on a staging buffer's state, that buffer's refresh is done. Those steps are the upload's "uploaded, not dirty" and the levels on demand given their memory from what the detiling held; they are now `Step::TextureHost`. So the flags end as they would have, and the next lists record the same uploads.
+  - At the end of the preparing, every refresh is done. That is before the settle when the card's results run low (its copy-backs write title memory), before `Host::card_before`, and so before the lists go.
+  - A refresh no wide thread has begun by then is run by the submitting thread itself. A busy pool never makes it wait for more than the refreshes already running.
+- **The texture table's lock** (`texture::STAGING`, on which recording threads wait about 10 ms) is not taken by the lanes.
+- **The last drops on the reaper, after the send.** In ON phases, `host::retire` does not drop an object at once when no submission is running. That covers the sweep's host copies of windows (`shadow::let_go_idle`) and of textures (`resource::let_go_idle`), and what the heap's slots let go of then. The object waits in a list instead, and the next submission hands that list to the reaper thread right after its lists went to the card. The same goes for the staging buffers `texture::let_go_idle` lets go of (they are no longer destroyed under the texture table's lock) and the twins of the host textures the sweep lets go of. Nothing names those objects any more; that is why the sweep took them. The reaper thread is made for this even without `VICTORY_REAPER=1`.
+- **Without the switch** nothing changes: the refresh runs in turn, `TextureHost` steps run as `Host` steps did, and the drops happen where they did.
+
+**`=alt`.** Twenty seconds off, twenty on. Each change is logged as `a submission's texture refreshes run on the wide threads, joined before the card's copies, and the host's last drops on the reaper after the lists go (structural stage 3) from now (VICTORY_SUBMIT_LANES=alt): ON` or `... : off, as usual`, the lines `alt-fps.sh` reads. The phase is taken at the start of each submission. Set no other switch to `alt` in the same run: `alt-fps.sh` reads every `=alt): ON|off` line.
+
+**The summary** (one per phase with `alt`, every 20 s with `1`):
+
+`a submission's preparation on lanes (VICTORY_SUBMIT_LANES alt, ON|alt, off|on), the ON phase that ended|the off phase that ended|on, the last period: F frames in S s (X fps); per frame: N submissions, preparing P ms (the frame line's); texture refreshes R, L of them on the wide threads: T ms on the submitting thread, W ms on the wide threads; the submitting thread waited J ms for the wide threads (n joins, m waits for one texture); U uploads recorded; D of the host's objects dropped on the reaper after the lists went (Q ms there)`
+
+- **Off phase:** T is the refresh time on the submitting thread (the ground), L and W are 0, and D is 0.
+- **ON phase:**
+  - T is what the submitting thread still ran: refreshes no wide thread had begun at a join.
+  - J is its wait for refreshes still running.
+  - The gain on the submitting thread is about (T off) minus (T + J ON), and "preparing" shows it.
+- **U must match** ON against off in comparable stretches: the same uploads.
+- The frame line's "textures X ms" counts refresh time on whichever thread ran it: with lanes ON it includes the wide threads.
+- The frame line's `reaper` part counts the drops on the reaper thread. Without `VICTORY_REAPER=1` it says `reaper off: reaper ... ms dropping objects`.
+
+**Expected** (Fable, wall2):
+- Mission stretch: S -15 to -25 ms (frame 134 -> 115-122 ms), half of that if the render thread takes over as the wall.
+- Settled boat and prologue: S -4 to -8 ms (about +0.3 fps).
+
+**Stop criteria** (Fable, wall2):
+- In stretches of more than 80 uploads a frame, drop the stage if the submitting thread's time at work falls by less than 6 ms. Read the summary's "preparing", ON against off.
+- If frame minus present stays above 25 ms in ON phases, the render thread is the wall: go to stage 4 (its counter below).
+
+**Suggested runs** (the full recommended set of the stage 2 runs, `xcl-notes\verify-s2.ps1`'s `Full`, with `VICTORY_TABLES_LEFT=1` so stage 2 is on in both phases, as in PB1; the cache is unchanged, nothing changes translation):
+1. Boat (`scene2`, with `VICTORY_KEYS`), `VICTORY_SUBMIT_LANES=alt`, 480 s: `alt-fps.sh` paired median, the summaries ON against off (T, J, preparing, U), and the stop criteria.
+2. Prologue, `VICTORY_SUBMIT_LANES=alt`, 420 s: the same.
+3. Picture, from the captures every 32 frames in both phases: hull, water, faces, the passenger's shirt; on the prologue the bunk room.
+
+**Tests.**
+- `host::lanes::tests::a_join_finds_every_refresh_given_done`: each refresh runs once, all of them before the join returns, whether the wide threads or the submitting thread ran them.
+- `host::lanes::tests::steps_keep_their_order_around_the_lanes`: the order is played as `run_deferred` plays it, with each texture's "title memory" as a number of its own. A refresh given before a title copy into its memory, or before a `Run` step, reads the old value; those given after read the new one. A buffer's state step after its refresh sees the refresh done.
+- `host::lanes::tests::a_copy_elsewhere_does_not_wait`: a title copy waits for the refresh under its destination, not for one elsewhere.
+- `host::lanes::tests::a_buffer_given_twice_runs_in_turn`: the same buffer given twice before a join runs in turn, not side by side.
+- `host::lanes::tests::{off_nothing_is_given, the_summary_is_said}`.
+
+**Risks (medium).**
+- Each wide thread keeps a read buffer as large as the largest texture it read through the kernel (`texture::with_read`), up to one per wide thread, where there was one for the submitting thread.
+- The kernel reads now run beside the submitting thread's own refreshes of host copies: both take the process's memory and the write-watch journal's lock. If they slow each other, J grows.
+- The wide threads also run the heap sync's page reads (first) and the snapshots. A busy pool shows as T in ON phases, never as a wait longer than the refreshes running.
+- Destroying objects later keeps the card's memory for about one more submission.
+- Aliasing is known only through the guards. Take a title copy into memory that shows the same physical pages as a texture at another address, before the guards have found the two views. That texture's refresh, running beside the copy, could take the copy's bytes one submission early, where in turn it would have read them at the next one.
+
+### Stage 4's counter: the heap mirror's calls that only look (`VICTORY_MADE_READ`; counted always, no behaviour change)
+
+Stage 4 (`VICTORY_MADE_READ=1|alt|check`, not written) would take a heap's slot state shared first in `HostHeap::mirror`, and return the view when the slot was made from the record already; it would take the state alone only to make the slot.
+
+The case for it (PB1): the recording threads wait 83.5 ms a frame, summed, in `HostHeap::mirror` > `made_alone` > `held_alone`. Of that, 67 ms come from `draw::State::bind_attempt` and 16.8 ms from `descriptor::mirror` > `mirror_tried`.
+
+The counter decides whether stage 4 goes ahead (`descriptor/host/made_read.rs`):
+- It counts every `HostHeap::mirror` call, split by caller. `bind_attempt` and `descriptor::mirror` mark their thread; everything else counts as "other".
+- It also counts the calls whose making took only the looking path: the host slot was there without taking a pool slot, and its key was the record's (`Count::Same`). Those could have been answered under a shared lock.
+- The paths that hold the state for several slots, and the free path of `VICTORY_MIRROR_TRY`, do not wait there and are not counted.
+- The cost is a thread-local mark and per-thread counters per call.
+- `VICTORY_MADE_READ=0` leaves the line out.
+
+The line, with the heap sync's line once a frame-rate line:
+
+`the heap's slot state taken alone for one slot (HostHeap::mirror; stage 4's counter, VICTORY_MADE_READ): per frame, draws (draw::State::bind_attempt) N calls, X % of them found their slot made from the record already, so could have been answered under a shared lock; the title's view calls and copies (descriptor::mirror > mirror_tried) N calls, Y %; other callers (the heap sync, slots that waited for a texture) N calls, Z %; draws and calls together W % (stage 4 goes ahead if the draws' share is 70 % or more)`
+
+How to read it:
+- **Bar:** stage 4 is written only if X is 70 % or more on the boat.
+- **After stage 4,** the recording threads' summed wait must fall by at least 40 ms.
+- **Re-measure `VICTORY_MIRROR_TRY=1`** in the same run.
+- **Test:** `descriptor::host::made_read::tests::calls_count_by_caller_and_path`.
+
+### Stage 2 fixes (`fx-main-lanes`)
+
+- **The holds keep each key with its copy (on by default; a fix).**
+  - The problem (wall2, item 4): `Holds::take` stored a slot's record key and its copy's pointer apart. Two recording threads taking one slot at once could leave one's key with the other's copy. That changed only how long a copy was held, not the picture.
+  - The fix: a slot's key and pointer now change together under a lock of that slot alone. The lock is the pointer's low bit, always clear in an `Arc` pointer: no memory more, and one compare-and-swap per take when uncontended. `release_other`, `expire` and the flip's clearing take the same lock.
+  - Test: `descriptor::left::tests::a_hold_keeps_its_key_with_its_copy_under_racing_takes`. Four threads race on two slots, 40 rounds. Each round must end with each key held with its own copy, and no copy may be held twice or lost.
+- **`VICTORY_TABLES_LEFT_HEAL_SPREAD=1` (off by default).**
+  - The heal of the slots left to the draws whose mark expired, and the expiry of their holds, ran in one sync every 64 frames: some 43,000 slots at once on the boat (wall2, item 3). With the switch, each frame heals one 64th of each heap's title slots, in whole words of 64 slots: the part numbered `frame % 64`. Every slot is looked at once in any 64 frame numbers. A frame number no sync met gets its part healed at the next sync, at most one whole round after a long gap (`left::heal_parts`, `left::heal_span`, `HostHeap::left_heal_in`).
+  - **Off by default** because it is not a pure scheduling change with identical results:
+    - a slot is healed, and a hold too old let go, at the frame of its part, up to 63 frames earlier or later than the burst would have done it;
+    - a slot a draw marks again in between is left by one schedule and healed by the other;
+    - copies live for other lengths of time.
+  - The bound is the same: a slot whose mark expired is healed within 64 frames.
+  - Test: `descriptor::left::tests::the_spread_heal_covers_every_slot_once_in_64_frames`. The parts cover any heap once. Frames met one by one or in jumps of 2 and 3 heal each part once in any 64 frame numbers. A heap's 1,000 left bits are each taken exactly once over 64 frames, and the holds of a part go with it.
+- **Nothing else** in stage 2's behaviour changes. Without the spread switch, the heal runs the same code over every slot, as before.
 
 ## Roadmap: from about 3.5 fps toward 15–20 (2026-11-25; superseded by [ROADMAP.md](ROADMAP.md), kept for history)
 

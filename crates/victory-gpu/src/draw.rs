@@ -1389,6 +1389,9 @@ impl State {
 
     /// [`State::bind`] before a rejection's slots are given back.
     fn bind_attempt(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // VIcky (stage 4's counter): the heap mirror's calls from here are
+        // the draws'.
+        let _caller = crate::descriptor::host::made_read::As::enter(crate::descriptor::host::made_read::Caller::Draw);
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);

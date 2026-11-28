@@ -104,7 +104,7 @@
 //! `VICTORY_TABLES_LEFT_HOLD=0`: no holds, to tell whether they matter.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::shadow::Shadow;
@@ -689,6 +689,63 @@ pub(crate) const HOLD_FRAMES: u32 = 240;
 /// holds whose mark is too old let go, once in this many frames.
 pub(crate) const HEAL_EVERY: u64 = 64;
 
+/// `VICTORY_TABLES_LEFT_HEAL_SPREAD=1` (off by default): the heal is spread
+/// over its [`HEAL_EVERY`] frames. Each frame heals one part of each heap's
+/// title slots, part `frame % HEAL_EVERY` ([`heal_parts`], [`heal_span`]),
+/// so every slot is looked at once in any 64 frames, as with the heal in one
+/// burst (wall2: some 43,000 slots healed in one sync every 64 frames).
+///
+/// Off by default because it is not a pure scheduling change: a slot is
+/// healed, and a hold whose mark is too old let go, at the frame of its
+/// part, up to 63 frames before or after the burst would have done it. A
+/// slot a draw marks again in between is left by one and healed by the
+/// other, and copies live other lengths of time. The bound is the same: a
+/// slot whose mark expired is healed within 64 frames.
+pub(crate) fn heal_spread() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_SPREAD.get() {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = left_set() && std::env::var_os("VICTORY_TABLES_LEFT_HEAL_SPREAD").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "VICTORY_TABLES_LEFT_HEAL_SPREAD=1: the heal of the slots left to the draws whose mark expired is spread \
+                 over {HEAL_EVERY} frames, a {HEAL_EVERY}th of each heap's title slots a frame"
+            );
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`heal_spread`] for this thread, whatever the environment.
+    pub(crate) static TEST_SPREAD: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// The parts of the spread heal due at `frame` when the last heal of the
+/// heap was at frame `last` (0: none yet): the part of every frame number
+/// after `last` up to `frame` (its number modulo [`HEAL_EVERY`]), each once,
+/// at most one whole round. A frame number that no heap sync met (the title
+/// begins two or three frames for one it presents) has its part healed at
+/// the next one, so no part waits more than 64 frame numbers.
+pub(crate) fn heal_parts(last: u64, frame: u64) -> std::ops::RangeInclusive<u64> {
+    let first = if last == 0 { frame } else { last.saturating_add(1).max(frame.saturating_sub(HEAL_EVERY - 1)) };
+    first..=frame
+}
+
+/// The title slots of the spread heal's part `part` (taken modulo
+/// [`HEAL_EVERY`]) in a heap whose left bits are `words` words of 64 slots:
+/// whole words, so that the parts cover every slot once.
+pub(crate) fn heal_span(part: u64, words: usize) -> std::ops::Range<u32> {
+    let p = (part % HEAL_EVERY) as usize;
+    let n = HEAL_EVERY as usize;
+    let word = |p: usize| (p * words / n * 64) as u32;
+    word(p)..word(p + 1)
+}
+
 /// `VICTORY_TABLES_LEFT_GRACE=1` (off by default): stage 2's rule 2.
 pub(crate) fn grace() -> bool {
     #[cfg(test)]
@@ -809,15 +866,25 @@ static HOLDS_ALIVE: AtomicI64 = AtomicI64::new(0);
 /// title writes another record there: no copy lives longer than without the
 /// switch, where the slot held it as long as the record stayed.
 ///
-/// A pointer and a key per title slot, swapped atomically (no lock: every
-/// draw takes the holds of the entries it reads): 16 bytes a slot, with the
-/// switch only.
-pub(crate) struct Holds {
-    copies: Vec<AtomicPtr<Shadow>>,
+/// A pointer and a key per title slot: 16 bytes a slot, with the switch
+/// only. Every draw takes the holds of the entries it reads, so there is no
+/// table lock; the key and the pointer of a slot change together under a
+/// lock of that slot alone, the pointer's low bit ([`Holds::lock`]): two
+/// recording threads taking one slot at once cannot leave one's key with
+/// the other's copy (wall2, item 4: the key and the pointer were stored
+/// apart). Uncontended, that is one compare-and-swap more than before.
+///
+/// Generic for the tests; the heaps hold host copies.
+pub(crate) struct Holds<T = Shadow> {
+    copies: Vec<AtomicPtr<T>>,
     keys: Vec<AtomicU64>,
 }
 
-impl Holds {
+/// The bit of a slot's pointer that locks the slot: `Arc::into_raw` points
+/// past the reference counts, so its low bit is always clear.
+const HOLD_LOCKED: usize = 1;
+
+impl<T> Holds<T> {
     /// The holds of `slots` title slots (none: an empty table).
     pub(crate) fn new(slots: u32) -> Self {
         Holds {
@@ -830,71 +897,135 @@ impl Holds {
         self.copies.is_empty()
     }
 
+    /// Locks slot `at` (spinning while another thread has it: a few
+    /// instructions) and returns the copy it holds, null for none. The key
+    /// is read and written only between this and [`Holds::unlock`].
+    fn lock(&self, at: usize) -> *mut T {
+        let slot = &self.copies[at];
+        let mut held = slot.load(Relaxed);
+        loop {
+            if held.addr() & HOLD_LOCKED != 0 {
+                std::hint::spin_loop();
+                held = slot.load(Relaxed);
+                continue;
+            }
+            match slot.compare_exchange_weak(held, held.map_addr(|a| a | HOLD_LOCKED), Acquire, Relaxed) {
+                Ok(_) => return held,
+                Err(now) => held = now,
+            }
+        }
+    }
+
+    /// Unlocks slot `at`, which now holds `copy` (null: none).
+    fn unlock(&self, at: usize, copy: *mut T) {
+        debug_assert_eq!(copy.addr() & HOLD_LOCKED, 0);
+        self.copies[at].store(copy, Release);
+    }
+
     /// Title slot `index`, holding the record `key`, holds `copy`. Returns
     /// whether that was new (not the copy and record it held already); the
     /// copy it held before, if any, is given back for retiring.
-    pub(crate) fn take(&self, index: u32, key: u64, copy: &Arc<Shadow>) -> (bool, Option<Arc<Shadow>>) {
-        let (Some(slot), Some(held_key)) = (self.copies.get(index as usize), self.keys.get(index as usize)) else {
-            return (false, None);
-        };
-        if slot.load(Relaxed).cast_const() == Arc::as_ptr(copy) && held_key.load(Relaxed) == key {
+    pub(crate) fn take(&self, index: u32, key: u64, copy: &Arc<T>) -> (bool, Option<Arc<T>>) {
+        let at = index as usize;
+        if at >= self.copies.len() || at >= self.keys.len() {
             return (false, None);
         }
-        held_key.store(key, Relaxed);
+        let held = self.lock(at);
+        if held.cast_const() == Arc::as_ptr(copy) && self.keys[at].load(Relaxed) == key {
+            self.unlock(at, held);
+            return (false, None);
+        }
+        self.keys[at].store(key, Relaxed);
         let new = Arc::into_raw(copy.clone()).cast_mut();
-        let old = slot.swap(new, Relaxed);
-        if old.is_null() {
+        self.unlock(at, new);
+        if held.is_null() {
             HOLDS_ALIVE.fetch_add(1, Relaxed);
             return (true, None);
         }
         // SAFETY: every pointer in the table came from `Arc::into_raw` and is
-        // owned by the table until swapped out, once.
-        (true, Some(unsafe { Arc::from_raw(old.cast_const()) }))
+        // owned by the table until taken out under its slot's lock, once.
+        (true, Some(unsafe { Arc::from_raw(held.cast_const()) }))
     }
 
     /// The title wrote record `key` at title slot `index`: a hold taken for
     /// another record goes (given back for retiring).
-    pub(crate) fn release_other(&self, index: u32, key: u64) -> Option<Arc<Shadow>> {
-        let slot = self.copies.get(index as usize)?;
-        if slot.load(Relaxed).is_null() || self.keys.get(index as usize).is_some_and(|k| k.load(Relaxed) == key) {
+    pub(crate) fn release_other(&self, index: u32, key: u64) -> Option<Arc<T>> {
+        let at = index as usize;
+        // (A look without the lock first: most slots hold nothing.)
+        if self.copies.get(at)?.load(Relaxed).is_null() {
             return None;
         }
-        self.drop_at(index as usize)
+        let held = self.lock(at);
+        if held.is_null() || self.keys[at].load(Relaxed) == key {
+            self.unlock(at, held);
+            return None;
+        }
+        self.unlock(at, std::ptr::null_mut());
+        HOLDS_ALIVE.fetch_sub(1, Relaxed);
+        // SAFETY: as in `take`.
+        Some(unsafe { Arc::from_raw(held.cast_const()) })
     }
 
     /// The hold of slot `at`, out of the table.
-    fn drop_at(&self, at: usize) -> Option<Arc<Shadow>> {
-        let old = self.copies.get(at)?.swap(std::ptr::null_mut(), Relaxed);
-        if old.is_null() {
+    fn drop_at(&self, at: usize) -> Option<Arc<T>> {
+        if at >= self.copies.len() {
+            return None;
+        }
+        let held = self.lock(at);
+        self.unlock(at, std::ptr::null_mut());
+        if held.is_null() {
             return None;
         }
         HOLDS_ALIVE.fetch_sub(1, Relaxed);
         // SAFETY: as in `take`.
-        Some(unsafe { Arc::from_raw(old.cast_const()) })
+        Some(unsafe { Arc::from_raw(held.cast_const()) })
+    }
+
+    /// Whether slot `at` holds a copy (or is being changed now).
+    fn holding(&self, at: usize) -> bool {
+        !self.copies[at].load(Relaxed).is_null()
     }
 
     /// Lets go of the holds whose slot `keep` refuses; returns them.
-    pub(crate) fn expire(&self, keep: impl Fn(u32) -> bool) -> Vec<Arc<Shadow>> {
-        (0..self.copies.len())
-            .filter(|&at| !self.copies[at].load(Relaxed).is_null() && !keep(at as u32))
+    pub(crate) fn expire(&self, keep: impl Fn(u32) -> bool) -> Vec<Arc<T>> {
+        self.expire_in(0..u32::MAX, keep)
+    }
+
+    /// [`Holds::expire`] for the title slots in `slots` alone (the heal
+    /// spread over its frames, [`heal_span`]).
+    pub(crate) fn expire_in(&self, slots: std::ops::Range<u32>, keep: impl Fn(u32) -> bool) -> Vec<Arc<T>> {
+        let end = (slots.end as usize).min(self.copies.len());
+        (slots.start as usize..end)
+            .filter(|&at| self.holding(at) && !keep(at as u32))
             .filter_map(|at| self.drop_at(at))
             .collect()
     }
 
     /// Lets go of every hold; returns them.
-    pub(crate) fn clear(&self) -> Vec<Arc<Shadow>> {
+    pub(crate) fn clear(&self) -> Vec<Arc<T>> {
         self.expire(|_| false)
     }
 
     /// The copy title slot `index` holds, by its address (tests).
     #[cfg(test)]
     pub(crate) fn held(&self, index: u32) -> Option<usize> {
-        let held = self.copies.get(index as usize)?.load(Relaxed);
-        (!held.is_null()).then_some(held as usize)
+        let held = self.copies.get(index as usize)?.load(Relaxed).map_addr(|a| a & !HOLD_LOCKED);
+        (!held.is_null()).then_some(held.addr())
+    }
+
+    /// The copy and the key title slot `index` holds, read under its lock
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn held_pair(&self, index: u32) -> (Option<usize>, u64) {
+        let at = index as usize;
+        let held = self.lock(at);
+        let key = self.keys[at].load(Relaxed);
+        self.unlock(at, held);
+        ((!held.is_null()).then_some(held.addr()), key)
     }
 }
 
-impl Drop for Holds {
+impl<T> Drop for Holds<T> {
     fn drop(&mut self) {
         drop(self.clear());
     }
@@ -971,8 +1102,15 @@ impl HeapLeft {
     /// The slots whose bit is set and that `take` accepts, in order; their
     /// bits are cleared.
     pub(crate) fn bits_take(&self, take: impl Fn(u32) -> bool) -> Vec<u32> {
+        self.bits_take_in(0..u32::MAX, take)
+    }
+
+    /// [`HeapLeft::bits_take`] for the slots of whole words in `slots` (a
+    /// part of the spread heal, [`heal_span`]).
+    pub(crate) fn bits_take_in(&self, slots: std::ops::Range<u32>, take: impl Fn(u32) -> bool) -> Vec<u32> {
         let mut out = Vec::new();
-        for (w, word) in self.bits.iter().enumerate() {
+        let words = (slots.start as usize / 64).min(self.bits.len())..(slots.end as usize).div_ceil(64).min(self.bits.len());
+        for (w, word) in self.bits.iter().enumerate().take(words.end).skip(words.start) {
             let mut set = word.load(Relaxed);
             while set != 0 {
                 let b = set.trailing_zeros();
@@ -1520,6 +1658,123 @@ mod tests {
         let text = said(0, &counts, 30_000.0, 10, 2.0, [5, 2], &[0; CK_COUNT]);
         assert!(text.contains("mirrored 40 records") && text.contains("waited 2.00 ms for it"), "{text}");
         assert!(text.contains("copies 3.00 ms") && text.contains("0.50 let go and 0.20 made again"), "{text}");
+    }
+
+    /// Recording threads taking one slot at once, for different records,
+    /// leave it holding one record's key with that record's own copy (the
+    /// key and the pointer change together), and no copy is held twice or
+    /// lost: after the table is cleared, only the test holds each copy.
+    #[test]
+    fn a_hold_keeps_its_key_with_its_copy_under_racing_takes() {
+        // Copy `k` is the one for record key `k + 1`.
+        let copies: Vec<Arc<u64>> = (0..6u64).map(|k| Arc::new(k + 1)).collect();
+        let holds: Holds<u64> = Holds::new(4);
+        for round in 0..40u64 {
+            std::thread::scope(|s| {
+                for t in 0..4u64 {
+                    let (holds, copies) = (&holds, &copies);
+                    s.spawn(move || {
+                        let mut x = round * 7 + t * 13 + 1;
+                        for _ in 0..2_000 {
+                            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                            let k = ((x >> 33) % copies.len() as u64) as usize;
+                            let slot = ((x >> 20) % 2) as u32;
+                            if (x >> 40) % 9 == 0 {
+                                drop(holds.release_other(slot, k as u64 + 1));
+                            } else {
+                                let (_, old) = holds.take(slot, k as u64 + 1, &copies[k]);
+                                drop(old);
+                            }
+                        }
+                    });
+                }
+            });
+            for slot in 0..2 {
+                let (held, key) = holds.held_pair(slot);
+                if let Some(at) = held {
+                    let copy = copies.iter().find(|c| Arc::as_ptr(c).addr() == at).expect("a copy of the test's");
+                    assert_eq!(**copy, key, "round {round}, slot {slot}: one record's key with another's copy");
+                }
+            }
+        }
+        drop(holds.clear());
+        assert!(copies.iter().all(|c| Arc::strong_count(c) == 1), "a copy held twice or lost");
+        // The same copy for the same record again: nothing new.
+        let (new, old) = holds.take(3, 1, &copies[0]);
+        assert!(new && old.is_none());
+        let (new, old) = holds.take(3, 1, &copies[0]);
+        assert!(!new && old.is_none());
+        assert_eq!(holds.held(3), Some(Arc::as_ptr(&copies[0]).addr()));
+        let (_, old) = holds.take(3, 2, &copies[1]);
+        assert_eq!(old.map(|c| *c), Some(1), "the copy it held before, given back");
+        assert!(holds.release_other(3, 2).is_none(), "the same record: kept");
+        assert_eq!(holds.release_other(3, 5).map(|c| *c), Some(2), "another record: let go");
+        assert!(holds.held(3).is_none());
+    }
+
+    /// The spread heal's parts cover a heap's title slots once, in whole
+    /// words, for any size; and over frames met one by one or in jumps,
+    /// every part is healed once in any 64 frame numbers, at most one round
+    /// after a long gap.
+    #[test]
+    fn the_spread_heal_covers_every_slot_once_in_64_frames() {
+        for words in [0usize, 1, 5, 63, 64, 65, 200, 2048] {
+            let spans: Vec<_> = (0..HEAL_EVERY).map(|p| heal_span(p, words)).collect();
+            assert_eq!(spans[0].start, 0);
+            assert_eq!(spans[HEAL_EVERY as usize - 1].end as usize, words * 64, "{words} words");
+            assert!(spans.windows(2).all(|w| w[0].end == w[1].start && w[0].start <= w[0].end), "{words} words");
+            assert!(spans.iter().all(|s| s.start % 64 == 0), "whole words");
+            assert_eq!(heal_span(HEAL_EVERY + 3, words), heal_span(3, words));
+        }
+        // Frames met one by one, then in steps of 2 and 3.
+        let mut last = 1_000u64;
+        let mut parts = Vec::new();
+        for step in [1u64, 1, 2, 3, 1, 2, 2, 3].iter().cycle().take(200) {
+            let frame = last + step;
+            parts.extend(heal_parts(last, frame));
+            last = frame;
+        }
+        assert_eq!(parts, (1_001..=last).collect::<Vec<u64>>(), "each frame number's part once, in order");
+        for window in parts.windows(HEAL_EVERY as usize) {
+            let mut seen: Vec<u64> = window.iter().map(|f| f % HEAL_EVERY).collect();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..HEAL_EVERY).collect::<Vec<u64>>());
+        }
+        assert_eq!(heal_parts(100, 1_000).count(), HEAL_EVERY as usize, "one round after a long gap");
+        assert_eq!(heal_parts(0, 500).collect::<Vec<u64>>(), [500], "the first heal: its own part");
+        assert_eq!(heal_parts(500, 500).count(), 0, "the same frame again: nothing");
+        // A heap's left bits, all set: taken part by part over 64 frames,
+        // every slot exactly once.
+        TEST_LEFT.set(Some((Mode2::On, true, false, true)));
+        let left = HeapLeft::new(1_000, false);
+        for index in 0..1_000 {
+            left.bit_set(index);
+        }
+        let (mut taken, mut last) = (Vec::new(), 4_000u64);
+        for frame in 4_001..4_001 + HEAL_EVERY {
+            for part in heal_parts(last, frame) {
+                taken.extend(left.bits_take_in(heal_span(part, left.bits.len()), |_| true));
+            }
+            last = frame;
+        }
+        taken.sort_unstable();
+        assert_eq!(taken, (0..1_000).collect::<Vec<u32>>());
+        TEST_LEFT.set(None);
+        // The holds of a part are looked at with it, the others not.
+        let holds: Holds<u64> = Holds::new(300);
+        let copy = Arc::new(7u64);
+        for index in [0, 63, 64, 200, 299] {
+            let _ = holds.take(index, 1, &copy);
+        }
+        // (5 words: parts 0 to 11 are empty, part 12 is the first word.)
+        assert_eq!(heal_span(11, 5), 0..0);
+        let span = heal_span(12, 300usize.div_ceil(64));
+        assert_eq!(span, 0..64);
+        assert_eq!(holds.expire_in(span, |_| false).len(), 2, "slots 0 and 63");
+        assert!(holds.held(0).is_none() && holds.held(64).is_some());
+        assert_eq!(holds.expire_in(0..u32::MAX, |index| index != 299).len(), 1);
+        assert_eq!(holds.clear().len(), 2);
+        assert_eq!(Arc::strong_count(&copy), 1);
     }
 
     /// The sync's makings are counted by rule only inside [`SyncMaking`],

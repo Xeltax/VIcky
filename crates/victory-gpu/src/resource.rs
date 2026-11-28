@@ -1799,7 +1799,7 @@ pub(crate) fn let_go_idle() {
                 None
             }
         };
-        if let Some((host, _)) = gone {
+        if let Some((host, twin)) = gone {
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
@@ -1809,6 +1809,11 @@ pub(crate) fn let_go_idle() {
                 first = Some(at);
             }
             crate::host::retire(host);
+            // VIcky (`VICTORY_SUBMIT_LANES`, ON phases): its twin too, on the
+            // reaper after the next send (else dropped here, as before).
+            if let Some(twin) = twin {
+                crate::host::lanes::drop_after_send(twin);
+            }
         }
     }
     if went > 0 {

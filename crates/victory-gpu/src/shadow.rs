@@ -3014,6 +3014,22 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
 }
 
+/// VIcky (`VICTORY_SUBMIT_LANES`, `crate::host::lanes`): `jobs` for the kept
+/// threads, after their shared work, as the snapshots given beside are
+/// ([`snapside`]); no caller of [`wide`] waits for them. The caller comes for
+/// them itself (each job runs once, whoever takes it first).
+pub(crate) fn wide_later(jobs: Vec<Box<dyn FnOnce() + Send>>) {
+    if jobs.is_empty() {
+        return;
+    }
+    let workers = workers();
+    // Under the shared queue's lock, as in `snapside::give`: no kept thread
+    // misses the word.
+    let _shared = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+    workers.later.lock().unwrap_or_else(|e| e.into_inner()).extend(jobs);
+    workers.more.notify_all();
+}
+
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;
 

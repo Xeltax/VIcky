@@ -182,6 +182,8 @@ fn mirror(handle: u64, copied: bool) {
         Some(host) => {
             drop(pending);
             if let Some(host) = host {
+                // (VIcky, stage 4's counter: the title's calls and copies.)
+                let _caller = host::made_read::As::enter(host::made_read::Caller::Call);
                 // (VIcky, `VICTORY_LOT4_PROBE`: not the sync's slots, P2.)
                 crate::lot4::in_call(|| {
                     if copied {
@@ -636,6 +638,8 @@ pub(crate) fn sync_line(frames: f64) {
     // lie, the sync's records by rule, the pass's marked slots (said without
     // the switch too, so that a run without it says where its tables lie).
     left::line(frames, mirrored as f64 / frames, tabled_left);
+    // VIcky (stage 4's counter): the heap mirror's calls that only looked.
+    host::made_read::line(frames);
     // VIcky (diagnostics): the sync and its join by the submission's place
     // in the burst, next to it.
     #[cfg(feature = "diagnostics")]

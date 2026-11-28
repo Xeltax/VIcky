@@ -707,6 +707,10 @@ pub(crate) fn let_go_idle() {
     // is reset: one only the table holds is named by no list, recorded or
     // running.
     let (mut went, mut bytes) = (0u64, 0u64);
+    // VIcky (`VICTORY_SUBMIT_LANES`, ON phases): those let go are dropped on
+    // the reaper after the next send, not here under the table's lock.
+    let later = crate::host::lanes::drops_later();
+    let mut gone = Vec::new();
     map.retain(|_, s| {
         let keep = Arc::strong_count(s) > 1
             || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
@@ -715,9 +719,15 @@ pub(crate) fn let_go_idle() {
             LET_GO[1].fetch_add(s.bytes, Relaxed);
             went += 1;
             bytes += s.bytes;
+            if later {
+                gone.push(s.clone());
+            }
         }
         keep
     });
+    if !gone.is_empty() {
+        crate::host::lanes::drop_after_send(gone);
+    }
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }
@@ -897,6 +907,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     crate::framelog::add(crate::framelog::T::Uploads, 1);
+    crate::host::lanes::uploaded();
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
@@ -950,12 +961,14 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     }
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
-    // again if it detiles (the next list then uploads once more).
+    // again if it detiles (the next list then uploads once more). (VIcky,
+    // `VICTORY_SUBMIT_LANES`: a step on the buffer's state, so after a
+    // refresh of it an earlier list gave to the wide threads.)
     {
-        let staging = staging.clone();
-        list.defer_host(move || {
-            staging.uploaded.store(true, Relaxed);
-            staging.dirty.store(false, Relaxed);
+        let held = staging.clone();
+        list.defer_texture_host(&staging, move || {
+            held.uploaded.store(true, Relaxed);
+            held.dirty.store(false, Relaxed);
         });
     }
     // Levels on demand (`crate::tiles`): after the check below, in the
@@ -971,7 +984,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         return;
     };
     list.defer_texture(staging.clone());
-    list.defer_host(move || {
+    list.defer_texture_host(&staging.clone(), move || {
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
         // A texture picked by index has no staging buffer after this

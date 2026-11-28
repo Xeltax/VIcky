@@ -179,7 +179,16 @@ impl HostHeap {
             return None;
         }
         self.mirror_waited_in(frame, at, false);
-        if live && frame >= self.left.healed.load(Relaxed) + left::HEAL_EVERY {
+        let last = self.left.healed.load(Relaxed);
+        if live && left::heal_spread() {
+            // (VIcky, `VICTORY_TABLES_LEFT_HEAL_SPREAD=1`: a part of the slots
+            // each frame, every slot once in 64 frames.)
+            if frame > last && self.left.healed.compare_exchange(last, frame, Relaxed, Relaxed).is_ok() {
+                for part in left::heal_parts(last, frame) {
+                    self.left_heal_in(at, frame, left::heal_span(part, self.left.bits.len()));
+                }
+            }
+        } else if live && frame >= last + left::HEAL_EVERY {
             self.left.healed.store(frame, Relaxed);
             self.left_heal(at, frame);
         }
@@ -221,13 +230,20 @@ impl HostHeap {
     /// before for good. And the holds whose mark is [`left::HOLD_FRAMES`]
     /// frames old go. Returns the slots mirrored and the holds let go.
     pub(super) fn left_heal(&self, at: (u64, u64), frame: u64) -> [usize; 2] {
-        let expired = self
-            .left
-            .bits_take(|index| !self.buffer_marked_lately(index, frame) && !self.tabled_lately(index, frame));
+        self.left_heal_in(at, frame, 0..u32::MAX)
+    }
+
+    /// [`HostHeap::left_heal`] of the title slots in `slots` alone (with
+    /// `VICTORY_TABLES_LEFT_HEAL_SPREAD=1`, one part of the heal a frame,
+    /// [`left::heal_span`]); the same rules, slot by slot.
+    pub(super) fn left_heal_in(&self, at: (u64, u64), frame: u64, slots: std::ops::Range<u32>) -> [usize; 2] {
+        let expired = self.left.bits_take_in(slots.clone(), |index| {
+            !self.buffer_marked_lately(index, frame) && !self.tabled_lately(index, frame)
+        });
         let [_, mirrored, _] = if expired.is_empty() { [0; 3] } else { self.left_remirror(at, &expired, &[]) };
         left::add2(K::Healed, mirrored as u64);
         let marks = &self.buffer_marks;
-        let gone = self.left.holds.expire(|index| {
+        let gone = self.left.holds.expire_in(slots, |index| {
             marks
                 .get(index as usize)
                 .is_some_and(|stamp| left::within(stamp.load(Relaxed), frame, left::HOLD_FRAMES))

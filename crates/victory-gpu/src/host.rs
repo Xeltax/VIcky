@@ -212,6 +212,11 @@ pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
+        // VIcky (`VICTORY_SUBMIT_LANES`): to the reaper after the next send.
+        if lanes::drops_later() {
+            lanes::hold(Retired(Box::new(object)));
+            return;
+        }
         drop(object);
         return;
     }
@@ -365,6 +370,7 @@ fn submission_us(i: usize, us: u64) {
     crate::framelog::add([crate::framelog::T::PrepareUs, crate::framelog::T::CardWaitUs][i], us);
     if i == 0 {
         crate::framelog::add(crate::framelog::T::Submissions, 1);
+        lanes::prepared(us);
     }
 }
 
@@ -2176,6 +2182,9 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
+    /// VIcky: [`Step::Host`] work on the state of one staging buffer (by
+    /// address), after its refresh ([`lanes`]).
+    TextureHost(usize, Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
@@ -3045,7 +3054,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                 Step::Run(_) => return Some(WHY_RUN),
                 // (A pass beside stands for refreshes: put in their place
                 // before this is asked, `HostList::join_heap_passes`.)
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) | Step::HeapPass(_) => {}
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) | Step::TextureHost(..) | Step::HeapPass(_) => {}
                 #[cfg(feature = "diagnostics")]
                 Step::Inspect(..) => {}
             }
@@ -6605,7 +6614,7 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        let mut batch = Batch { lanes: lanes::Lanes::begin(), ..Batch::default() };
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
@@ -6714,6 +6723,9 @@ impl Host {
         crate::descriptor::left::check_submission(runs);
         #[cfg(feature = "diagnostics")]
         crate::descriptor::burst::submitted(crate::descriptor::beside::on(), joined, _covered);
+        // VIcky ([`lanes`]): the texture refreshes are done before a settle's
+        // copy-backs write title memory and before the card's copies.
+        batch.lanes.finish();
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
@@ -6737,6 +6749,7 @@ impl Host {
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
+            lanes::sent();
             awake::sent(&self.device);
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -6782,6 +6795,7 @@ impl Host {
             unsafe {
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
+                lanes::sent();
                 awake::sent(&self.device);
                 let waited = self
                     .queue
@@ -8267,6 +8281,12 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
+    /// [`HostList::defer_host`] for work on `staging`'s state.
+    pub(crate) fn defer_texture_host(&self, staging: &std::sync::Arc<crate::texture::Staging>, work: impl Fn() + Send + 'static) {
+        let key = std::sync::Arc::as_ptr(staging) as *const () as usize;
+        self.deferred().copies.push(Step::TextureHost(key, Box::new(work)));
+    }
+
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
@@ -8280,6 +8300,14 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
+            // VIcky ([`lanes`]): the refreshes on the wide threads are done
+            // before a title write there, a buffer's before a step on it.
+            match step {
+                &Step::Copy(dst, _, len) => batch.lanes.before_copy(dst, len),
+                Step::Run(_) => batch.lanes.join(),
+                Step::TextureHost(key, _) => batch.lanes.wait_for(*key),
+                _ => {}
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -8316,7 +8344,7 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
+                Step::Run(work) | Step::Host(work) | Step::TextureHost(_, work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
@@ -8356,7 +8384,7 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        batch.lanes.refresh(staging);
                     }
                     continue;
                 }
@@ -8387,6 +8415,7 @@ impl HostList {
                 batch.front_next();
             }
         }
+        batch.lanes.flush();
     }
 }
 
@@ -8489,6 +8518,8 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// VIcky: their refreshes on the wide threads ([`lanes`]).
+    lanes: lanes::Lanes,
 }
 
 /// Where a host copy is brought up to date in a submission (the copies
@@ -8524,6 +8555,10 @@ pub(crate) mod late_water;
 /// VIcky: the card kept awake between submissions, `VICTORY_CARD_AWAKE`
 /// (port of foxhound 9f8838b1).
 mod awake;
+
+/// VIcky: texture refreshes on the wide threads and the last drops on the
+/// reaper, `VICTORY_SUBMIT_LANES` (structural stage 3).
+pub(crate) mod lanes;
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
