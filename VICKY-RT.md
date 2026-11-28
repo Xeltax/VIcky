@@ -1544,6 +1544,27 @@ Read for each: the stale line (S, O), the `writes behind the guards` line, the `
 
 ### Streamed textures: exact uploads and the audit (`VICTORY_TEXTURE_EXACT`, `VICTORY_TEXTURE_AUDIT`)
 
+**Measured (2026-11-28, boat mission save, RT on, full recommended set, one run each, interleaved).** The passenger's printed shirt in the dialogue cutscene:
+
+| Run | Settings | Shirt | fps (last 12 lines) |
+|---|---|---|---|
+| M1 | audit only | wrong (lavender body) | 9.19 |
+| X1 | audit + `TEXTURE_EXACT=1` | mostly right, a few wrong patches | 8.38 |
+| M2 | audit only | mosaic, the boat's console black | 8.00 |
+| X2 | audit + `TEXTURE_EXACT=1` | **clean** | 7.03 |
+
+- The base set broke the shirt in about 5 of 7 earlier boat runs that day.
+- `TEXTURE_EXACT` looks like it helps, but two runs are not enough. It costs about 0.9 fps (unpaired), mostly from part E and the extra uploads from A, C and E.
+- Over one X run, its counters were:
+  - A: 154k slots named, 127 missed by the old rule;
+  - C: 1,402 torn reads caught;
+  - D: 29k holds;
+  - E: 68k settle checks, 19k mismatches, 2.4k fixed.
+- The audit at the decoration bake's draws shows the real problem. When the title bakes, 2,000-4,000 textures still differ from their memory in every run, with or without `EXACT`. Of those, 1,000-1,900 are queued more than 8 frames and 1,000-2,000 are in flight; only 5-190 are out of the queue.
+- In other words, the bindless texture queue is far behind when the bakes happen. A bigger pre-bake budget does not fix it: with `VICTORY_BAKE_TEXTURES_MS=10000 VICTORY_EARLY_TEXTURES_MS=40` the shirt was wrong in 3 of 3 runs, with up to 35k slots due at a bake.
+- Next step: make the pre-bake pass complete and the texture pass parallel. That should also help the 1-2 fps cutscene starts, where this pass takes about 830 ms a frame.
+
+
 2026-11-28, `fx-main-texexact`. Both are opt-in and have not been measured in the game. From Fable's design (`xcl-notes\fable-2026-11-28-texstale2.md`).
 
 **The problem.** With the recommended texture set, a streamed texture picked by index still shows wrong bytes for a whole cutscene in about half of the boat runs: a mosaic (a recycled block's last texture) or another colourway. No total counter separates broken runs from clean ones; it is a lottery per texture. Fable ranked these holes:

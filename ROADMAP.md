@@ -89,7 +89,7 @@ Lot 6's always-on SSE2 `changed_runs` and per-thread counts: picture clean, 9.41
 | **Picture: posterized sky** | `VICTORY_FILTER_3D` | Diamonds on the water | Left off |
 | **Picture: interior mips** | `VICTORY_INTERIOR_MIP_RESIDENCY` | No effect | Left off |
 
-| **Picture: clothing / streamed textures** | `NO_WAIT_FALLBACK` + `DS_HOLD` + `PAGE_WRITES=all` + `BCPACK_FIXES` + `RECHECK_PARTLY` + `HEAP_RECHECK_MIPS` (every 960) | Never-re-uploaded stale slots 82 -> 3-15 per sample; no fps cost. **Not solved:** the passenger's shirt still breaks in about half the boat runs (4 of 7 on 2026-11-28) | Recommended; root cause open, top picture priority |
+| **Picture: clothing / streamed textures** | Recommended texture set; `VICTORY_TEXTURE_EXACT=1` (opt-in) and `VICTORY_TEXTURE_AUDIT` | Base breaks the shirt in about 5 of 7 boat runs. `EXACT`: 1 clean, 1 mostly right of 2, about -0.9 fps. The audit at the title's decoration bakes finds 2-4k textures behind their memory (queue backlog) | Root cause = queue backlog at bake time: make the pre-bake pass complete and the texture pass parallel (top picture priority) |
 
 | **Structural stage 1** | `VICTORY_TABLE_BOUND` | **+1.66 fps boat (10.48 fps run), +1.18 prologue**; stage-2 criterion passes (64-72 %) | Optional. With `TABLE_BOUND_FRESH` (stage 1b) the picture is clean but the gain shrinks to +0.17 boat / +0.39 prologue: the speed came from skipping the staleness work. Next: stage 2 |
 
