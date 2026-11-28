@@ -1475,7 +1475,7 @@ Read for each: the stale line (S, O), the `writes behind the guards` line, the `
 
 ## Structural: tables left to the draws (2026-11-28; opt-in, not measured in the game yet)
 
-The design is `xcl-notes\fable-2026-11-28-structural.md`. A draw already makes every entry of the tables it makes afresh in dynamic slots of its own (`draw.rs` `State::tables`). The heap sync, the pass over buffer views and the texture pass then make the same title slots again, for shaders that pick views by index. That second making is most of the join, most of the pass and most of the texture pass. The project stops it in four stages, one branch and one switch each, each with an `=alt`. This section is stage 1. Stage 2 re-lands the dropped commit 7b66261e (`VICTORY_TABLES_LEFT`, buffer slots left to the draws, with the host copies kept); it is not ported here.
+The design is `xcl-notes\fable-2026-11-28-structural.md`. A draw already makes every entry of the tables it makes afresh in dynamic slots of its own (`draw.rs` `State::tables`). The heap sync, the pass over buffer views and the texture pass then make the same title slots again, for shaders that pick views by index. That second making is most of the join, most of the pass and most of the texture pass. The project stops it in four stages, one branch and one switch each, each with an `=alt`. This section has stage 1 (with 1b, `TABLE_BOUND_FRESH`) and stage 2, which re-lands the dropped commit 7b66261e (`VICTORY_TABLES_LEFT`, buffer slots left to the draws) with a hold that keeps their host copies.
 
 ### Stage 1: the table bound, `VICTORY_TABLE_BOUND=1|alt` (`fx-main-tablebound`)
 
@@ -1621,6 +1621,122 @@ Code: `descriptor/left.rs` (`fresh`, `fresh_live`, `C::MarkedTexturesRead`); `de
   - The hold adds one atomic load per check with no request pending.
 - **Hold.** A held draw upload of a texture never uploaded shows what the host copy had (zeros for a new one) for up to 16 frames. The pass's slots already do this.
 - **Not covered.** A slot several draws read, where the one that names it stops but another reads it through a descriptor array from data, is left to the draws for 240 frames with no staging buffer. Memory events still make it due. A new record copied into it as bytes waits for a draw that names it. The table-made stale line counts such slots as "out".
+- **Not measured in the game.** Unit tests only so far.
+
+### Stage 2: buffer slots left to the draws, with the hold, `VICTORY_TABLES_LEFT=1|alt|check` (`fx-main-tablesleft`; opt-in, not measured in the game yet)
+
+The design's stage 2. It re-lands the dropped 7b66261e (2026-11-26) on today's main, and adds what that commit lacked: the hold that keeps the host copies, only read slots left (stage 1b's rule), an `=alt` whose flip leaves nothing stale, a check at submission, and one summary per phase.
+
+Credits (reimplemented here, no code copied):
+- avatarmanz, VIctory-7900XTX 1f1a433676 / a9400a6d6 (`sync_heaps`, "draws' own records left to the draws"), carried in cool_fox's tree (f4b48ad7): the design and its guards (marks of 8 frames, view records only, the 4-frame grace, big tables).
+- myokex, victory-amd c3723f3: the buffer marks kept apart from the texture marks.
+
+**Why 7b66261e measured neutral (T1, 2026-11-26).** The join fell 15 ms and the wait for the pass 25 ms, but copies rose about 30 ms. A host copy of a window is let go once nothing holds it (`shadow.rs` `let_go_idle`): no list, no descriptor slot, no kept range of the pass. Without the switch, the host slot the pass made and the pass's kept range held the copy for as long as the slot held the record. With the switch, only the draws' dynamic slots and lists held it, until the lists were reset. The copy was then let go once idle and made again at the next read.
+
+**What the switch does.** It sets stage 1's bound and marks: `VICTORY_TABLE_BOUND` need not be set. With `VICTORY_TABLE_BOUND=alt` as well, both alternate together (stages 1 and 2 against neither).
+- **Buffer marks, only read slots.** With `VICTORY_TABLE_BOUND_FRESH` (on by default), a table made afresh marks only the entries its draw reads: the shader names them, or picks them by a root constant. Every entry read in place is marked too. Stage 1 marked every entry of a table of up to 64 slots; that rule is kept with `FRESH=0`.
+- **The heap sync** (`HostHeap::left_found`): it runs on every path (page by page, one by one, `VICTORY_HEAP_SYNC_THREADS`, `_LEAN`, `VICTORY_PARALLEL_MIRROR`).
+  - A new record is left to the draws when it is a buffer or constant view (`descriptor::record_is_buffer`: constant buffer views, buffer views of resources, placed buffer views) in a slot with a buffer mark of the last 8 frames.
+  - Its print is not noted, so the sync looks at it again when its page changes. Its slot's left bit is set.
+  - Texture views keep stage 1's rules. A record of no view is mirrored, which empties the slot.
+- **The pass over buffer views** (`heap_pass::slots_for`, `HostHeap::leave_to_draws`, `heap_pass::left_slots`): the marked slots leave its list at the call, and the ranges it kept for them go.
+- **The hold** (`left::Holds`, `HostHeap::hold_copy`): when a draw reads a buffer view through a marked slot, the slot holds the host copy the view reads.
+  - It takes the place of the host slot and the pass's kept range, which held that copy without the switch.
+  - A hold goes when the title writes another record in its slot (the sync sees it, `Holds::release_other`), when its slot's mark is 240 frames old (the heal), or at the flip to off.
+  - No copy lives longer than without the switch, where the slot held it as long as the record stayed.
+  - The table is a pointer and a record key per title slot, swapped atomically with no lock: 16 bytes a slot (about 20 MB), with the switch only. A draw that reads the same record again takes nothing new.
+  - `VICTORY_TABLES_LEFT_HOLD=0` turns the holds off, to tell in one run whether they matter.
+- **The grace** (`VICTORY_TABLES_LEFT_GRACE=1`, **off by default**): the design's rule 2.
+  - A new constant or placed buffer record in a slot without a mark waits 4 frames, its print noted.
+  - It is then mirrored, unless a draw's table claimed the slot meanwhile; then it is left as if it had been left when found.
+  - Off by default because it makes a shader that picks such a buffer by index see it 4 frames late. A constant buffer view written in a new place each frame would always be 4 frames old. Try it in one run with `=check`, which counts what it would leave stale.
+- **The heal**, in ON phases, once in 64 frames: some slots are left with an expired mark (and no texture mark leaves them). Their record is mirrored if it is not the one last noted. Without this, a slot no draw reads any more, whose page the title never writes again, would keep the view it showed before.
+- **Without the switch** the runtime does what it did: one empty-vector check per new record in the sync, one per pass call.
+
+**`=alt`.** Twenty seconds off, twenty on, with the `... (VICTORY_TABLES_LEFT=alt): ON` / `off, as usual` lines that `alt-fps.sh` reads. The phase is taken at the start of each heap sync.
+- At each flip to off, each heap is swept once (`HostHeap::left_flip_off`):
+  - every slot left and not noted since (its left bit), and every record waiting its grace, is read through the kernel a page at a time;
+  - a left slot is mirrored if its record is not the one last noted; a waiting record is mirrored as it is now; both are noted as seen;
+  - every hold goes.
+- The off phase thus starts from what it would have had.
+- Draws set the marks in both phases. In the off phase nothing acts on them: the sync mirrors, the pass keeps its slots, no hold is taken.
+- One line per sweep: `VICTORY_TABLES_LEFT=alt, at the flip to off: N slots left to the draws and W records waiting their grace swept in X ms: R read, M mirrored as the heap sync would have mirrored them, U on pages that could not be read; H holds let go`.
+
+**`=check`.** Everything is mirrored and made as without the switch, so the picture is the off picture. A model notes, per title slot, from when the switch would have left its host slot showing another view than the title's record, or none (`HostHeap::check_making`).
+- The sync's decision flags a record it would leave or hold.
+- The making of a flagged record, and the pass's making of a slot it would leave (`left::left_making`), keep the model's divergence. Any other making (a draw reading a table in place, the sync's making of an unmarked record) ends it.
+- **At each submission** (`left::check_submission`, after the heap sync's join, before the lists go), every slot the lists read is checked. A slot a draw reads through a table it makes, or through a table read in place by name, is made by that draw. That leaves the slots a list reads by an index it computes through a table read in place (noted by `State::left_indexed`). Each such slot must show its record under the switch too. One that would not is a **violation**: counted, the first 16 named in a warning.
+- Lists whose shaders pick buffers from the whole heap are counted, with the slots the switch would have left stale at their submission.
+- The slots the pass made that the switch leaves are counted, with those stale under it (and those for over 8 frames).
+
+**The summary** (one per phase with `alt`, every 20 s with `1` and `check`):
+
+`tables left to the draws (VICTORY_TABLES_LEFT alt, ON|alt, off|on|check), the ON phase that ended|the off phase that ended|...: F frames in S s (X fps); per frame: the heap sync mirrored M records in N syncs of T ms (L left to the draws by a buffer mark, H held by the grace, after it G mirrored and C claimed by a draw's table); the submitting thread waited J ms at the sync's join (n joins); the pass over buffer views P ms for Q slots (R left to the draws), and the submitting thread waited W ms for it (n waits); copies K ms (the frame line's); window copies A let go and B made again; holds T taken, X let go for another record, E expired, F let go at the flip, N alive now (VICTORY_TABLES_LEFT_HOLD on|0: off); D slots healed`
+
+With `check` it goes on: `; check since the last summary: L lists, R slots read by an index through tables read in place, V violations ...; P lists pick buffers from the whole heap, which then had on average S slots the switch would have left stale (N now); the pass made M slots the switch leaves, K of them stale under it (G for over 8 frames); the sync made Y slots the switch would not have`.
+
+- ON against off: records mirrored, the join, the pass and the submitting thread's wait for it, copies, copies let go and made again. The design's stop criteria read straight off these lines.
+- "Left to the draws" counts a left record each time the sync looks at it, which is each time its page changes while its mark lives (its print is not noted), as the sync line's count of slots left by texture marks does.
+- The stage 1 line (`tables and the heap sync ...`) stays, per second.
+
+**Code.** `descriptor/left.rs` (stage 2's block: `Mode2`, `decide`, `Waiting`, `Holds`, `HeapLeft`, the phase counts, the check's counts, `check_submission`, the summary), `descriptor/host/tables_left.rs` (the host heap's part), `descriptor/host.rs` (`mirror_copied`, `copied_due_with`, `mirror_view`), `descriptor/host/sync_lean.rs` (the check's model on the lean path), `descriptor.rs` (`record_is_buffer`, `record_held_kind`, `walk_heap`, `sync_held`), `draw.rs` (`readable` returns the copy, `State::tables`, `State::table_entry`, `State::left_indexed`, `heap_buffers`), `draw/heap_pass.rs` (`slots_for`, `left_slots`, the pass's time and wait by phase), `host.rs` (the list's check notes, the check at submission, the join and the copies by phase), `shadow.rs` (a test-only hook in `let_go_idle`).
+
+**Suggested runs** (the design's, in order; nothing was run for this commit):
+1. Boat, `VICTORY_TABLES_LEFT=check`, 5 minutes: violations must be 0, or the slots are named. Also look at the slots the pass made that the switch leaves, stale under it: shaders that pick buffers from the whole heap could read those.
+2. Boat, `VICTORY_TABLES_LEFT=alt`, on the recommended set (with `VICTORY_TABLE_BOUND=1` if it is there, so stage 1 is on in both phases). Read the paired median with `alt-fps.sh`, and the summaries ON against off.
+3. Prologue, `=alt`.
+4. Picture: boat captures every 32 frames in both phases (hull, shore vegetation, faces, the passenger's shirt), and the prologue bunk room under the ceiling lights.
+5. Only if copies rise by more than 5 ms ON against off: one run with `VICTORY_TABLES_LEFT_HOLD=0`. If copies rise the same, the hold is not the cause: profile (`VICTORY_PROFILE_AFTER=250`) before anything else.
+
+**Expected** (the design's model, predicted from the T1 ratios, if the copies stay flat):
+
+| | Boat | Prologue |
+|---|---|---|
+| Records mirrored | 80k -> 35-45k | 96k -> 43-52k |
+| Join | 23 -> about 8 ms | 31-33 -> about 10 |
+| Submitting thread's wait for the pass | 22 -> 0 | 2 -> 0 |
+| Pass slots | 70k -> 14-20k | 75-89k -> 15-19k |
+| Copies (must hold) | 11 -> at most 16 | 33-36 -> at most 41 |
+| fps | 9.4 -> 13 to 14.5 (card-bound at about 68 ms) | +1 to +1.7 |
+
+Two things make the real figures lower than the model:
+- with FRESH only read entries are marked, where stage 1's counters (64-68 % of the records, 71-72 % of the pass's slots) counted every entry of the small tables;
+- the grace is off by default, and stage 1's "would hold" share was part of those percentages.
+
+Stage 1's line gives both shares, in the off phases.
+
+**Stop criteria** (the design's):
+- On the boat, records mirrored stay above 45k, or the pass's slots above 30k: the tables are not the bulk here. Keep the switch opt-in and stop.
+- Copies rise by more than 5 ms with the hold on: run `HOLD=0` once (above).
+- The paired median is under +0.5 fps on the boat although the join and the pass's wait fell by 25 ms or more: the time went somewhere the lines do not show. Profile; do not stack stage 3 on it.
+
+**Tests.**
+- `descriptor::left::tests::{stage_2_leaves_holds_or_mirrors, stage_2_modes, waiting_records_come_out_after_four_frames, left_bits_are_taken_once, the_summary_is_said}`.
+- `descriptor::host::tables_left_tests::marked_buffer_and_constant_records_are_left_and_the_rest_mirrored`. The sync leaves a buffer or constant view in a marked slot, and finds it again with its page. It mirrors a texture view there, a record of no view, a slot whose mark expired, and everything in the off phase. The pass takes the marked slots out of its list in ON phases only.
+- `descriptor::host::tables_left_tests::the_grace_holds_new_buffer_records_until_a_draw_claims_them`.
+- `descriptor::host::tables_left_tests::the_hold_keeps_copies`, through the real `let_go_idle` (a test-only hook takes one copy as idle, `shadow::TEST_IDLE`):
+  - a window copy a draw read through a left slot is not let go while the slot holds it;
+  - once the title writes another record there, the hold goes, and the copy is let go and made again;
+  - no hold is taken in the off phase or with `HOLD=0`.
+- `descriptor::host::tables_left_tests::holds_expire_with_their_mark_and_go_at_the_flip`.
+- `descriptor::host::tables_left_tests::the_flip_to_off_leaves_nothing_stale`. Left slots and a record waiting its grace are all mirrored at the flip. Afterwards the host slots, the buffer slots noted and the prints are those of a heap that never had the switch. One sweep a flip, none from off to ON.
+- `descriptor::host::tables_left_tests::check_counts_reads_the_switch_would_have_left_stale`:
+  - the model diverges where the switch would leave a slot;
+  - a draw's making in place ends the divergence, and the pass's making of a left slot does not;
+  - a list's read by index is a violation at its submission, and the list's notes are taken.
+- `draw::heap_pass::tests::with_tables_left_the_slots_lists_read_are_as_full_mirroring_makes_them`, the equivalence:
+  - setup: two heaps written alike as a title that copies records as bytes (buffer views moved and emptied, constant views among them); one has the switch, one does not; both are synced and passed over for three rounds;
+  - every slot shaders pick by index ends in the same state on both, with the same kept ranges;
+  - every slot the draws read through their tables is the same once the draws have made it;
+  - the pass keeps no range for the marked slots with the switch.
+
+**Risks (medium).**
+- **A table slot also picked by index.** A shader that picks by index a buffer slot a draw's table read in the last 8 frames reads the view the slot showed before, or none: a single object with a wrong buffer. `=check` counts the reads by index through tables read in place exactly. It can only count exposure for shaders that pick from the whole heap (which slot they pick is not known on the CPU).
+- **The pass becomes much shorter.** `MADE_PASS_FIRST` only changed when the pass runs against the sync, and the boat hull went dark with it. If that was a latent order fault, this stage can show it again; the captures above are for that.
+- **Copies.** If copies still rise, the hold was not the cause. One `HOLD=0` run tells. The other causes the design did not rule out are the pass's merged spans, which made later per-draw refreshes of unwatched memory cheap (`splice`), and the frame line booking the pass's spans outside "copies". A rise with the hold on would point at the first.
+- **Memory.** Holds keep copies at most as long as the slots did without the switch, plus up to 240 frames for a slot no draw reads any more and the title never writes again. The table is 20 MB with the switch.
+- **Left slots whose record becomes all zeros.** The sync never noted their print, so it takes such a slot for one never written. The heal (64 frames after the mark expires) and the flip mirror them.
+- **The grace** (opt-in): shaders that pick a constant or placed buffer by index see it 4 frames late.
 - **Not measured in the game.** Unit tests only so far.
 
 ## Roadmap: from about 3.5 fps toward 15–20 (2026-11-25; superseded by [ROADMAP.md](ROADMAP.md), kept for history)

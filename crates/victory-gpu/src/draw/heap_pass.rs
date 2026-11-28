@@ -28,6 +28,14 @@
 //! `VICTORY_HEAP_PASS_THREADS=<n>` the pass's slots are made on `n` threads
 //! ([`threads`]).
 //!
+//! With VIcky's `VICTORY_TABLES_LEFT` (stage 2 of the structural design,
+//! `crate::descriptor::left`) the pass leaves out the slots a draw's table
+//! read in the last 8 frames, at the call, and drops the ranges it kept for
+//! them ([`left_slots`]): the draws make what they read of their tables, and
+//! the slot's hold keeps the host copy (`HostHeap::hold_copy`). With
+//! `VICTORY_TABLES_LEFT=check` it makes them all the same, as makings the
+//! switch would not do.
+//!
 //! What the pass reads, and when:
 //! - Title memory: only the record of each slot it looks at, three words
 //!   read in place when the pass gets to the slot, under the lock of the
@@ -506,10 +514,11 @@ pub(crate) fn in_place(list: &HostList, heap: &Heap, host: &HostHeap, frame: u64
         .get_or_insert_with(Default::default)
         .entry(std::ptr::from_ref(host) as usize)
         .or_insert_with(|| (0, Ranges::new()));
-    let (mut slots, afresh) = slots_for(host, *passes);
+    let (mut slots, afresh, mut left) = slots_for(host, *passes);
     afresh.apply(ranges, &mut slots);
     *passes += 1;
     buffers(heap, host, &mut slots, ranges, None, !one_look());
+    left_slots(heap, host, &mut left, ranges, !one_look(), frame);
     let views = ranges.len() as u32;
     let spans = spans(ranges);
     drop(kept);
@@ -518,6 +527,8 @@ pub(crate) fn in_place(list: &HostList, heap: &Heap, host: &HostHeap, frame: u64
         shadow.refresh(list, *from, to - from);
     }
     timed(slots.len(), began);
+    // VIcky (`VICTORY_TABLES_LEFT`): the pass's time by its phase.
+    crate::descriptor::left::add2_timed(crate::descriptor::left::K::Passes, crate::descriptor::left::K::PassUs, began.elapsed());
     Made { slots: slots.len(), views, copies: spans.len(), bytes }
 }
 
@@ -824,10 +835,39 @@ fn choose(
 /// [`slots_chosen`] for pass `n` over `host`, at the call; VIcky
 /// (`crate::descriptor::left`'s line): its slots, and those with a buffer
 /// mark of a draw's table (`HostHeap::count_pass_marks`), are counted.
-fn slots_for(host: &HostHeap, n: u64) -> (Vec<u32>, Afresh) {
-    let (slots, afresh) = slots_chosen(host, n);
-    host.count_pass_marks(&slots, crate::frame::current());
-    (slots, afresh)
+/// VIcky (`VICTORY_TABLES_LEFT`, stage 2): the slots with a buffer mark of
+/// the last 8 frames are taken out and returned third
+/// (`HostHeap::leave_to_draws`; none while stage 2 does not act): the draws
+/// that read them through their tables make what they read, and bring its
+/// memory up to date ([`left_slots`]).
+fn slots_for(host: &HostHeap, n: u64) -> (Vec<u32>, Afresh, Vec<u32>) {
+    let (mut slots, afresh) = slots_chosen(host, n);
+    let frame = crate::frame::current();
+    host.count_pass_marks(&slots, frame);
+    let left = host.leave_to_draws(&mut slots, frame);
+    (slots, afresh, left)
+}
+
+/// VIcky (`VICTORY_TABLES_LEFT`, stage 2): what the pass of `frame` does
+/// with the slots [`slots_for`] left to the draws: the ranges it kept for
+/// them go (not brought up to date for them any more: a table's draw brings
+/// up to date what it reads, and the slot's hold keeps its copy,
+/// `HostHeap::hold_copy`). With `check` they are made all the same, as
+/// without the switch, as makings it would not do
+/// (`crate::descriptor::left::left_making`, on this thread), and counted
+/// (`HostHeap::check_pass`).
+fn left_slots(heap: &Heap, host: &HostHeap, left: &mut [u32], ranges: &mut Ranges, marks: bool, frame: u64) {
+    if left.is_empty() {
+        return;
+    }
+    if crate::descriptor::left::checking() {
+        crate::descriptor::left::left_making(|| buffers_taken(heap, host, left, ranges, None, marks));
+        host.check_pass(left, frame);
+        return;
+    }
+    for index in left.iter() {
+        ranges.remove(index);
+    }
 }
 
 /// [`choose`] for pass `n` over `host`, at the call, or with
@@ -1112,6 +1152,12 @@ impl Pending {
             count(C::WaitedUs, began.elapsed().as_micros() as u64);
             // VIcky (`VICTORY_MADE_PASS_FIRST`): by that switch's phase.
             crate::descriptor::host::made_first::pass_waited(began.elapsed());
+            // VIcky (`VICTORY_TABLES_LEFT`): by its phase.
+            crate::descriptor::left::add2_timed(
+                crate::descriptor::left::K::PassWaits,
+                crate::descriptor::left::K::PassWaitUs,
+                began.elapsed(),
+            );
         }
         // VIcky (PF5b's meter): the first submission that asked for it.
         if !self.asked.swap(true, Relaxed) {
@@ -1244,6 +1290,9 @@ struct Call {
     slots: Vec<u32>,
     /// The kept ranges the pass drops first ([`Afresh`]).
     afresh: Afresh,
+    /// VIcky (`VICTORY_TABLES_LEFT`): the slots left to the draws
+    /// ([`slots_for`], [`left_slots`]).
+    left: Vec<u32>,
     /// Whether its making marks the slots it makes ([`one_look`], read at
     /// the call).
     marks: bool,
@@ -1273,7 +1322,7 @@ pub(crate) fn start(list: &HostList, heap: &Heap, host: &HostHeap, frame: u64, r
         *passes += 1;
         *passes - 1
     };
-    let (slots, afresh) = slots_for(host, n);
+    let (slots, afresh, left) = slots_for(host, n);
     let lane = lane();
     // (Not without the lane: the pass would run here, before the answers.)
     let check = lane.is_some() && (check || (check_on() && n % CHECK_EVERY == CHECK_EVERY / 2));
@@ -1292,6 +1341,7 @@ pub(crate) fn start(list: &HostList, heap: &Heap, host: &HostHeap, frame: u64, r
         host: key,
         slots,
         afresh,
+        left,
         marks: !one_look(),
         frame,
         called,
@@ -1340,7 +1390,7 @@ fn run(call: Call) -> Option<(Vec<Range>, Option<Checked>)> {
     count(C::QueuedUs, (began - call.called).as_micros() as u64);
     #[cfg(test)]
     let _fast = TestFast::here(call.fast);
-    let Call { heap, start, host, mut slots, afresh, marks, frame, at_call, .. } = call;
+    let Call { heap, start, host, mut slots, afresh, mut left, marks, frame, at_call, .. } = call;
     let (refreshes, found) = crate::descriptor::with_heap(heap, start, |heap| {
         let here = heap.host().filter(|h| std::ptr::from_ref(*h) as usize == host)?;
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1351,6 +1401,7 @@ fn run(call: Call) -> Option<(Vec<Range>, Option<Checked>)> {
         afresh.apply(ranges, &mut slots);
         let mut found = at_call.is_some().then(Vec::new);
         buffers(heap, here, &mut slots, ranges, found.as_mut(), marks);
+        left_slots(heap, here, &mut left, ranges, marks, frame);
         let views = ranges.len() as u32;
         let spans = spans(ranges);
         drop(kept);
@@ -1363,6 +1414,8 @@ fn run(call: Call) -> Option<(Vec<Range>, Option<Checked>)> {
     })
     .flatten()?;
     count(C::OwnUs, began.elapsed().as_micros() as u64);
+    // VIcky (`VICTORY_TABLES_LEFT`): the pass's time by its phase.
+    crate::descriptor::left::add2_timed(crate::descriptor::left::K::Passes, crate::descriptor::left::K::PassUs, began.elapsed());
     let checked = match (found, at_call) {
         (Some(found), Some(at_call)) => at_call.recv().ok().map(|at_call| compare(&at_call, &found)),
         _ => None,

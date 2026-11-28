@@ -1485,3 +1485,125 @@ fn ranges_are_kept_by_slot() {
     assert!(ranges.is_empty() && ranges.get(other).is_none());
     crate::shadow::unregister(0x7e57_6501, base);
 }
+
+/// VIcky (`VICTORY_TABLES_LEFT`, stage 2): stage 2 now as `on`, with stage
+/// 1's bound, on this thread.
+fn tables_left(on: bool) {
+    use crate::descriptor::left::{Mode2, TEST_BOUND, TEST_LEFT};
+    TEST_BOUND.set(Some((true, true)));
+    TEST_LEFT.set(Some((if on { Mode2::On } else { Mode2::Off }, on, false, true)));
+}
+
+/// VIcky: the switches [`tables_left`] set, unset.
+fn tables_left_done() {
+    crate::descriptor::left::TEST_LEFT.set(None);
+    crate::descriptor::left::TEST_BOUND.set(None);
+}
+
+/// VIcky (`VICTORY_TABLES_LEFT`, stage 2), the equivalence: two heaps
+/// written alike, as a title that copies records into its heap as bytes,
+/// one without the switch and one with it, synced and passed over round
+/// after round (buffer views moved and emptied, constant views among
+/// them). The draws' tables mark slots 2 to 5 in both (only the second acts
+/// on the marks). Every slot the lists read is in the same state on both:
+/// the slots shaders pick by index (not marked) once the sync and the pass
+/// are done, with the same ranges kept for them; the marked ones once the
+/// draws that read them through their tables have made them. With the
+/// switch the pass keeps no range for the marked slots.
+#[test]
+fn with_tables_left_the_slots_lists_read_are_as_full_mirroring_makes_them() {
+    let Some(device) = crate::host::host() else {
+        return;
+    };
+    tables_left(false);
+    let a = title_heap(64);
+    tables_left(true);
+    let b = title_heap(64);
+    let (Some(a), Some(b)) = (a, b) else {
+        tables_left_done();
+        return;
+    };
+    let base = 0x5c_0000_0000u64;
+    crate::shadow::register(0x7e57_5c01, base, 0x4_0000);
+    let marked = [2u32, 3, 4, 5];
+    let copy = |heap: &Heap, slot: u32, view: Option<View>| {
+        crate::descriptor::copy_view(heap.handle(slot).expect("a slot"), view);
+    };
+    let both = |slot: u32, view: Option<View>| {
+        copy(a.1, slot, view.clone());
+        copy(b.1, slot, view);
+    };
+    let rounds: [&dyn Fn(); 3] = [
+        &|| {
+            for slot in 1..=10 {
+                both(slot, Some(buffer_view(base, 0x4_0000, 4 * slot, 8)));
+            }
+            both(3, Some(View::Constant(base + 0x400, 256)));
+            both(11, Some(View::Constant(base + 0x200, 256)));
+        },
+        &|| {
+            both(2, Some(buffer_view(base, 0x4_0000, 64, 8)));
+            both(4, None);
+            both(7, Some(buffer_view(base, 0x4_0000, 96, 4)));
+        },
+        &|| {
+            both(5, Some(View::Constant(base + 0x800, 512)));
+            both(2, Some(buffer_view(base, 0x4_0000, 0, 2)));
+            both(9, None);
+            both(10, Some(buffer_view(base, 0x4_0000, 128, 16)));
+        },
+    ];
+    let heaps = [(&a, false), (&b, true)];
+    let alike = |round: usize, slots: &mut dyn Iterator<Item = u32>, what: &str| {
+        for slot in slots {
+            assert_eq!(a.2.made(slot), b.2.made(slot), "round {round}, slot {slot}: made ({what})");
+            assert_eq!(a.2.shown_raw(slot), b.2.shown_raw(slot), "round {round}, slot {slot}: the buffer shown ({what})");
+        }
+    };
+    for (round, change) in rounds.iter().enumerate() {
+        change();
+        let frame = crate::frame::current();
+        for (heap, on) in heaps {
+            tables_left(on);
+            // The draws' tables.
+            for &slot in &marked {
+                heap.2.slot_tabled_in(slot, frame);
+            }
+            // The heap sync over the heap's records.
+            let start = heap.1.handle(0).expect("a slot");
+            // SAFETY: the title heap's own memory, 64 records.
+            let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, 64 * 32) }.to_vec();
+            let (_, due) = heap.2.copied_due(0..64, (start, 32), start as usize, &bytes);
+            heap.2.mirror_due(&due);
+            // The pass over buffer views.
+            let list = device.new_list().expect("a list");
+            in_place(&list, heap.1, heap.2, 0x5c00 + round as u64);
+            list.close();
+        }
+        // What shaders that pick by index read: alike, with the same ranges.
+        alike(round, &mut (0..64).filter(|slot| !marked.contains(slot)), "picked by index");
+        let (kept_a, kept_b) = (kept(a.2), kept(b.2));
+        for (slot, range) in &kept_a {
+            if marked.contains(slot) {
+                assert!(!kept_b.contains_key(slot), "round {round}: no range kept for {slot} with the switch");
+            } else {
+                assert_eq!(kept_b.get(slot), Some(range), "round {round}: the range of {slot}");
+            }
+        }
+        assert!(kept_b.keys().all(|slot| !marked.contains(slot)));
+        // What the draws read through their tables, made by them: alike.
+        for (heap, on) in heaps {
+            tables_left(on);
+            for &slot in &marked {
+                heap.2.mirror(slot, heap.1.handle(slot).expect("a slot"), true);
+            }
+        }
+        alike(round, &mut (0..64), "after the draws");
+    }
+    tables_left_done();
+    crate::shadow::unregister(0x7e57_5c01, base);
+    forget(a.2);
+    forget(b.2);
+    assert_eq!(release(a.0), 0);
+    assert_eq!(release(b.0), 0);
+}

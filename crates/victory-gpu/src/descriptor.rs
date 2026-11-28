@@ -309,6 +309,9 @@ fn sync_held(asked: Option<&dyn Fn()>, started: std::time::Instant) {
         count.fetch_add(n, Relaxed);
     }
     host::note_kind::synced(us, mirrored + drained);
+    // VIcky (`VICTORY_TABLES_LEFT`): the sync's records and time by phase.
+    left::add2_timed(left::K::Syncs, left::K::SyncUs, started.elapsed());
+    left::add2(left::K::Mirrored, mirrored + drained);
     host::sync_lean::synced(us, mirrored + drained);
     host::par_mirror::synced(us, mirrored + drained);
     // VIcky (`VICTORY_MADE_PASS_FIRST`): the sync's own time by its phase.
@@ -353,6 +356,10 @@ fn walk_heap(
     // flip of its phase to off, the slots with a live mark of a table,
     // mirrored as this sync would have mirrored them.
     host.table_bound_flip((start, step));
+    // VIcky (`VICTORY_TABLES_LEFT`, stage 2, [`left`]; nothing without it):
+    // at a flip of `alt` to off, what it left mirrored and its holds let go;
+    // else the records whose grace is over, and in ON phases the heal.
+    host.tables_left_walk((start, step));
     let threads = sync_threads();
     // VIcky (`VICTORY_PARALLEL_MIRROR`, `host::par_mirror`): the pages read
     // first (here on this thread alone without `VICTORY_HEAP_SYNC_THREADS`),
@@ -1359,6 +1366,75 @@ pub(crate) fn record_view([tag, i, generation]: [u32; 3]) -> Option<View> {
         return None;
     }
     view_at(i, generation)
+}
+
+/// VIcky (`VICTORY_TABLES_LEFT`, [`left`]): whether the record `words` names
+/// a buffer or constant view: a constant buffer view, a buffer view of a
+/// resource (shader or unordered access), or a view of placed memory that
+/// is a buffer. False for textures, samplers and records of no view (or of
+/// a view that went). Stage 2 leaves only these to the draws; texture slots
+/// keep stage 1's rules.
+#[cfg(windows)]
+pub(crate) fn record_is_buffer([tag, i, generation]: [u32; 3]) -> bool {
+    if tag != VIEW_TAG {
+        return false;
+    }
+    match generation >> KIND_SHIFT {
+        CONSTANT => true,
+        PLACED => placed_is_buffer(i, generation),
+        0 => {
+            let views = views_read();
+            views.list.get(i as usize).is_some_and(|(view, current)| {
+                *current == generation
+                    && match view {
+                        View::Constant(..) => true,
+                        View::Shader(r, _) | View::Unordered(r, _, _) => crate::resource::buffer_bytes(*r as This).is_some(),
+                        // (Placed memory above 1 TiB, or `VICTORY_VIEW_INLINE=0`:
+                        // an entry of the table.)
+                        View::Placed(_, resource, _) => resource[0] == 1,
+                        _ => false,
+                    }
+            })
+        }
+        _ => false,
+    }
+}
+
+/// VIcky (`VICTORY_TABLES_LEFT_GRACE=1`, [`left`]): whether the record
+/// `words` is one stage 2's grace holds: a constant buffer view or a view of
+/// placed memory that is a buffer, named whole in the record.
+#[cfg(windows)]
+pub(crate) fn record_held_kind([tag, i, generation]: [u32; 3]) -> bool {
+    tag == VIEW_TAG
+        && match generation >> KIND_SHIFT {
+            CONSTANT => true,
+            PLACED => placed_is_buffer(i, generation),
+            _ => false,
+        }
+}
+
+/// Whether the placed view record words `i`, `generation` name is of a buffer
+/// (its shape's resource description, dimension 1).
+#[cfg(windows)]
+fn placed_is_buffer(i: u32, generation: u32) -> bool {
+    let shape = (payload(i, generation) >> PLACED_ADDRESS_BITS) as usize;
+    views_read().shapes.get(shape).is_some_and(|(_, resource, _)| resource[0] == 1)
+}
+
+/// Tests: writes the record of `view` (none: zeros) at `handle` as bytes,
+/// as a title that copies records into its heap does: nothing is mirrored
+/// (the heap sync finds it).
+#[cfg(test)]
+pub(crate) fn copy_view(handle: u64, view: Option<View>) {
+    let words = match view {
+        Some(view) => {
+            let [i, generation] = words_for(view);
+            [VIEW_TAG, i, generation, 0, 0, 0, 0, 0]
+        }
+        None => [0; 8],
+    };
+    // SAFETY: a descriptor slot of a title heap, 32 bytes.
+    unsafe { (handle as *mut [u32; 8]).write_unaligned(words) };
 }
 
 /// Tests: writes the record of `view` at `handle` and mirrors it, as a

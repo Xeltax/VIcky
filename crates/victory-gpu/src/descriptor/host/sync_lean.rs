@@ -351,6 +351,9 @@ impl HostHeap {
         if super::super::left::in_sync_making() {
             self.count_sync_rule(made, index, key, view.as_ref());
         }
+        // VIcky (`VICTORY_TABLES_LEFT=check`, `super::tables_left`): the
+        // check's model (nothing without it).
+        self.check_making(made, index, key, view.is_some(), false);
         let Some(view) = view else {
             count(Count::NotOurs);
             #[cfg(feature = "diagnostics")]

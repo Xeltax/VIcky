@@ -64,9 +64,50 @@
 //! only a read leaves a slot to the draws, and memory events still find and
 //! make due the slots draws read, whose staged textures are read again
 //! after a write behind the guards and held under a DirectStorage write.
+//!
+//! Stage 2 (`VICTORY_TABLES_LEFT=1|alt|check`, [`mode2`]; off by default;
+//! it sets stage 1's bound and marks too, [`set`]): the buffer and constant
+//! views in title slots draws read through their tables are left to those
+//! draws, which make what they read in dynamic slots of their own. A re-land
+//! of the dropped 7b66261e on this tree (after avatarmanz's VIctory-7900XTX
+//! 1f1a433676 / a9400a6d6, carried in cool_fox's tree, and myokex c3723f3's
+//! buffer marks), with what that commit lacked:
+//! - the heap sync leaves a new buffer or constant view record in a slot
+//!   with a buffer mark of the last [`FRAMES`] frames, and notes it in the
+//!   slot's left bit ([`HeapLeft::bits`]); the pass over buffer views leaves
+//!   such slots out and drops the ranges it kept for them;
+//! - with `VICTORY_TABLE_BOUND_FRESH` (on by default) only the entries a
+//!   draw reads get buffer marks, so only read slots are left;
+//! - the hold ([`Holds`]): the host copy a draw's table reads through a
+//!   marked slot is held by that slot, in place of the host slot and the
+//!   pass's kept range that held it without the switch, until the mark is
+//!   [`HOLD_FRAMES`] frames old or the title writes another record there.
+//!   Without it the copies were let go once idle and made again (T1:
+//!   copies +30 ms while the join fell 15 ms and the pass's wait 25 ms);
+//! - `alt`: twenty seconds off, twenty on; at each flip to off every slot
+//!   left and not noted since is mirrored as the sync would have, what
+//!   waits its grace is mirrored, and the holds go, so the off phase starts
+//!   from what it would have had; in ON phases the slots whose mark expired
+//!   are healed the same way every [`HEAL_EVERY`] frames;
+//! - `check`: everything is mirrored and made as without the switch, and
+//!   at each submission every slot its lists read by an index they compute
+//!   is checked against what the switch would have left there
+//!   ([`check_submission`]); violations are counted and the first named;
+//! - one summary per phase, ON against off: records mirrored, the join, the
+//!   pass and the submitting thread's wait for it, copies, copies let go and
+//!   made again, holds ([`period_line`]).
+//!
+//! `VICTORY_TABLES_LEFT_GRACE=1` (off by default): a new constant or placed
+//! buffer view record in a slot without a mark waits [`GRACE`] frames for
+//! a draw's table to claim it before it is mirrored (the design's rule 2).
+//! A shader that picks such a buffer by index sees it that much later.
+//! `VICTORY_TABLES_LEFT_HOLD=0`: no holds, to tell whether they matter.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use crate::shadow::Shadow;
 
 /// The switch (`VICTORY_TABLE_BOUND=1|alt`).
 pub(crate) static TABLE_BOUND: crate::alt::Alt = crate::alt::Alt::new(
@@ -80,15 +121,16 @@ thread_local! {
     pub(crate) static TEST_BOUND: Cell<Option<(bool, bool)>> = const { Cell::new(None) };
 }
 
-/// Whether the switch is set (`1` or `alt`): draws test a table made afresh
-/// against the title slots the host heap mirrors, and set buffer marks, in
-/// both phases.
+/// Whether the switch is set (`1` or `alt`), or stage 2's
+/// (`VICTORY_TABLES_LEFT`, which builds on the bound and the marks): draws
+/// test a table made afresh against the title slots the host heap mirrors,
+/// and set buffer marks, in both phases.
 pub(crate) fn set() -> bool {
     #[cfg(test)]
     if let Some((set, _)) = TEST_BOUND.get() {
         return set;
     }
-    TABLE_BOUND.set()
+    TABLE_BOUND.set() || left_set()
 }
 
 /// With `alt`, the phase as the last heap sync found it ([`tick`]).
@@ -174,6 +216,12 @@ pub(crate) fn tick() {
     if TABLE_BOUND.mode() == 2 {
         LIVE.store(TABLE_BOUND.on(), Relaxed);
     }
+    // Stage 2 (`VICTORY_TABLES_LEFT=alt`): its phase, and its summary of a
+    // phase that ended.
+    if mode2() == Mode2::Alt {
+        LEFT_LIVE.store(TABLES_LEFT.on(), Relaxed);
+    }
+    period_tick();
 }
 
 /// The first title slot of a table made afresh of `n` slots whose marks are
@@ -214,6 +262,12 @@ pub(crate) fn mark(stamp: &AtomicU32, frame: u64) {
 /// Whether a buffer mark `stamp` (as [`mark`] sets them; 0 for none) is live
 /// at `frame`: set within the last [`FRAMES`] frames, or a little ahead.
 pub(crate) fn lately(stamp: u32, frame: u64) -> bool {
+    within(stamp, frame, FRAMES)
+}
+
+/// Whether a buffer mark `stamp` was set within the last `frames` frames
+/// before `frame`, or a little ahead.
+pub(crate) fn within(stamp: u32, frame: u64, frames: u32) -> bool {
     let stamp = stamp & !TOP;
     if stamp == 0 {
         return false;
@@ -221,7 +275,7 @@ pub(crate) fn lately(stamp: u32, frame: u64) -> bool {
     let now = (frame as u32).wrapping_add(1) & !TOP;
     let since = now.wrapping_sub(stamp) & !TOP;
     let ahead = stamp.wrapping_sub(now) & !TOP;
-    since <= FRAMES || ahead <= AHEAD
+    since <= frames || ahead <= AHEAD
 }
 
 /// Whether entry `k` of a table of `n` entries made afresh gets a buffer
@@ -519,6 +573,795 @@ pub(crate) fn line(frames: f64, mirrored: f64, left: f64) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Stage 2: `VICTORY_TABLES_LEFT=1|alt|check`.
+// ---------------------------------------------------------------------------
+
+/// The switch of stage 2. Its `alt` phases are stage 1's when both are
+/// `alt` (both stages against neither); else its own.
+pub(crate) static TABLES_LEFT: crate::alt::Alt = crate::alt::Alt::following(
+    "VICTORY_TABLES_LEFT",
+    "the buffer and constant views in the title slots draws read through tables are left to those draws (structural stage 2)",
+    &TABLE_BOUND,
+);
+
+/// What `VICTORY_TABLES_LEFT` asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode2 {
+    /// Unset or `0`: as before.
+    Off,
+    /// `1`: on.
+    On,
+    /// `alt`: twenty seconds off, twenty on.
+    Alt,
+    /// `check`: everything mirrored and made as without the switch; what the
+    /// switch would have left is modelled and checked at each submission.
+    Check,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: (mode, live, grace, hold) for this thread, whatever the
+    /// environment says.
+    pub(crate) static TEST_LEFT: Cell<Option<(Mode2, bool, bool, bool)>> = const { Cell::new(None) };
+}
+
+/// `VICTORY_TABLES_LEFT=check`, read once.
+fn check_asked() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_TABLES_LEFT").is_ok_and(|v| v.trim() == "check");
+        if on {
+            tracing::info!(
+                "VICTORY_TABLES_LEFT=check: everything is mirrored and made as without the switch; what it would have left \
+                 is modelled, and each submission checks the slots its lists read by index against it"
+            );
+        }
+        on
+    })
+}
+
+/// Stage 2's mode.
+pub(crate) fn mode2() -> Mode2 {
+    #[cfg(test)]
+    if let Some((mode, ..)) = TEST_LEFT.get() {
+        return mode;
+    }
+    if check_asked() {
+        return Mode2::Check;
+    }
+    match TABLES_LEFT.mode() {
+        1 => Mode2::On,
+        2 => Mode2::Alt,
+        _ => Mode2::Off,
+    }
+}
+
+/// Whether stage 2's switch is set at all.
+pub(crate) fn left_set() -> bool {
+    mode2() != Mode2::Off
+}
+
+/// With `alt`, stage 2's phase as the last heap sync found it ([`tick`]).
+static LEFT_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// Whether stage 2 leaves slots to the draws now: with `1`, and in the ON
+/// phases of `alt`; never with `check` (which mirrors everything).
+pub(crate) fn left_live() -> bool {
+    #[cfg(test)]
+    if let Some((_, live, ..)) = TEST_LEFT.get() {
+        return live;
+    }
+    match mode2() {
+        Mode2::On => true,
+        Mode2::Alt => LEFT_LIVE.load(Relaxed),
+        Mode2::Off | Mode2::Check => false,
+    }
+}
+
+/// Whether `VICTORY_TABLES_LEFT=check`.
+pub(crate) fn checking() -> bool {
+    mode2() == Mode2::Check
+}
+
+/// Whether the sync and the pass decide by stage 2's rules now: when it
+/// leaves slots, and with `check` (which then makes them all the same).
+pub(crate) fn acting() -> bool {
+    left_live() || checking()
+}
+
+/// Whether a table made afresh gives buffer marks only to the entries its
+/// draw reads (stage 2 with `VICTORY_TABLE_BOUND_FRESH`: only read slots
+/// are left to the draws); else stage 1's rule ([`marked`]).
+pub(crate) fn marks_read_only() -> bool {
+    left_set() && fresh()
+}
+
+/// Frames a new constant or placed buffer record outside the tables waits
+/// for a draw's table to claim its slot (`VICTORY_TABLES_LEFT_GRACE=1`).
+pub(crate) const GRACE: u64 = 4;
+
+/// Frames a hold lasts after the last buffer mark of its slot (the life of
+/// the tree's marks of tables' slots, `TABLED_FRAMES`).
+pub(crate) const HOLD_FRAMES: u32 = 240;
+
+/// In ON phases, the slots left whose mark expired are healed, and the
+/// holds whose mark is too old let go, once in this many frames.
+pub(crate) const HEAL_EVERY: u64 = 64;
+
+/// `VICTORY_TABLES_LEFT_GRACE=1` (off by default): stage 2's rule 2.
+pub(crate) fn grace() -> bool {
+    #[cfg(test)]
+    if let Some((_, _, grace, _)) = TEST_LEFT.get() {
+        return grace;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = left_set() && std::env::var_os("VICTORY_TABLES_LEFT_GRACE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "VICTORY_TABLES_LEFT_GRACE=1: a new constant or placed buffer record outside the tables waits {GRACE} frames \
+                 for a draw's table before the heap sync mirrors it"
+            );
+        }
+        on
+    })
+}
+
+/// The hold, on by default with the switch; `VICTORY_TABLES_LEFT_HOLD=0`
+/// turns it off (to tell in one run whether copies let go and made again
+/// are its cost).
+pub(crate) fn hold_on() -> bool {
+    #[cfg(test)]
+    if let Some((_, _, _, hold)) = TEST_LEFT.get() {
+        return hold;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_TABLES_LEFT_HOLD").is_none_or(|v| v != "0");
+        if left_set() {
+            tracing::info!(
+                on,
+                "VICTORY_TABLES_LEFT: the host copies draws read through slots left to them are held by those slots \
+                 (VICTORY_TABLES_LEFT_HOLD=0: not)"
+            );
+        }
+        on
+    })
+}
+
+/// What the heap sync does with a new record ([`decide`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Copied {
+    /// Mirrored now, as before.
+    Mirror,
+    /// Left to the draws that read the slot through a table: its print is
+    /// not noted (looked at again when its page changes again), its slot's
+    /// left bit set.
+    Left,
+    /// Waits [`GRACE`] frames ([`Waiting`]); its print is noted.
+    Wait,
+}
+
+/// The sync's choice for a new record, by stage 2's rules (asked only while
+/// [`acting`]): a buffer or constant view (`buffer`) in a slot with a buffer
+/// mark of the last [`FRAMES`] frames (`marked`) is left; with the grace, a
+/// constant or placed buffer view elsewhere (`held`) waits; the rest is
+/// mirrored (textures follow stage 1's marks, records of no view empty the
+/// slot). The closures are asked in that order, the cheap one first.
+pub(crate) fn decide(marked: impl FnOnce() -> bool, buffer: impl FnOnce() -> bool, held: impl FnOnce() -> bool) -> Copied {
+    let marked = marked();
+    if marked && buffer() {
+        Copied::Left
+    } else if !marked && grace() && held() {
+        Copied::Wait
+    } else {
+        Copied::Mirror
+    }
+}
+
+/// Records that wait their grace ([`Copied::Wait`]), by the frame they were
+/// found in, oldest first.
+#[derive(Default)]
+pub(crate) struct Waiting {
+    queue: std::collections::VecDeque<(u64, Vec<u32>)>,
+}
+
+impl Waiting {
+    /// `slots` were found with new records in `frame`.
+    pub(crate) fn push(&mut self, frame: u64, slots: Vec<u32>) {
+        if !slots.is_empty() {
+            self.queue.push_back((frame, slots));
+        }
+    }
+
+    /// The slots that have waited [`GRACE`] frames at `frame` (with `all`,
+    /// every one), each once and in order; they leave the queue.
+    pub(crate) fn due(&mut self, frame: u64, all: bool) -> Vec<u32> {
+        let mut out = Vec::new();
+        while self.queue.front().is_some_and(|(found, _)| all || found + GRACE <= frame) {
+            if let Some((_, slots)) = self.queue.pop_front() {
+                out.extend(slots);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// The slots waiting (each as often as it was found).
+    pub(crate) fn len(&self) -> usize {
+        self.queue.iter().map(|(_, slots)| slots.len()).sum()
+    }
+}
+
+/// Holds alive in every heap (for the summary).
+static HOLDS_ALIVE: AtomicI64 = AtomicI64::new(0);
+
+/// Per title slot, the host copy a draw read through it while it was left
+/// to the draws, and the record (its key) it was read for. Without the
+/// switch the slot's host slot (made by the pass over buffer views) and
+/// that pass's kept range held the copy as long as the slot held the
+/// record; left to the draws, only the draws' dynamic slots and lists did,
+/// until the lists were reset, and the copy was let go once idle
+/// (`crate::shadow::let_go_idle`) and made again at the next read. Here it
+/// is held until the slot's buffer mark is [`HOLD_FRAMES`] frames old or the
+/// title writes another record there: no copy lives longer than without the
+/// switch, where the slot held it as long as the record stayed.
+///
+/// A pointer and a key per title slot, swapped atomically (no lock: every
+/// draw takes the holds of the entries it reads): 16 bytes a slot, with the
+/// switch only.
+pub(crate) struct Holds {
+    copies: Vec<AtomicPtr<Shadow>>,
+    keys: Vec<AtomicU64>,
+}
+
+impl Holds {
+    /// The holds of `slots` title slots (none: an empty table).
+    pub(crate) fn new(slots: u32) -> Self {
+        Holds {
+            copies: (0..slots).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect(),
+            keys: (0..slots).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.copies.is_empty()
+    }
+
+    /// Title slot `index`, holding the record `key`, holds `copy`. Returns
+    /// whether that was new (not the copy and record it held already); the
+    /// copy it held before, if any, is given back for retiring.
+    pub(crate) fn take(&self, index: u32, key: u64, copy: &Arc<Shadow>) -> (bool, Option<Arc<Shadow>>) {
+        let (Some(slot), Some(held_key)) = (self.copies.get(index as usize), self.keys.get(index as usize)) else {
+            return (false, None);
+        };
+        if slot.load(Relaxed).cast_const() == Arc::as_ptr(copy) && held_key.load(Relaxed) == key {
+            return (false, None);
+        }
+        held_key.store(key, Relaxed);
+        let new = Arc::into_raw(copy.clone()).cast_mut();
+        let old = slot.swap(new, Relaxed);
+        if old.is_null() {
+            HOLDS_ALIVE.fetch_add(1, Relaxed);
+            return (true, None);
+        }
+        // SAFETY: every pointer in the table came from `Arc::into_raw` and is
+        // owned by the table until swapped out, once.
+        (true, Some(unsafe { Arc::from_raw(old.cast_const()) }))
+    }
+
+    /// The title wrote record `key` at title slot `index`: a hold taken for
+    /// another record goes (given back for retiring).
+    pub(crate) fn release_other(&self, index: u32, key: u64) -> Option<Arc<Shadow>> {
+        let slot = self.copies.get(index as usize)?;
+        if slot.load(Relaxed).is_null() || self.keys.get(index as usize).is_some_and(|k| k.load(Relaxed) == key) {
+            return None;
+        }
+        self.drop_at(index as usize)
+    }
+
+    /// The hold of slot `at`, out of the table.
+    fn drop_at(&self, at: usize) -> Option<Arc<Shadow>> {
+        let old = self.copies.get(at)?.swap(std::ptr::null_mut(), Relaxed);
+        if old.is_null() {
+            return None;
+        }
+        HOLDS_ALIVE.fetch_sub(1, Relaxed);
+        // SAFETY: as in `take`.
+        Some(unsafe { Arc::from_raw(old.cast_const()) })
+    }
+
+    /// Lets go of the holds whose slot `keep` refuses; returns them.
+    pub(crate) fn expire(&self, keep: impl Fn(u32) -> bool) -> Vec<Arc<Shadow>> {
+        (0..self.copies.len())
+            .filter(|&at| !self.copies[at].load(Relaxed).is_null() && !keep(at as u32))
+            .filter_map(|at| self.drop_at(at))
+            .collect()
+    }
+
+    /// Lets go of every hold; returns them.
+    pub(crate) fn clear(&self) -> Vec<Arc<Shadow>> {
+        self.expire(|_| false)
+    }
+
+    /// The copy title slot `index` holds, by its address (tests).
+    #[cfg(test)]
+    pub(crate) fn held(&self, index: u32) -> Option<usize> {
+        let held = self.copies.get(index as usize)?.load(Relaxed);
+        (!held.is_null()).then_some(held as usize)
+    }
+}
+
+impl Drop for Holds {
+    fn drop(&mut self) {
+        drop(self.clear());
+    }
+}
+
+/// Stage 2's state of one view heap (empty without the switch).
+pub(crate) struct HeapLeft {
+    /// A bit per title slot: the heap sync left the slot's new record to the
+    /// draws and has not noted a record there since. The flip to off and the
+    /// heal look at these alone.
+    pub(crate) bits: Vec<AtomicU64>,
+    /// The records waiting their grace.
+    pub(crate) waiting: Mutex<Waiting>,
+    /// The holds.
+    pub(crate) holds: Holds,
+    /// `check`: per title slot, the frame (plus one) from which the switch
+    /// would have left its host slot showing another view than the title's
+    /// record, or none; 0 while it would show the same.
+    pub(crate) diverged: Vec<AtomicU32>,
+    /// `check`: per title slot, 1 if the heap sync's next making of it is
+    /// one the switch would not do (set where it decides, taken where it
+    /// makes, on whichever path and thread).
+    pub(crate) flags: Vec<AtomicU8>,
+    /// Whether stage 2 acted at this heap's last heap sync ([`left_live`]):
+    /// a change to false is the flip to off.
+    pub(crate) live_seen: AtomicBool,
+    /// The frame of the last heal.
+    pub(crate) healed: AtomicU64,
+}
+
+impl HeapLeft {
+    /// Stage 2's state for a heap of `titled` title slots (nothing for a
+    /// sampler heap or without the switch).
+    pub(crate) fn new(titled: u32, sampler: bool) -> Self {
+        let on = !sampler && left_set();
+        let check = on && checking();
+        let n = if on { titled } else { 0 };
+        HeapLeft {
+            bits: (0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            waiting: Mutex::default(),
+            holds: Holds::new(if on && !check { titled } else { 0 }),
+            diverged: (0..if check { titled } else { 0 }).map(|_| AtomicU32::new(0)).collect(),
+            flags: (0..if check { titled } else { 0 }).map(|_| AtomicU8::new(0)).collect(),
+            live_seen: AtomicBool::new(left_live()),
+            healed: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether the heap has stage 2's state.
+    pub(crate) fn on(&self) -> bool {
+        !self.bits.is_empty()
+    }
+
+    /// Notes that the sync left title slot `index`'s record.
+    pub(crate) fn bit_set(&self, index: u32) {
+        if let Some(word) = self.bits.get(index as usize / 64) {
+            let bit = 1u64 << (index % 64);
+            if word.load(Relaxed) & bit == 0 {
+                word.fetch_or(bit, Relaxed);
+            }
+        }
+    }
+
+    /// Notes that a record of title slot `index` was noted (mirrored).
+    pub(crate) fn bit_clear(&self, index: u32) {
+        if let Some(word) = self.bits.get(index as usize / 64) {
+            let bit = 1u64 << (index % 64);
+            if word.load(Relaxed) & bit != 0 {
+                word.fetch_and(!bit, Relaxed);
+            }
+        }
+    }
+
+    /// The slots whose bit is set and that `take` accepts, in order; their
+    /// bits are cleared.
+    pub(crate) fn bits_take(&self, take: impl Fn(u32) -> bool) -> Vec<u32> {
+        let mut out = Vec::new();
+        for (w, word) in self.bits.iter().enumerate() {
+            let mut set = word.load(Relaxed);
+            while set != 0 {
+                let b = set.trailing_zeros();
+                set &= set - 1;
+                let index = (w * 64) as u32 + b;
+                if take(index) {
+                    word.fetch_and(!(1u64 << b), Relaxed);
+                    out.push(index);
+                }
+            }
+        }
+        out
+    }
+
+    /// `check`: the switch's host slot of title slot `index` would differ
+    /// from the title's record from `frame` on (kept if it did already).
+    pub(crate) fn diverge(&self, index: u32, frame: u64) {
+        if let Some(since) = self.diverged.get(index as usize)
+            && since.load(Relaxed) == 0
+        {
+            since.store((frame as u32).wrapping_add(1).max(1), Relaxed);
+            DIVERGED_NOW.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// `check`: title slot `index`'s host slot is as the switch would have it.
+    pub(crate) fn undiverge(&self, index: u32) {
+        if let Some(since) = self.diverged.get(index as usize)
+            && since.load(Relaxed) != 0
+            && since.swap(0, Relaxed) != 0
+        {
+            DIVERGED_NOW.fetch_sub(1, Relaxed);
+        }
+    }
+
+    /// `check`: since which frame (plus one) the switch's host slot of
+    /// `index` would differ; 0 if it would not.
+    pub(crate) fn diverged_since(&self, index: u32) -> u32 {
+        self.diverged.get(index as usize).map_or(0, |since| since.load(Relaxed))
+    }
+
+    /// `check`: the sync's next making of title slot `index` is one the
+    /// switch would not do.
+    pub(crate) fn flag(&self, index: u32) {
+        if let Some(flag) = self.flags.get(index as usize) {
+            flag.store(1, Relaxed);
+        }
+    }
+
+    /// `check`: whether the sync's making of `index` now is one the switch
+    /// would not do (the flag taken).
+    pub(crate) fn take_flag(&self, index: u32) -> bool {
+        self.flags.get(index as usize).is_some_and(|flag| flag.load(Relaxed) != 0 && flag.swap(0, Relaxed) != 0)
+    }
+}
+
+/// `check`: title slots in every heap whose host slot the switch would have
+/// left showing another view than the title's record, or none.
+static DIVERGED_NOW: AtomicI64 = AtomicI64::new(0);
+
+thread_local! {
+    /// `check`: while this thread makes slots the switch would have left to
+    /// the draws (the pass over buffer views' left slots, [`left_making`]).
+    static LEFT_MAKING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `check`: `f`, whose makings of slots on this thread are ones the switch
+/// would not do (`HostHeap::check_making`).
+pub(crate) fn left_making<R>(f: impl FnOnce() -> R) -> R {
+    let was = LEFT_MAKING.replace(true);
+    let out = f();
+    LEFT_MAKING.set(was);
+    out
+}
+
+/// `check`: whether this thread is in [`left_making`].
+pub(crate) fn in_left_making() -> bool {
+    LEFT_MAKING.get()
+}
+
+/// What stage 2's summary counts, per phase ([`add2`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum K {
+    /// Heap syncs, their microseconds, the records they mirrored (the sync
+    /// line's), those left to the draws by a buffer mark, those held by the
+    /// grace, and after it mirrored or claimed by a draw's table.
+    Syncs,
+    SyncUs,
+    Mirrored,
+    Left,
+    Held,
+    GraceMirrored,
+    GraceClaimed,
+    /// Joins of the heap sync beside by the submitting thread, and their
+    /// microseconds.
+    Joins,
+    JoinUs,
+    /// Passes over buffer views, their microseconds on their thread (or the
+    /// recording thread's in place), their slots, those left to the draws;
+    /// the submitting thread's waits for a pass still running, and their
+    /// microseconds.
+    Passes,
+    PassUs,
+    PassSlots,
+    PassLeft,
+    PassWaits,
+    PassWaitUs,
+    /// Holds taken (new), let go because the title wrote another record
+    /// in their slot, let go because their mark was too old, let go at the
+    /// flip to off.
+    HoldsTaken,
+    HoldsReleased,
+    HoldsExpired,
+    HoldsCleared,
+    /// Slots healed in ON phases (left, their mark expired, then mirrored).
+    Healed,
+}
+
+const K_COUNT: usize = K::Healed as usize + 1;
+
+/// Per phase (0: ON, or the only phase of `1` and `check`; 1: off).
+static PHASES: [[AtomicU64; K_COUNT]; 2] = [const { [const { AtomicU64::new(0) }; K_COUNT] }; 2];
+
+/// Per phase, the microseconds of the frame line's copies.
+static COPIES_US: [AtomicI64; 2] = [const { AtomicI64::new(0) }; 2];
+
+/// The phase counts go to now.
+fn row() -> usize {
+    usize::from(mode2() == Mode2::Alt && !left_live())
+}
+
+/// Counts `n` of `what` for stage 2's summary (nothing without the switch).
+pub(crate) fn add2(what: K, n: u64) {
+    if n > 0 && left_set() {
+        PHASES[row()][what as usize].fetch_add(n, Relaxed);
+    }
+}
+
+/// [`add2`] of a duration's microseconds, with one of `count`.
+pub(crate) fn add2_timed(count: K, us: K, took: std::time::Duration) {
+    if left_set() {
+        let row = &PHASES[row()];
+        row[count as usize].fetch_add(1, Relaxed);
+        row[us as usize].fetch_add(took.as_micros() as u64, Relaxed);
+    }
+}
+
+/// The frame line's copies took `us` microseconds more (or fewer).
+pub(crate) fn copies_us(us: i64) {
+    if left_set() {
+        COPIES_US[row()].fetch_add(us, Relaxed);
+    }
+}
+
+/// What the `check` counts, between two summaries.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Ck {
+    /// Lists checked at their submission; the slots they read by an index
+    /// they compute through tables read in place; of those, the ones whose
+    /// host slot the switch would have left showing another view than the
+    /// title's record, or none (violations).
+    Lists,
+    Reads,
+    Violations,
+    /// Lists whose shaders pick buffers from the whole heap, and the sum
+    /// over them of the slots the switch would have left stale at their
+    /// submission (a shader of theirs may pick one).
+    Picking,
+    Exposed,
+    /// Slots the pass over buffer views made that the switch leaves to the
+    /// draws, of them those the switch would have left stale, and of those
+    /// stale for over [`FRAMES`] frames.
+    PassLeft,
+    PassStale,
+    PassStaleLong,
+    /// Makings by the heap sync that the switch would not have done.
+    SyncLeft,
+}
+
+const CK_COUNT: usize = Ck::SyncLeft as usize + 1;
+
+static CHECKS: [AtomicU64; CK_COUNT] = [const { AtomicU64::new(0) }; CK_COUNT];
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: with `Some`, what this thread counts for the check is added
+    /// here too.
+    pub(crate) static TEST_CHECKS: std::cell::RefCell<Option<[u64; CK_COUNT]>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Counts `n` of `what` for the check.
+pub(crate) fn add_check(what: Ck, n: u64) {
+    if n > 0 {
+        CHECKS[what as usize].fetch_add(n, Relaxed);
+        #[cfg(test)]
+        TEST_CHECKS.with_borrow_mut(|counts| {
+            if let Some(counts) = counts {
+                counts[what as usize] += n;
+            }
+        });
+    }
+}
+
+/// `check`, at a submission of `runs`, once the heap sync it waits for has
+/// ended (after its join, before the lists go): every slot a list read by
+/// an index it computes through a table read in place must show what its
+/// record names under the switch too (made by the draws or mirrored by the
+/// sync); one that the switch would have left showing another view, or
+/// none, is a violation. Lists whose shaders pick buffers from the whole
+/// heap are counted with the slots the switch would have left stale then.
+pub(crate) fn check_submission(runs: &[&crate::host::HostList]) {
+    if !checking() {
+        return;
+    }
+    let exposed = DIVERGED_NOW.load(Relaxed).max(0) as u64;
+    for list in runs {
+        let (mut reads, picks) = list.take_left_reads();
+        add_check(Ck::Lists, 1);
+        if picks {
+            add_check(Ck::Picking, 1);
+            add_check(Ck::Exposed, exposed);
+        }
+        if reads.is_empty() {
+            continue;
+        }
+        reads.sort_unstable();
+        reads.dedup();
+        for group in reads.chunk_by(|a, b| (a.0, a.1) == (b.0, b.1)) {
+            let (heap, start) = (group[0].0, group[0].1);
+            crate::descriptor::with_heap(heap, start, |heap| {
+                if let Some(host) = heap.host() {
+                    for &(_, _, slot) in group {
+                        host.check_read(slot);
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// `check`: a read of title slot `slot` at a submission found its host slot
+/// diverged since `since` (frame plus one): counted, and the first few named.
+pub(crate) fn violation(slot: u32, since: u32) {
+    add_check(Ck::Violations, 1);
+    static SAID: AtomicU32 = AtomicU32::new(0);
+    if SAID.fetch_add(1, Relaxed) < 16 {
+        let now = (crate::frame::current() as u32).wrapping_add(1);
+        tracing::warn!(
+            slot,
+            frames = now.wrapping_sub(since),
+            "VICTORY_TABLES_LEFT=check: a list reads by index a title slot whose host slot the switch would have left \
+             showing another view than the title's record, or none"
+        );
+    }
+}
+
+/// Stage 2's state for a line: `off`, `on`, `alt, ON`, `alt, off`, `check`.
+pub(crate) fn said2() -> &'static str {
+    if mode2() == Mode2::Check { "check" } else { TABLES_LEFT.said() }
+}
+
+/// The current period of stage 2's summary: its phase row, when it began
+/// (`crate::host::now_ms`), the presents and the window copies let go and
+/// made again then.
+struct Period {
+    row: usize,
+    began: u64,
+    presented: u64,
+    churn: [u64; 2],
+}
+
+static PERIOD: Mutex<Option<Period>> = Mutex::new(None);
+
+/// A period of `1` and `check` lasts this long (`alt`: its phase).
+const PERIOD_MS: u64 = 20_000;
+
+/// At each heap sync: a period that ended (a flip of `alt`, or 20 s of the
+/// others) is summed up ([`period_line`]) and the next begins.
+fn period_tick() {
+    if !left_set() {
+        return;
+    }
+    let row = row();
+    let now = crate::host::now_ms();
+    let fresh = || Period { row, began: now, presented: crate::queue::presented(), churn: crate::shadow::window_churn() };
+    let mut period = PERIOD.lock().unwrap_or_else(|e| e.into_inner());
+    match &*period {
+        None => {
+            for at in [0, 1] {
+                for count in &PHASES[at] {
+                    count.store(0, Relaxed);
+                }
+                COPIES_US[at].store(0, Relaxed);
+            }
+            *period = Some(fresh());
+        }
+        Some(p) if p.row != row || (mode2() != Mode2::Alt && now >= p.began + PERIOD_MS) => {
+            let ended = period.replace(fresh());
+            drop(period);
+            if let Some(ended) = ended {
+                period_line(&ended, now);
+            }
+        }
+        Some(_) => {}
+    }
+}
+
+/// The summary of the period `p` that ended at `now`: per frame, by phase.
+fn period_line(p: &Period, now: u64) {
+    let counts: [u64; K_COUNT] = std::array::from_fn(|i| PHASES[p.row][i].swap(0, Relaxed));
+    let copies = COPIES_US[p.row].swap(0, Relaxed).max(0) as f64;
+    let checks: [u64; CK_COUNT] = std::array::from_fn(|i| CHECKS[i].swap(0, Relaxed));
+    let frames = crate::queue::presented().saturating_sub(p.presented);
+    let churn = crate::shadow::window_churn();
+    let seconds = now.saturating_sub(p.began) as f64 / 1000.0;
+    tracing::info!("{}", said(p.row, &counts, copies, frames, seconds, [churn[0] - p.churn[0], churn[1] - p.churn[1]], &checks));
+}
+
+/// The summary's text (see [`period_line`]).
+fn said(row: usize, c: &[u64; K_COUNT], copies_us: f64, frames: u64, seconds: f64, churn: [u64; 2], ck: &[u64; CK_COUNT]) -> String {
+    let n = frames.max(1) as f64;
+    let get = |k: K| c[k as usize];
+    let per = |k: K| get(k) as f64 / n;
+    let ms = |k: K| get(k) as f64 / 1000.0 / n;
+    let phase = match (mode2(), row) {
+        (Mode2::Alt, 0) => "the ON phase that ended",
+        (Mode2::Alt, _) => "the off phase that ended",
+        (Mode2::Check, _) => "check, the last period",
+        _ => "on, the last period",
+    };
+    let check = if mode2() == Mode2::Check {
+        let get = |k: Ck| ck[k as usize];
+        format!(
+            "; check since the last summary: {} lists, {} slots read by an index through tables read in place, {} \
+             violations (the switch would have left their host slot showing another view than the title's record, or \
+             none); {} lists pick buffers from the whole heap, which then had on average {:.0} slots the switch would \
+             have left stale ({} now); the pass made {} slots the switch leaves, {} of them stale under it ({} for over \
+             {FRAMES} frames); the sync made {} slots the switch would not have",
+            get(Ck::Lists),
+            get(Ck::Reads),
+            get(Ck::Violations),
+            get(Ck::Picking),
+            get(Ck::Exposed) as f64 / get(Ck::Picking).max(1) as f64,
+            DIVERGED_NOW.load(Relaxed).max(0),
+            get(Ck::PassLeft),
+            get(Ck::PassStale),
+            get(Ck::PassStaleLong),
+            get(Ck::SyncLeft),
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "tables left to the draws (VICTORY_TABLES_LEFT {}), {phase}: {frames} frames in {seconds:.1} s ({:.2} fps); per \
+         frame: the heap sync mirrored {:.0} records in {:.1} syncs of {:.2} ms ({:.0} left to the draws by a buffer mark, \
+         {:.0} held by the grace, after it {:.0} mirrored and {:.0} claimed by a draw's table); the submitting thread \
+         waited {:.2} ms at the sync's join ({:.1} joins); the pass over buffer views {:.2} ms for {:.0} slots ({:.0} \
+         left to the draws), and the submitting thread waited {:.2} ms for it ({:.1} waits); copies {:.2} ms (the frame \
+         line's); window copies {:.2} let go and {:.2} made again; holds {:.1} taken, {:.1} let go for another record, \
+         {:.1} expired, {:.1} let go at the flip, {} alive now (VICTORY_TABLES_LEFT_HOLD {}); {:.1} slots healed{check}",
+        said2(),
+        frames as f64 / seconds.max(0.001),
+        per(K::Mirrored),
+        per(K::Syncs),
+        ms(K::SyncUs),
+        per(K::Left),
+        per(K::Held),
+        per(K::GraceMirrored),
+        per(K::GraceClaimed),
+        ms(K::JoinUs),
+        per(K::Joins),
+        ms(K::PassUs),
+        per(K::PassSlots),
+        per(K::PassLeft),
+        ms(K::PassWaitUs),
+        per(K::PassWaits),
+        copies_us / 1000.0 / n,
+        churn[0] as f64 / n,
+        churn[1] as f64 / n,
+        per(K::HoldsTaken),
+        per(K::HoldsReleased),
+        per(K::HoldsExpired),
+        per(K::HoldsCleared),
+        HOLDS_ALIVE.load(Relaxed).max(0),
+        if hold_on() { "on" } else { "0: off" },
+        per(K::Healed),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +1428,98 @@ mod tests {
         assert_eq!(at(Some(60), 4), C::FirstPastWindow as usize);
         assert_eq!(at(Some(60), 5), C::FirstPastTitle as usize);
         assert_eq!(at(None, 5), C::FirstNoIndex as usize);
+    }
+
+    /// Stage 2's rule: a buffer or constant view in a marked slot is left;
+    /// a texture view there is mirrored (stage 1's marks take it); with the
+    /// grace, a constant or placed buffer record elsewhere waits; the rest is
+    /// mirrored. The closures are asked only as needed, the mark first.
+    #[test]
+    fn stage_2_leaves_holds_or_mirrors() {
+        for grace in [false, true] {
+            TEST_LEFT.set(Some((Mode2::On, true, grace, true)));
+            assert_eq!(decide(|| true, || true, || panic!("not asked")), Copied::Left);
+            assert_eq!(decide(|| true, || false, || panic!("not asked")), Copied::Mirror, "a texture in a marked slot");
+            assert_eq!(
+                decide(|| false, || panic!("not asked"), || true),
+                if grace { Copied::Wait } else { Copied::Mirror }
+            );
+            assert_eq!(decide(|| false, || panic!("not asked"), || false), Copied::Mirror);
+        }
+        TEST_LEFT.set(None);
+    }
+
+    /// Stage 2's modes: set, live and check as each mode has them; stage 1's
+    /// bound and marks with any of them.
+    #[test]
+    fn stage_2_modes() {
+        for (mode, live, set2, acts, check) in [
+            (Mode2::Off, false, false, false, false),
+            (Mode2::On, true, true, true, false),
+            (Mode2::Alt, false, true, false, false),
+            (Mode2::Alt, true, true, true, false),
+            (Mode2::Check, false, true, true, true),
+        ] {
+            TEST_LEFT.set(Some((mode, live, false, true)));
+            assert_eq!((left_set(), acting(), checking()), (set2, acts, check), "{mode:?} {live}");
+            assert_eq!(left_live(), live);
+        }
+        TEST_LEFT.set(None);
+    }
+
+    /// New records wait [`GRACE`] frames and come out each once, in order,
+    /// with those of earlier frames; with `all`, every one at once.
+    #[test]
+    fn waiting_records_come_out_after_four_frames() {
+        let mut w = Waiting::default();
+        w.push(10, vec![7, 3]);
+        w.push(10, Vec::new());
+        w.push(11, vec![3, 9]);
+        assert_eq!(w.len(), 4);
+        assert!(w.due(10 + GRACE - 1, false).is_empty());
+        assert_eq!(w.due(10 + GRACE, false), [3, 7]);
+        assert_eq!(w.len(), 2);
+        assert!(w.due(10 + GRACE, false).is_empty());
+        w.push(12, vec![1]);
+        assert_eq!(w.due(12, true), [1, 3, 9], "each once, in order, all of them");
+        assert_eq!(w.len(), 0);
+    }
+
+    /// A slot's left bit is set once, cleared when noted, and taken once.
+    #[test]
+    fn left_bits_are_taken_once() {
+        TEST_LEFT.set(Some((Mode2::On, true, false, true)));
+        let left = HeapLeft::new(200, false);
+        assert!(left.on() && !left.holds.is_empty() && left.diverged.is_empty());
+        for index in [3, 70, 199, 3] {
+            left.bit_set(index);
+        }
+        left.bit_clear(70);
+        assert_eq!(left.bits_take(|index| index != 199), [3]);
+        assert_eq!(left.bits_take(|_| true), [199]);
+        assert!(left.bits_take(|_| true).is_empty());
+        assert!(!HeapLeft::new(200, true).on(), "nothing for a sampler heap");
+        TEST_LEFT.set(Some((Mode2::Check, false, false, true)));
+        let check = HeapLeft::new(200, false);
+        assert!(check.holds.is_empty() && check.diverged.len() == 200, "check: the model, no holds");
+        check.flag(5);
+        assert!(check.take_flag(5) && !check.take_flag(5), "a flag is taken once");
+        TEST_LEFT.set(Some((Mode2::Off, false, false, true)));
+        assert!(!HeapLeft::new(200, false).on());
+        TEST_LEFT.set(None);
+    }
+
+    /// The summary says what it counts, whatever the counts.
+    #[test]
+    fn the_summary_is_said() {
+        let text = said(1, &[0; K_COUNT], 0.0, 0, 0.0, [0, 0], &[0; CK_COUNT]);
+        assert!(text.starts_with("tables left to the draws"), "{text}");
+        let mut counts = [0; K_COUNT];
+        counts[K::Mirrored as usize] = 400;
+        counts[K::PassWaitUs as usize] = 20_000;
+        let text = said(0, &counts, 30_000.0, 10, 2.0, [5, 2], &[0; CK_COUNT]);
+        assert!(text.contains("mirrored 40 records") && text.contains("waited 2.00 ms for it"), "{text}");
+        assert!(text.contains("copies 3.00 ms") && text.contains("0.50 let go and 0.20 made again"), "{text}");
     }
 
     /// The sync's makings are counted by rule only inside [`SyncMaking`],

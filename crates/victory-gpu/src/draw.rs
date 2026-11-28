@@ -1837,6 +1837,12 @@ impl State {
         if !list.first_use(ONCE) {
             return Some(gpu);
         }
+        // VIcky (`VICTORY_TABLES_LEFT=check`): the list's shaders pick buffers
+        // from the whole heap (counted at its submission with the slots the
+        // switch would have left stale then).
+        if left::checking() {
+            list.note_left_picks();
+        }
         // The list may outlive the title's heap object, which owns the table.
         if let Some(buffer) = host.strides_buffer() {
             list.keep(buffer);
@@ -3046,7 +3052,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            let copy = readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -3054,10 +3060,15 @@ impl State {
                 tally.add(left::C::MarkedTexturesRead, 1);
             }
             // VIcky (`VICTORY_TABLE_BOUND`, `crate::descriptor::left`): the
-            // slot's buffer mark, whatever it views (only counted).
+            // slot's buffer mark, whatever it views (stage 1: only counted;
+            // stage 2, `VICTORY_TABLES_LEFT`: its buffer or constant views
+            // are left to the draws, and the slot holds the copy read).
             if left::set() {
                 host.slot_tabled(index);
                 tally.add(left::C::MarkedInPlace, 1);
+                if let Some(copy) = copy {
+                    host.hold_copy(index, handle, &copy);
+                }
             }
         }
     }
@@ -3160,6 +3171,12 @@ impl State {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute, &mut tally);
             }
+        }
+        // VIcky (`VICTORY_TABLES_LEFT=check`): the entries of tables read in
+        // place that the shader picks by an index it computes, which no draw
+        // makes: checked at the list's submission.
+        if left::checking() {
+            self.left_indexed(list, indexed, &fresh, compute);
         }
         let mut made = Vec::new();
         for slot in fresh {
@@ -3279,8 +3296,13 @@ impl State {
             // VIcky (`VICTORY_TABLE_BOUND`): the table's buffer marks,
             // whatever its slots hold (of a big one, which may lie over slots
             // shaders pick by index, only the entries the shader names);
-            // only counted. In both phases of `alt`.
+            // only counted. In both phases of `alt`. (Stage 2,
+            // `VICTORY_TABLES_LEFT` with `VICTORY_TABLE_BOUND_FRESH`: only
+            // the entries the draw reads, below, as only read slots are left
+            // to the draws.)
+            let read_marks = title_first.is_some() && left::marks_read_only();
             if left::set()
+                && !read_marks
                 && let Some(title) = title_first
             {
                 let named = |k: u32| entries.iter().any(|u| u.table_offset_dwords / 8 == k);
@@ -3302,6 +3324,16 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // (VIcky, stage 2: a constant view the draw reads is
+                        // left to it; its constants are copied to the list's
+                        // scratch memory, so no host copy is held.)
+                        if read_marks
+                            && (used.is_some() || selected.binary_search(&k).is_ok())
+                            && let Some(title) = title_first
+                        {
+                            host.slot_tabled(title + k);
+                            tally.add(left::C::MarkedFresh, 1);
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -3317,8 +3349,22 @@ impl State {
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
-                        if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                        let copy = kind.and_then(|kind| readable(list, kind, &view));
+                        // VIcky (stage 2, `VICTORY_TABLES_LEFT`): an entry the
+                        // draw reads is marked (with FRESH), and its title
+                        // slot holds the host copy the draw reads
+                        // (`HostHeap::hold_copy`).
+                        if let Some(title) = title_first
+                            && left::set()
+                            && (if read_marks { kind.is_some() } else { left::marked(n, k, |_| used.is_some()) })
+                        {
+                            if read_marks {
+                                host.slot_tabled(title + k);
+                                tally.add(left::C::MarkedFresh, 1);
+                            }
+                            if let Some(copy) = &copy {
+                                host.hold_copy(title + k, table + u64::from(k) * 32, copy);
+                            }
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -3358,6 +3404,30 @@ impl State {
             made.push((slot, first * 32));
         }
         made
+    }
+
+    /// VIcky (`VICTORY_TABLES_LEFT=check`, `crate::descriptor::left`): the
+    /// entries of the tables read in place (not made afresh: their root
+    /// slots are not in `fresh`) that the shader picks by an index it
+    /// computes, as the draw reads them: from the title slots' host slots,
+    /// which no draw makes. Noted in `list`, whose submission checks them
+    /// (`left::check_submission`). (After 7b66261e's `check_indexed`.)
+    fn left_indexed(&self, list: &HostList, indexed: &[RootIndexedView], fresh: &[u8], compute: bool) {
+        for index in indexed.iter().filter(|index| !fresh.contains(&index.table_slot)) {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(index.table_slot)) else {
+                continue;
+            };
+            let constant = self.user_value(compute, index.constant_slot, RootType::Constants, index.constant_dword);
+            // As for a table made afresh (`tables`).
+            let k = index.byte_offset.wrapping_add(constant << index.shift) / 32;
+            let handle = table + u64::from(k) * 32;
+            let Some(heap) = self.heap_of(handle).filter(|heap| !heap.samplers()) else {
+                continue;
+            };
+            if let Some(title) = heap.index(handle) {
+                list.note_left_read(std::ptr::from_ref(heap) as usize, heap.start, title);
+            }
+        }
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -4109,10 +4179,15 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+/// Makes what a shader reads through `view` (as `kind`) ready in `list`.
+/// Returns the host copy a buffer view reads (VIcky, `VICTORY_TABLES_LEFT`:
+/// held by the title slot a table left to the draws,
+/// `HostHeap::hold_copy`).
+fn readable(list: &HostList, kind: ResourceType, view: &View) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
+    let mut copy = None;
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
@@ -4132,6 +4207,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 }
             }
         }
+        copy = Some(shadow);
     }
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
@@ -4183,6 +4259,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         }
         _ => {}
     }
+    copy
 }
 
 /// The pixel shaders whose draws get their slots listed

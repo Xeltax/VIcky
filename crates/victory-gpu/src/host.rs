@@ -371,6 +371,10 @@ fn submission_us(i: usize, us: u64) {
 /// Adds to [`PREPARING`]'s copies (time, bytes) and to the frame log's totals.
 fn preparing(i: usize, n: u64) {
     PREPARING[i].fetch_add(n, Ordering::Relaxed);
+    // VIcky (`VICTORY_TABLES_LEFT`): the copies' time by its phase.
+    if i == 0 {
+        crate::descriptor::left::copies_us(n as i64);
+    }
     crate::framelog::add([crate::framelog::T::CopyUs, crate::framelog::T::CopyBytes][i], n);
 }
 
@@ -2233,6 +2237,13 @@ struct Deferred {
     /// whose step it holds, or the one of the frame its shaders pick from
     /// ([`HostList::after_heap_pass`]).
     heap_passes: Vec<std::sync::Arc<crate::draw::heap_pass::Pending>>,
+    /// VIcky (`VICTORY_TABLES_LEFT=check`, `crate::descriptor::left`): the
+    /// title slots the list's draws read by an index they compute through
+    /// tables read in place (title heap, its first descriptor, slot), and
+    /// whether its shaders pick buffers from the whole heap; checked at its
+    /// submission (`left::check_submission`).
+    left_reads: Vec<(usize, u64, u32)>,
+    left_picks: bool,
 }
 
 impl Deferred {
@@ -6690,7 +6701,17 @@ impl Host {
         if let Some(beside) = beside {
             (joined, _covered) = beside.join();
             crate::descriptor::make_waiting();
+            // VIcky (`VICTORY_TABLES_LEFT`): the join by its phase.
+            crate::descriptor::left::add2_timed(
+                crate::descriptor::left::K::Joins,
+                crate::descriptor::left::K::JoinUs,
+                joined,
+            );
         }
+        // VIcky (`VICTORY_TABLES_LEFT=check`): the host heaps are as these
+        // lists will find them; every slot they read by index is checked
+        // against what the switch would have left there.
+        crate::descriptor::left::check_submission(runs);
         #[cfg(feature = "diagnostics")]
         crate::descriptor::burst::submitted(crate::descriptor::beside::on(), joined, _covered);
         // Copies in the card's memory: what changed on their CPU side goes
@@ -7845,6 +7866,27 @@ impl HostList {
         }
     }
 
+    /// VIcky (`VICTORY_TABLES_LEFT=check`): a draw of the list reads title
+    /// slot `slot` of the heap at `heap` (first descriptor `start`) by an
+    /// index it computes, through a table read in place.
+    pub(crate) fn note_left_read(&self, heap: usize, start: u64, slot: u32) {
+        self.deferred().left_reads.push((heap, start, slot));
+    }
+
+    /// VIcky (`VICTORY_TABLES_LEFT=check`): the list's shaders pick buffers
+    /// from the whole heap.
+    pub(crate) fn note_left_picks(&self) {
+        self.deferred().left_picks = true;
+    }
+
+    /// VIcky (`VICTORY_TABLES_LEFT=check`): what [`HostList::note_left_read`]
+    /// and [`HostList::note_left_picks`] noted, taken (a submission again
+    /// finds nothing).
+    pub(crate) fn take_left_reads(&self) -> (Vec<(usize, u64, u32)>, bool) {
+        let mut deferred = self.deferred();
+        (std::mem::take(&mut deferred.left_reads), std::mem::take(&mut deferred.left_picks))
+    }
+
     /// VIcky: before anything reads the list's steps for a submission,
     /// waits for the passes beside it waits for, and puts the refreshes of
     /// the one whose step it holds in that step's place, as
@@ -8668,6 +8710,7 @@ impl Batch {
             let over = summed.saturating_sub(started.elapsed().as_micros() as u64);
             PREPARING[0].fetch_sub(over, Ordering::Relaxed);
             crate::framelog::sub(crate::framelog::T::CopyUs, over);
+            crate::descriptor::left::copies_us(-(over as i64));
         } else {
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to, Refreshed::Flush);

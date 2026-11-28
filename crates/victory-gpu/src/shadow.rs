@@ -4303,6 +4303,14 @@ pub(crate) fn window_use() -> [u64; 8] {
     out
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests (VIcky, the holds of `crate::descriptor::left`): with `Some`,
+    /// [`let_go_idle`] on this thread looks at the copy of that number alone
+    /// and takes it as idle whatever its time (the other conditions stay).
+    pub(crate) static TEST_IDLE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// Lets go of the copies of windows outside buffers that nothing names any
 /// more. They were never freed, and the world's streaming keeps asking for
 /// new ones: 648 windows (2.8 GB) when the cutscene began, 974 (4.3 GB)
@@ -4331,6 +4339,11 @@ pub(crate) fn let_go_idle() {
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
+                // (Tests, VIcky: only the copy named, taken as idle.)
+                #[cfg(test)]
+                if let Some(id) = TEST_IDLE.get() {
+                    return s.id == id && Arc::strong_count(s) == 1 && crate::host::references(&s.buffer) == 1;
+                }
                 Arc::strong_count(s) == 1
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1

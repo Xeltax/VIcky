@@ -23,6 +23,7 @@ pub(crate) mod made_first;
 pub(crate) mod note_kind;
 pub(crate) mod par_mirror;
 pub(crate) mod sync_lean;
+pub(crate) mod tables_left;
 
 /// The next host heap's identity ([`HostHeap::release`]).
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -142,6 +143,11 @@ pub(crate) struct HostHeap {
     /// whether the marks of `tabled` acted ([`left::live`]) at this heap's
     /// last heap sync.
     bound_live: std::sync::atomic::AtomicBool,
+    /// VIcky (`VICTORY_TABLES_LEFT`, stage 2, [`tables_left`]; empty without
+    /// the switch): the slots left to the draws and not noted since, the
+    /// records waiting their grace, the holds of host copies, and the
+    /// check's model.
+    left: left::HeapLeft,
     /// The title memory each placed texture view of this heap describes,
     /// by slot and by address ([`Spans`]): which slots a newer view of
     /// other memory there makes stale, and which to look at again when the
@@ -1663,6 +1669,7 @@ impl HostHeap {
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
             bound_live: std::sync::atomic::AtomicBool::new(left::live()),
+            left: left::HeapLeft::new(titled, sampler),
             placed: {
                 let spans = std::sync::Arc::<Mutex<Spans>>::default();
                 if !sampler {
@@ -3261,7 +3268,9 @@ impl HostHeap {
         // frame this pass took over some 250,000 to 300,000 records, run
         // 200.)
         let print = record_print(record) | 1;
-        {
+        // VIcky (`VICTORY_TABLES_LEFT`, stage 2, [`tables_left`]).
+        let (frame, mut waits, mut retire) = (crate::frame::current(), Vec::new(), Vec::new());
+        let now = {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
                 copied.resize(self.mirrored() as usize, 0);
@@ -3273,7 +3282,19 @@ impl HostHeap {
             if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
                 return false;
             }
-            *last = print;
+            // (VIcky, stage 2: a buffer or constant view in a slot a draw's
+            // table read lately is left to the draws, its print not noted;
+            // with the grace, a new constant or placed buffer record
+            // elsewhere waits, its print noted.)
+            let (note, now) = self.left_found(index, words_of(record), frame, &mut waits, &mut retire);
+            if note {
+                *last = print;
+            }
+            now
+        };
+        self.left_after(frame, waits, retire);
+        if !now {
+            return false;
         }
         // (VIcky, [`left`]'s line: counted by rule.)
         let _making = left::SyncMaking::enter();
@@ -3340,6 +3361,9 @@ impl HostHeap {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
         let mut due: Vec<(u32, u64)> = Vec::new();
+        // VIcky (`VICTORY_TABLES_LEFT`, stage 2, [`tables_left`]): the records
+        // that wait their grace, and the holds let go for another record.
+        let (mut waits, mut retire) = (Vec::new(), Vec::new());
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
@@ -3373,14 +3397,25 @@ impl HostHeap {
                     COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
-                *last = print;
+                // (VIcky, stage 2: a buffer or constant view in a slot a
+                // draw's table read lately is left to the draws and looked
+                // at again next time; with the grace, a new constant or
+                // placed buffer record elsewhere waits, its print noted.)
+                let words = words_of(record);
+                let (note, now) = self.left_found(index as u32, words, frame, &mut waits, &mut retire);
+                if note {
+                    *last = print;
+                }
+                if !now {
+                    continue;
+                }
                 due.push((index as u32, handle));
                 if let Some(records) = records.as_deref_mut() {
-                    let word = |w: usize| u32::from_le_bytes([0, 1, 2, 3].map(|b| record.get(w * 4 + b).copied().unwrap_or(0)));
-                    records.push([word(0), word(1), word(2)]);
+                    records.push(words);
                 }
             }
         }
+        self.left_after(frame, waits, retire);
         (looked, due)
     }
 
@@ -3808,6 +3843,9 @@ impl HostHeap {
         if !for_draw && left::in_sync_making() {
             self.count_sync_rule(made, index, key, view.as_ref());
         }
+        // VIcky (`VICTORY_TABLES_LEFT=check`, [`tables_left`]): the check's
+        // model of what the switch would show (nothing without it).
+        self.check_making(made, index, key, view.is_some(), for_draw);
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
@@ -4958,6 +4996,19 @@ fn record_print(record: &[u8]) -> u64 {
         h = (h ^ u64::from(b)).wrapping_mul(K);
     }
     h ^ (h >> 32)
+}
+
+/// The first three words of a descriptor record's bytes (tag, view index,
+/// generation); zeros for what is missing.
+fn words_of(record: &[u8]) -> [u32; 3] {
+    let word = |w: usize| u32::from_le_bytes([0, 1, 2, 3].map(|b| record.get(w * 4 + b).copied().unwrap_or(0)));
+    [word(0), word(1), word(2)]
+}
+
+/// The key a host slot made from the record `words` holds (generation and
+/// index), 0 for a record of no view of ours.
+fn key_of_words([tag, i, generation]: [u32; 3]) -> u64 {
+    if tag == VIEW_TAG { u64::from(generation) << 32 | u64::from(i) } else { 0 }
 }
 
 /// Whether a buffer view off its buffer's elements gets a copy of its own
@@ -8390,7 +8441,7 @@ mod table_bound_tests {
     use super::*;
 
     /// A title view heap of `count` slots and its first descriptor.
-    fn title_heap(count: u32) -> (crate::object::This, u64) {
+    pub(super) fn title_heap(count: u32) -> (crate::object::This, u64) {
         #[repr(C)]
         struct Extended(super::super::HeapDesc, super::super::Placement);
         let desc = super::super::HeapDesc {
@@ -8406,14 +8457,14 @@ mod table_bound_tests {
         (out, super::super::heap(out).start)
     }
 
-    fn release(object: crate::object::This) -> u32 {
+    pub(super) fn release(object: crate::object::This) -> u32 {
         crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(object, 0x10)(object)
     }
 
     /// A title heap of 64 slots whose host heap has a heap map (an identity
     /// window of 16, the pool up to 24), made with the switch as `bound`
     /// (set, live) on this thread, which stays so until it is set again.
-    fn mapped_heap(bound: (bool, bool)) -> Option<(crate::object::This, u64, &'static HostHeap)> {
+    pub(super) fn mapped_heap(bound: (bool, bool)) -> Option<(crate::object::This, u64, &'static HostHeap)> {
         host()?;
         left::TEST_BOUND.set(Some(bound));
         let (title, start) = title_heap(64);
@@ -8424,7 +8475,7 @@ mod table_bound_tests {
     }
 
     /// A placed buffer view of 64 KiB at `address`.
-    fn buffer_view(address: u64) -> View {
+    pub(super) fn buffer_view(address: u64) -> View {
         let mut resource = [0u32; 14];
         (resource[0], resource[4]) = (1, 0x1_0000);
         let mut desc = [0u32; 16];
@@ -8434,7 +8485,7 @@ mod table_bound_tests {
     }
 
     /// A placed 2D texture view at `address` (64x64 BC7, one level).
-    fn texture_view(address: u64) -> View {
+    pub(super) fn texture_view(address: u64) -> View {
         let resource = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
         let mut desc = [0u32; 16];
         (desc[0], desc[1], desc[2], desc[5]) = (98, 4, 5768, 1);
@@ -8444,7 +8495,7 @@ mod table_bound_tests {
 
     /// Writes `view`'s record (or none: zeros) into title slot `slot` as
     /// bytes, as a title that copies records does; its key.
-    fn write_record(start: u64, slot: u32, view: Option<&View>) -> u64 {
+    pub(super) fn write_record(start: u64, slot: u32, view: Option<&View>) -> u64 {
         let handle = start + u64::from(slot) * TITLE_SLOT_BYTES;
         let Some(view) = view else {
             // SAFETY: a descriptor slot of the title heap.
@@ -8459,7 +8510,7 @@ mod table_bound_tests {
 
     /// The heap sync's look at title slot `slot` ([`HostHeap::mirror_copied`]):
     /// whether it mirrored the record there.
-    fn sync(heap: &HostHeap, start: u64, slot: u32) -> bool {
+    pub(super) fn sync(heap: &HostHeap, start: u64, slot: u32) -> bool {
         let handle = start + u64::from(slot) * TITLE_SLOT_BYTES;
         // SAFETY: a descriptor slot of the title heap.
         let record = unsafe { std::slice::from_raw_parts(handle as *const u8, TITLE_SLOT_BYTES as usize) }.to_vec();
@@ -8475,7 +8526,7 @@ mod table_bound_tests {
 
     /// As a draw that made title slot `slot` from the record it holds: its
     /// host slot's key.
-    fn made_by_draw(heap: &HostHeap, slot: u32, key: u64) {
+    pub(super) fn made_by_draw(heap: &HostHeap, slot: u32, key: u64) {
         let made = heap.made_alone();
         let host = made.host(slot).expect("a pool slot");
         made.set_key(host, key);
@@ -8789,6 +8840,331 @@ mod table_bound_tests {
         assert_eq!(n[2], 2, "41 and the new memory of 40 found in the off phase");
         left::TEST_FRESH.set(None);
         left::TEST_BOUND.set(None);
+        assert_eq!(release(title), 0);
+    }
+}
+
+#[cfg(test)]
+mod tables_left_tests {
+    use super::table_bound_tests::{buffer_view, mapped_heap, release, sync, texture_view, write_record};
+    use super::*;
+    use left::{Ck, Mode2, TEST_BOUND, TEST_CHECKS, TEST_LEFT};
+    use std::sync::Arc;
+
+    /// A title heap of 64 slots whose host heap has a heap map (window 16),
+    /// made with stage 2 as `mode` (`live`, `grace`, the hold on) and stage
+    /// 1's bound on this thread, which stays so until [`done`].
+    fn heap2(mode: Mode2, live: bool, grace: bool) -> Option<(crate::object::This, u64, &'static HostHeap)> {
+        TEST_LEFT.set(Some((mode, live, grace, true)));
+        let made = mapped_heap((true, true));
+        if made.is_none() {
+            done();
+        }
+        made
+    }
+
+    /// Stage 2 now as `mode` (`live`, `grace`, `hold`) on this thread.
+    fn now(mode: Mode2, live: bool, grace: bool, hold: bool) {
+        TEST_LEFT.set(Some((mode, live, grace, hold)));
+    }
+
+    fn done() {
+        TEST_LEFT.set(None);
+        TEST_BOUND.set(None);
+        crate::shadow::TEST_IDLE.set(None);
+    }
+
+    fn handle(start: u64, slot: u32) -> u64 {
+        start + u64::from(slot) * TITLE_SLOT_BYTES
+    }
+
+    /// The record a host slot shows (0: none, or not made).
+    fn shows(heap: &HostHeap, slot: u32) -> u64 {
+        let made = heap.made_alone();
+        made.host(slot).and_then(|host| made.key_of(host)).unwrap_or(0)
+    }
+
+    /// Stage 2's rule at the heap sync: a buffer or constant view in a slot
+    /// with a buffer mark of the last 8 frames is left to the draws (its
+    /// print not noted, its left bit set, looked at again with its page); a
+    /// texture view, a record of no view, a slot without a live mark, and
+    /// the off phase of `alt` are mirrored as before. The pass over buffer
+    /// views takes the marked slots out of its list, in ON phases only.
+    #[test]
+    fn marked_buffer_and_constant_records_are_left_and_the_rest_mirrored() {
+        let Some((title, start, heap)) = heap2(Mode2::Alt, true, false) else {
+            return;
+        };
+        let frame = crate::frame::current();
+        let at = |n: u64| 0x6c_0000_0000 + n * 0x10_0000;
+        // 45 mirrored before any mark, then marked.
+        write_record(start, 45, Some(&buffer_view(at(5))));
+        assert!(sync(heap, start, 45));
+        for slot in [40, 41, 42, 45] {
+            heap.slot_tabled_in(slot, frame);
+        }
+        // 46's mark is too old.
+        heap.slot_tabled_in(46, frame.wrapping_sub(20));
+        write_record(start, 40, Some(&buffer_view(at(0))));
+        write_record(start, 41, Some(&View::Constant(at(1), 256)));
+        write_record(start, 42, Some(&texture_view(at(2))));
+        write_record(start, 44, Some(&buffer_view(at(4))));
+        write_record(start, 46, Some(&buffer_view(at(6))));
+        assert!(!sync(heap, start, 40), "a buffer view in a marked slot: left");
+        assert!(!sync(heap, start, 41), "a constant view in a marked slot: left");
+        assert!(sync(heap, start, 42), "a texture view: stage 1's rules, mirrored here");
+        assert!(sync(heap, start, 44), "no mark: mirrored");
+        assert!(sync(heap, start, 46), "an expired mark: mirrored");
+        assert!(!sync(heap, start, 40), "looked at again with its page, left again");
+        // A record of no view in a marked slot empties it, as before.
+        write_record(start, 45, None);
+        assert!(sync(heap, start, 45));
+        assert_eq!(heap.left_state().bits_take(|_| true), [40, 41], "the left bits");
+        // The pass: the marked slots out of its list.
+        let mut slots = vec![3, 40, 44, 45];
+        assert_eq!(heap.leave_to_draws(&mut slots, frame), [40, 45]);
+        assert_eq!(slots, [3, 44]);
+        // The off phase: mirrored, and the pass keeps its slots.
+        now(Mode2::Alt, false, false, true);
+        write_record(start, 41, Some(&View::Constant(at(7), 256)));
+        assert!(sync(heap, start, 41), "off: mirrored");
+        let mut slots = vec![3, 40, 44];
+        assert!(heap.leave_to_draws(&mut slots, frame).is_empty());
+        assert_eq!(slots, [3, 40, 44]);
+        done();
+        assert_eq!(release(title), 0);
+    }
+
+    /// `VICTORY_TABLES_LEFT_GRACE=1`: a new constant or placed buffer record
+    /// in a slot without a mark waits four frames (its print noted); then it
+    /// is mirrored, unless a draw's table claimed its slot meanwhile, which
+    /// leaves it to the draws as if it had been left when found. A placed
+    /// texture is not held. Without the grace, mirrored at once.
+    #[test]
+    fn the_grace_holds_new_buffer_records_until_a_draw_claims_them() {
+        let Some((title, start, heap)) = heap2(Mode2::On, true, true) else {
+            return;
+        };
+        let frame = crate::frame::current();
+        let at = |n: u64| 0x6d_0000_0000 + n * 0x10_0000;
+        let span = (start, TITLE_SLOT_BYTES);
+        write_record(start, 41, Some(&buffer_view(at(1))));
+        write_record(start, 42, Some(&View::Constant(at(2), 256)));
+        write_record(start, 43, Some(&texture_view(at(3))));
+        assert!(!sync(heap, start, 41), "waits");
+        assert!(!sync(heap, start, 42), "waits");
+        assert!(sync(heap, start, 43), "a placed texture is not held");
+        assert!(!sync(heap, start, 41), "its print noted: nothing new");
+        assert!(heap.buffer_slots().is_empty(), "nothing noted yet");
+        // A draw's table claims 42 during its grace.
+        heap.slot_tabled_in(42, frame + 1);
+        assert_eq!(heap.mirror_waited_in(frame + left::GRACE - 1, span, false), 0, "not yet");
+        assert_eq!(heap.mirror_waited_in(frame + left::GRACE, span, false), 1, "41 mirrored, 42 claimed");
+        assert_eq!(heap.buffer_slots(), [41]);
+        assert!(!sync(heap, start, 42), "claimed: left to the draws, looked at again");
+        assert_eq!(heap.left_state().bits_take(|_| true), [42]);
+        // Without the grace: mirrored at once.
+        now(Mode2::On, true, false, true);
+        write_record(start, 44, Some(&buffer_view(at(4))));
+        assert!(sync(heap, start, 44));
+        done();
+        assert_eq!(release(title), 0);
+    }
+
+    /// The hold keeps copies: a window copy a draw read through a slot left
+    /// to the draws is held by that slot, so `let_go_idle` does not let it go
+    /// once idle (as the slot's host slot kept it without the switch). Once
+    /// the title writes another record there, the hold goes, and the idle
+    /// copy is let go (and made again at the next read). With
+    /// `VICTORY_TABLES_LEFT_HOLD=0`, or in the off phase, no hold is taken.
+    #[test]
+    fn the_hold_keeps_copies() {
+        let Some((title, start, heap)) = heap2(Mode2::Alt, true, false) else {
+            return;
+        };
+        let frame = crate::frame::current();
+        let window = 0x7ff3_4000_0000u64;
+        let copy = |n: u64| crate::shadow::find(window + n * 0x40_0000, 0x100).expect("a window copy");
+        let let_go_idle = |id: u64| {
+            crate::shadow::TEST_IDLE.set(Some(id));
+            crate::shadow::let_go_idle();
+            crate::shadow::TEST_IDLE.set(None);
+        };
+        // Slot 40: a draw reads it through a table, its record left to it.
+        heap.slot_tabled_in(40, frame);
+        write_record(start, 40, Some(&buffer_view(window)));
+        assert!(!sync(heap, start, 40), "left to the draws");
+        let first = copy(0);
+        let id = first.id();
+        heap.hold_copy(40, handle(start, 40), &first);
+        assert_eq!(heap.left_state().holds.held(40), Some(Arc::as_ptr(&first) as usize));
+        drop(first);
+        let_go_idle(id);
+        assert_eq!(copy(0).id(), id, "held by the slot: kept");
+        // Another record there: the sync lets the hold go; idle, let go.
+        write_record(start, 40, Some(&buffer_view(window + 0x10_0000)));
+        assert!(!sync(heap, start, 40), "left to the draws");
+        assert_eq!(heap.left_state().holds.held(40), None, "the hold went with the record");
+        let_go_idle(id);
+        assert_ne!(copy(0).id(), id, "let go, then made again");
+        // No hold in the off phase, nor with the hold off.
+        let other = copy(1);
+        for (live, hold) in [(false, true), (true, false)] {
+            now(Mode2::Alt, live, false, hold);
+            heap.hold_copy(40, handle(start, 40), &other);
+            assert_eq!(heap.left_state().holds.held(40), None, "live {live}, hold {hold}");
+        }
+        let id = other.id();
+        drop(other);
+        let_go_idle(id);
+        assert_ne!(copy(1).id(), id, "nothing held it");
+        done();
+        assert_eq!(release(title), 0);
+    }
+
+    /// A hold goes once its slot's mark is 240 frames old (the heal), and
+    /// every hold goes at the flip to off; a draw that reads the slot for the
+    /// same record again takes nothing new.
+    #[test]
+    fn holds_expire_with_their_mark_and_go_at_the_flip() {
+        let Some((title, start, heap)) = heap2(Mode2::Alt, true, false) else {
+            return;
+        };
+        let frame = crate::frame::current();
+        let window = 0x7ff3_8000_0000u64;
+        let copy = crate::shadow::find(window, 0x100).expect("a window copy");
+        for slot in [40, 41] {
+            heap.slot_tabled_in(slot, frame);
+            write_record(start, slot, Some(&buffer_view(window + u64::from(slot) * 0x1000)));
+            heap.hold_copy(slot, handle(start, slot), &copy);
+        }
+        let holds = &heap.left_state().holds;
+        assert!(holds.held(40).is_some() && holds.held(41).is_some());
+        let key = key_of_words(super::super::record_words(handle(start, 40)));
+        let (new, old) = holds.take(40, key, &copy);
+        assert!(!new && old.is_none(), "the same copy for the same record: nothing new");
+        // 41 read again much later: its mark is fresh, 40's is not.
+        heap.slot_tabled_in(41, frame + 200);
+        let late = frame + u64::from(left::HOLD_FRAMES) + 1;
+        assert_eq!(heap.left_heal((start, TITLE_SLOT_BYTES), late), [0, 1]);
+        assert!(holds.held(40).is_none(), "expired with its mark");
+        assert!(holds.held(41).is_some());
+        now(Mode2::Alt, false, false, true);
+        let swept = heap.tables_left_walk((start, TITLE_SLOT_BYTES)).expect("the flip to off sweeps");
+        assert_eq!(swept[3], 1, "41's hold let go at the flip");
+        assert!(holds.held(41).is_none());
+        done();
+        assert_eq!(release(title), 0);
+    }
+
+    /// `alt`: at the flip to off, every slot the sync left to the draws and
+    /// every record waiting its grace is mirrored as the sync would have
+    /// mirrored it, so the off phase starts from what it would have had: the
+    /// host slots, the buffer slots noted and the prints are those of a heap
+    /// that never had the switch. One sweep a flip, none from off to ON.
+    #[test]
+    fn the_flip_to_off_leaves_nothing_stale() {
+        let at = |n: u64| 0x6e_0000_0000 + n * 0x10_0000;
+        let records = [
+            (40u32, Some(buffer_view(at(0)))),
+            (41, Some(View::Constant(at(1), 256))),
+            (42, Some(buffer_view(at(2)))),
+            (43, Some(texture_view(at(3)))),
+        ];
+        // What a heap without the switch makes of the same records.
+        let Some((plain, plain_start, plain_heap)) = heap2(Mode2::Off, false, false) else {
+            return;
+        };
+        for (slot, view) in &records {
+            write_record(plain_start, *slot, view.as_ref());
+            assert!(sync(plain_heap, plain_start, *slot));
+        }
+        let Some((title, start, heap)) = heap2(Mode2::Alt, true, true) else {
+            return;
+        };
+        let frame = crate::frame::current();
+        heap.slot_tabled_in(40, frame);
+        heap.slot_tabled_in(41, frame);
+        for (slot, view) in &records {
+            write_record(start, *slot, view.as_ref());
+        }
+        assert!(!sync(heap, start, 40), "left");
+        assert!(!sync(heap, start, 41), "left");
+        assert!(!sync(heap, start, 42), "waits its grace");
+        assert!(sync(heap, start, 43), "a texture: mirrored");
+        assert_eq!(heap.tables_left_walk((start, TITLE_SLOT_BYTES)), None, "no flip while ON");
+        now(Mode2::Alt, false, true, true);
+        let swept = heap.tables_left_walk((start, TITLE_SLOT_BYTES)).expect("the flip to off sweeps");
+        assert_eq!(swept, [2, 1, 3, 0], "two left, one waiting, three mirrored, no holds");
+        assert_eq!(heap.tables_left_walk((start, TITLE_SLOT_BYTES)), None, "once a flip");
+        for slot in [40, 41, 42, 43] {
+            assert!(!sync(heap, start, slot), "slot {slot}: its record noted as seen");
+            assert_eq!(shows(heap, slot), shows(plain_heap, slot), "slot {slot}: shown as without the switch");
+        }
+        assert_eq!(heap.buffer_slots(), plain_heap.buffer_slots(), "the buffer slots noted");
+        assert!(heap.left_state().bits_take(|_| true).is_empty(), "no left bit");
+        assert_eq!(heap.left_state().waiting.lock().unwrap().len(), 0, "nothing waiting");
+        now(Mode2::Alt, true, true, true);
+        assert_eq!(heap.tables_left_walk((start, TITLE_SLOT_BYTES)), None, "off to ON: nothing");
+        done();
+        assert_eq!(release(title), 0);
+        assert_eq!(release(plain), 0);
+    }
+
+    /// `check`: everything is mirrored as without the switch, and the model
+    /// notes the slots whose host slot the switch would have left showing
+    /// another view than the title's record: a read by index of one at a
+    /// submission is a violation; a draw's making in place, which the switch
+    /// does too, ends it; the pass's making of a slot the switch leaves does
+    /// not. A list's notes are checked at its submission and taken.
+    #[test]
+    fn check_counts_reads_the_switch_would_have_left_stale() {
+        let Some(device) = crate::host::host() else {
+            return;
+        };
+        let Some((title, start, heap)) = heap2(Mode2::Check, false, false) else {
+            return;
+        };
+        TEST_CHECKS.set(Some(Default::default()));
+        let frame = crate::frame::current();
+        let at = |n: u64| 0x6f_0000_0000 + n * 0x10_0000;
+        let since = |slot: u32| heap.left_state().diverged_since(slot);
+        heap.slot_tabled_in(40, frame);
+        write_record(start, 40, Some(&buffer_view(at(0))));
+        write_record(start, 41, Some(&buffer_view(at(1))));
+        assert!(sync(heap, start, 40), "mirrored as without the switch");
+        assert!(sync(heap, start, 41));
+        assert!(since(40) != 0 && since(41) == 0, "40 left by the switch: its host slot would show nothing");
+        heap.check_read(40);
+        heap.check_read(41);
+        // A draw reads 40 through a table read in place: made, as with the
+        // switch.
+        heap.mirror(40, handle(start, 40), true);
+        assert_eq!(since(40), 0);
+        heap.check_read(40);
+        // A new record: the pass makes it, a making the switch would not do.
+        write_record(start, 40, Some(&buffer_view(at(2))));
+        assert!(sync(heap, start, 40));
+        left::left_making(|| heap.mirror(40, handle(start, 40), true));
+        assert!(since(40) != 0, "still what the switch would leave");
+        heap.check_pass(&[40], frame);
+        // A list's read by index, checked at its submission.
+        let list = device.new_list().expect("a list");
+        let at_heap = super::super::heap(title);
+        list.note_left_read(std::ptr::from_ref(at_heap) as usize, at_heap.start, 40);
+        list.note_left_picks();
+        left::check_submission(&[&list]);
+        assert_eq!(list.take_left_reads(), (Vec::new(), false), "taken");
+        let counts = TEST_CHECKS.take().expect("counted");
+        let get = |what: Ck| counts[what as usize];
+        assert_eq!(get(Ck::Reads), 4, "{counts:?}");
+        assert_eq!(get(Ck::Violations), 2, "40 twice: before its draw, and at the submission");
+        assert_eq!(get(Ck::SyncLeft), 2);
+        assert_eq!((get(Ck::PassLeft), get(Ck::PassStale)), (1, 1));
+        assert_eq!((get(Ck::Lists), get(Ck::Picking)), (1, 1));
+        assert!(get(Ck::Exposed) >= 1);
+        list.close();
+        done();
         assert_eq!(release(title), 0);
     }
 }
