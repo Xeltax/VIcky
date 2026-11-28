@@ -1542,6 +1542,120 @@ Read for each: the stale line (S, O), the `writes behind the guards` line, the `
 - **Holds** (`DS_HOLD`): a slot whose memory is written again and again (a page written by many small requests) waits up to 16 frames; U on the line counts the ones that hit the bound.
 - **Not measured in the game.** None of the six has run in the game yet; no capture proves the link to the shirt. The diagnostic exists to make the next runs decisive.
 
+### Streamed textures: exact uploads and the audit (`VICTORY_TEXTURE_EXACT`, `VICTORY_TEXTURE_AUDIT`)
+
+2026-11-28, `fx-main-texexact`. Both are opt-in and have not been measured in the game. From Fable's design (`xcl-notes\fable-2026-11-28-texstale2.md`).
+
+**The problem.** With the recommended texture set, a streamed texture picked by index still shows wrong bytes for a whole cutscene in about half of the boat runs: a mosaic (a recycled block's last texture) or another colourway. No total counter separates broken runs from clean ones; it is a lottery per texture. Fable ranked these holes:
+1. Writes land with no event for the slot. `Spans::slots_holding` looks only at the nearest span before the write, and `Rule::Start` retires an old inner span only when a new one starts within 4 KiB of it. So a ghost span hides the texture now placed around it.
+2. The hold is asked when the slot is looked at, but the bytes are read at the submission.
+3. The checks compare memory now with memory when the upload was recorded, not with what was uploaded. A torn or failed read at the submission is invisible to both.
+
+All of it is host-side only, so there is no shader-cache rewarm. With every switch unset, nothing new runs and no new line is printed.
+
+#### The audit: `VICTORY_TEXTURE_AUDIT=<frame>,<frame>,...` (the metric)
+
+- **What it does.** World frames are counted as `VICTORY_CAPTURE_WORLD_ALSO` counts them: presented frames from the first one with 500 draws or more.
+  - At each listed frame, the texture pass takes a snapshot of the bookkeeping: what each texture's last detiling took (`texexact::Record`, kept while the audit or EXACT is on), the slots at each texture's address with their descriptor handles, and the textures staged for draws in the last 16 frames.
+  - A thread of its own (`victory-wide-audit`) then keeps the textures that have a current view and mapped memory. A current view means a slot whose view is of that very texture (`resource::placed_known`), or a texture staged for draws, which is how slots read through tables (`VICTORY_TABLES_LEFT`, `VICTORY_TABLE_BOUND`) are included.
+  - For each texture kept, it hashes the memory whole (blake3, through `copy_mapped`, zeros for unmapped pages, as the detiling read it) and compares that with the full hash of the bytes last detiled.
+  - The next texture pass reads the queue for the textures that differ and writes the lines. It never runs on the submitting thread. A walk takes seconds for some 5 GB.
+- **States**, in this order:
+  - **in flight**: an event of the texture lies 8 frames or fewer before the snapshot, or after it. An event is its detiling, or the write of one of its slots in the queue.
+  - **partly mapped**: not all of its memory is mapped now.
+  - **queued more than 8 frames**: one of its slots is in the queue and its last event is older.
+  - **out of the queue**: nothing will upload it again.
+- **Clean:** 0 out of the queue and 0 queued more than 8 frames, at every audit frame.
+- **The decoration bake.** With the audit on (any value; `VICTORY_TEXTURE_AUDIT=bake` gives these lines alone), each draw of the decoration bake (`BAKE_PIXEL_SHADERS`) logs the queue right after its own pass: due, waiting for memory, uploaded in part, oldest. Lines are printed for the first 256 bake draws and every 64th after that.
+  - The first 8 bake draws (`VICTORY_TEXTURE_AUDIT_BAKES`, at most one a frame, none while another audit runs) also start a walk. Its lines say how many textures differed from their memory at that bake.
+  - The bake runs once, so a source that is wrong then stays baked wrong for the run.
+- **Lines** (`grep "texture audit at"`):
+  - `texture audit at frame N: W textures with a host copy and a current view walked (M MB; T of them read only through tables, staged for draws) in S s, from the bookkeeping of pass frame F (presented frame P); D differ from the bytes last uploaded: O out of the queue, Q queued more than 8 frames, I in flight (8 frames or fewer since their last event), L partly mapped (K of them out of the queue); ... shown at another address too: ...; CLEAN|NOT CLEAN (clean: 0 out of the queue and 0 queued more than 8 frames); of R records, U unmapped now and V without a current view left out`
+  - `texture audit at frame N: by format and size: BC7_UNORM_SRGB (99), 1-4 MiB: o out of the queue, q queued more than 8 frames, i in flight, p partly mapped`: one line per format and size bucket.
+  - `texture audit at frame N: largest #k: slot S (or "read through tables"), address 0x..., format, WxH, B bytes, F frames since its upload, state[, uploaded in part][, memory all zeros now][, shown at another address too]`: the 20 largest.
+  - `texture audit at bake draw N: frame F (presented frame P), after its pass: D slots ... due, W waiting for their memory, U uploaded in part, Q in the queue, the oldest due one written O frames ago; ...`, and for a walk the same lines as above with `bake draw N` in place of `frame N`.
+- **"Shown at another address too"** (`watch::shown_elsewhere`): the texture's memory is a physical page that another address shows too, so the title may write it through that other view. Other trees found such textures behind "blocky stale tiles" (Kitty6 ae3cce8, mandy c8cb6f677). They are counted apart. Part E's full hash sees those writes too.
+- **Cost.** One HashMap insert per detiling (the record), and the walks at the listed frames only. It is a diagnostic, not for fps comparisons around the audit frames.
+
+#### The fix: `VICTORY_TEXTURE_EXACT=1`, parts `VICTORY_TEXTURE_EXACT_PARTS=abcde` (all by default)
+
+- **A, exact events** (`descriptor/host/exact_spans.rs`).
+  - The passes over memory mapped, unmapped or written ask `Spans::slots_exact`. It names every span whose shown levels overlap the range, however far before it starts, found through an index of the 1 MiB blocks each span's full size covers.
+  - What a span holds is the levels its views show (`texexact::viewed_end`, from the console layout: the tail block first, level 0 last). A texture viewed from level 3, whose packed neighbour sits where its larger levels would be (run 188's layout), does not hold its neighbour's bytes. A texture viewed from level 0, or whose levels are not known, holds all of its span.
+  - A span that ends exactly where a write starts is not named.
+  - The page-written events make their slots due with A, whatever `VICTORY_PAGE_WRITES` says. The textures staged for draws there are read again whole at their next submission (`texture::restage_in`), also without `VICTORY_TABLE_BOUND_FRESH`.
+  - **`Rule::Start` was reviewed and left as it is.** Retiring every older span inside a newer one viewed from level 0 would make null the packed neighbours of a texture the title views from level 0 although they sit inside it: run 188's loss under `Rule::Overlap`. With exact events a ghost span costs an upload of its slots at a write and hides nothing.
+- **B, the print of the bytes uploaded.**
+  - Each detiling notes the full hash of what it took, reusing the hash the refresh takes anyway (the write-watched path hashes once more).
+  - For a texture the pass uploaded for a slot, the detiling also notes `texture::fingerprint_of` over the slot's ranges (every mip) and posts it with the queue's write number. The next pass puts it in the slot's checked entry (`TextureQueue::exact_print`), so the looks compare memory with what was uploaded.
+  - A print that differs from the one taken when the upload was recorded brings the look forward to the next frame.
+  - A read that took nothing (a page missing, `VICTORY_TEXTURE_NO_WAIT`) posts a print no memory matches, so the look uploads the slot again. The slots there are also made due, as `VICTORY_NO_WAIT_FALLBACK` does.
+  - With B, uploads in part get a fingerprint too, as with `VICTORY_RECHECK_PARTLY`.
+- **C, torn reads.**
+  - A DirectStorage write sequence (`texexact::DS_SEQ`) moves when a write begins and when it ends. The writes under way are noted for C and D also without `VICTORY_DS_HOLD`.
+  - Each refresh samples the sequence around its read (`Staging::refresh_now`), on whichever thread refreshes: the submitting thread, or a wide one under `VICTORY_SUBMIT_LANES`.
+  - The read counts as torn if one of these held: a write under way overlaps its memory now; a write that ended during the read overlapped it (kept in a log of the last 1,024); or, with D, memory there is mapped and not written yet.
+  - A torn read is read again at the staging's next refresh and uploaded by its next list, and the slots there are due next frame. This is capped at 16 re-dues in a row for one texture.
+- **D, holds by page state.**
+  - The runtime's maps (`watch::title_memory_remapped`) mark byte ranges as mapped at a millisecond. Writes behind the guards (`watch::title_memory_written`) clear what they cover.
+  - A texture whose memory holds such a range (still mapped now, under 500 ms since the map), or under a DirectStorage write begun under 500 ms ago, is not uploaded and keeps its previous host copy. For the pass, the slot is looked at next frame. For draws, it applies to their upload and to the check at submission (`texture::held_for_write`).
+  - The bound is the time since the map, so a texture the title fills itself (no DirectStorage write) waits at most 500 ms.
+- **E, the settle check.**
+  - When a texture's detiling is 8 frames old, its memory is hashed whole on a wide thread (`shadow::wide_later`), against B's hash. Each frame takes about 8 MB (`VICTORY_TEXTURE_EXACT_SETTLE_MB`), the newest records first.
+  - When they differ, the slots there are made due and its staging is read again. It is looked at again after 8 more frames if nothing detiles it anew, up to 16 times in a row.
+  - Memory that is all zeros (mapped, not written yet) does not count as a mismatch and is looked at again later. A later detiling that checks clean counts as fixed.
+- **The table-read slots' weaker paths** (Fable section 4) under EXACT:
+  - D's hold applies to draws whether their staging was filled before or not, with or without `TABLE_BOUND_FRESH` and `DS_HOLD`. A never-filled staging whose copy was already recorded is read and, if torn, read again (C).
+  - The 30-frame read of a partly mapped texture stays as it was, but A's events read it again at once. A read that finds memory all zeros where it is mapped is no longer taken as what the staging holds, and comes again in 8 frames, not 30.
+  - The 8-frame hash turn goes by each texture's own count, as with `TABLE_BOUND_FRESH`, so a texture whose submissions meet the frame counter in steps of two cannot miss every turn.
+  - E checks every detiled texture, those the draws keep included.
+- **What was not done.** Fable's minor hole 4 (an upload that returns at `!list.first_use`, after which the slot is marked done with no look) is left as it is. That path has a staging only when another use in the same list made it, which the pass then treats as the draws'. E's settle check covers any detiled texture whatever the queue says.
+- **Line, every 5 s** (`grep "texture exact:"`): `texture exact: parts abcde (VICTORY_TEXTURE_EXACT=1), since the start: A N slots named by memory events through the exact spans, M of them missed by the old rule, L named by the old rule left out (...), R times textures staged for draws read again after an event; B P prints of the bytes uploaded put in checked entries (D differed from the print taken when the upload was recorded), F reads that took nothing, X posts lost; C T torn reads caught (...), K re-dues refused after 16 in a row; D H holds of the pass and W of draws (...), G let go by the 500 ms bound; E S settle checks, Mm mismatches found, Fx of them fixed, Gu given up after 16, Z found all zeros; X.X MB a frame hashed since the last line`. At start: `streamed textures uploaded exactly (VICTORY_TEXTURE_EXACT=1), parts ...`.
+- **What must move.**
+  - A's "missed by the old rule" is above 0; this is the proof of hole 1.
+  - The "changed after its upload with nothing to tell of it" warnings fall toward 0.
+  - C and D count above 0 while streaming.
+  - E's mismatches are rare and mostly fixed.
+  - Above all, the audit says CLEAN at every frame.
+- **Where the cost is.** Fable estimated under 0.1 fps; this is not measured. By part:
+  - A: the span index's upkeep per new span (one entry per 1 MiB block) and the exact queries per pass, microseconds. More slots due means more uploads in the same 192 MB / 250 ms budget; the "missed by the old rule" count is that extra.
+  - B: one fingerprint per pass upload over bytes already in cache, at most 48 KiB plus 64 mip windows, microseconds, on the refreshing thread. The full hash reuses the refresh's own.
+  - C: two atomic loads per refresh. When the sequence moved, one lock and a scan of the writes that ended during the read.
+  - D: one lock and a range lookup per look while mapped ranges are pending. The holds delay an upload by at most 500 ms.
+  - E: about 8 MB a frame of kernel reads and hashing on one wide thread, some 5-8 ms of a thread that is idle most of the frame, plus the re-uploads of what it finds.
+  - The fps line's `textures X ms` and the `MB a frame hashed` clause show it.
+- **Risks.**
+  - D delays textures the title fills itself (bounded at 500 ms).
+  - C and E could loop on a texture that keeps changing; both are capped at 16 in a row.
+  - A makes more slots due; watch the queue's `due` and `oldest` and the MB a frame.
+
+#### Suggested runs (boat save, RT on, the recommended texture set plus `VICTORY_FACE_D16=1`)
+
+The dialogue cutscene starts about 150-250 s after world entry: about world frames 1,400-2,400 at 9-10 fps. The shirt close-ups seen so far fell at world frames 2,500-2,900. Audit frames: `2000,2600,3200`. They lie around the cutscene's start and 60-120 s into it, as Fable's +100/+400/+800. Each walk takes a few seconds, so they do not overlap.
+
+| run | adds | answers |
+|---|---|---|
+| M | `VICTORY_TEXTURE_AUDIT=2000,2600,3200` | the metric on the current code: NOT CLEAN expected in a broken run, and which states and formats hold the mismatches; the bake lines say whether the bake ran with slots due |
+| X | M + `VICTORY_TEXTURE_EXACT=1` | the fix: CLEAN at all three frames, the `texture exact:` counts, fps against M |
+| X-bisect | X with `VICTORY_TEXTURE_EXACT_PARTS=` `a`, `ae`, `acd` ... | which parts the cleanness needs (only if X is clean and costs fps) |
+
+The recommended set is `VICTORY_NO_WAIT_FALLBACK=1 VICTORY_DS_HOLD=1 VICTORY_PAGE_WRITES=all VICTORY_BCPACK_FIXES=1 VICTORY_RECHECK_PARTLY=1 VICTORY_HEAP_RECHECK_MIPS=1 VICTORY_HEAP_RECHECK_EVERY=960`. Read for each run: the `texture audit at` lines, the `texture exact:` line, true fps over the cutscene, and the shirt captures.
+
+#### Tests
+
+- `texexact::tests`:
+  - `the_parts_are_read_from_their_letters`
+  - `the_viewed_levels_end_where_the_next_larger_one_starts`
+  - `a_read_sees_the_writes_that_ended_after_it_began` (the torn-read sequence)
+  - `torn_reads_are_re_dued_a_bounded_number_of_times_in_a_row`
+  - `memory_not_written_holds_for_a_bounded_time` (D's time bound)
+  - `settle_checks_take_the_newest_quiet_records_within_their_bytes`
+  - `the_audit_classifies_mismatches_by_their_last_event_and_queue`
+  - `the_print_of_detiled_bytes_matches_the_fingerprint_of_their_memory`
+- `descriptor::host::exact_spans::tests`:
+  - `exact_spans_name_every_texture_whose_viewed_levels_overlap` (the span overlap: the ghost inner span, packed neighbours, a span that ends where the write starts, the index emptied)
+  - `exact_slots_count_what_the_old_rule_missed`
+
 ## Structural: tables left to the draws (2026-11-28; opt-in, not measured in the game yet)
 
 The design is `xcl-notes\fable-2026-11-28-structural.md`. A draw already makes every entry of the tables it makes afresh in dynamic slots of its own (`draw.rs` `State::tables`). The heap sync, the pass over buffer views and the texture pass then make the same title slots again, for shaders that pick views by index. That second making is most of the join, most of the pass and most of the texture pass. The project stops it in four stages, one branch and one switch each, each with an `=alt`. This section has stage 1 (with 1b, `TABLE_BOUND_FRESH`) and stage 2, which re-lands the dropped commit 7b66261e (`VICTORY_TABLES_LEFT`, buffer slots left to the draws) with a hold that keeps their host copies. After stage 2's profile (`xcl-notes\fable-2026-11-28-wall2.md`) the plan was revised: stage 3 is now preparation on lanes (`VICTORY_SUBMIT_LANES`), stage 4 waits for its counter (`VICTORY_MADE_READ`), and stage 2 got two fixes. All three are at the end of this section.

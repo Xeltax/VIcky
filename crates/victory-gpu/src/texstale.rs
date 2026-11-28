@@ -184,6 +184,9 @@ impl Drop for WritePending {
         }
         let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(i) = pending.iter().position(|p| p.token == self.0) {
+            // VIcky (`VICTORY_TEXTURE_EXACT` part C): logged before it leaves
+            // the list, so a read that no longer finds it here finds it there.
+            crate::texexact::write_ended(&pending[i].ranges);
             let p = pending.swap_remove(i);
             if p.since.elapsed() > Duration::from_millis(DS_HOLD_MS) {
                 HOLD[3].fetch_add(1, Relaxed);
@@ -201,7 +204,8 @@ impl Drop for WritePending {
 /// `ranges` is not called. Called from the runtime's workers; locks one
 /// mutex and calls nothing.
 pub fn title_memory_write_pending(ranges: impl FnOnce() -> Vec<(usize, usize)>) -> WritePending {
-    if !ds_hold() {
+    // (VIcky, `VICTORY_TEXTURE_EXACT` parts C and D: noted for them too.)
+    if !ds_hold() && !crate::texexact::tracks_writes() {
         return WritePending(0);
     }
     let ranges: Vec<(u64, u64)> = ranges()
@@ -217,6 +221,7 @@ pub fn title_memory_write_pending(ranges: impl FnOnce() -> Vec<(usize, usize)>) 
     pending.push(Pending { token, since: Instant::now(), ranges });
     PENDING_N.store(pending.len(), Relaxed);
     HOLD[0].fetch_add(1, Relaxed);
+    crate::texexact::write_began();
     WritePending(token)
 }
 
@@ -237,6 +242,26 @@ pub(crate) fn write_pending(start: u64, end: u64) -> bool {
     }
     let pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     overlaps(&pending, start, end, Instant::now())
+}
+
+/// VIcky (`VICTORY_TEXTURE_EXACT` part C): whether a DirectStorage write
+/// noted as pending, however long ago, writes into `[start, end)`.
+pub(crate) fn write_pending_any(start: u64, end: u64) -> bool {
+    write_pending_since(start, end).is_some()
+}
+
+/// VIcky (`VICTORY_TEXTURE_EXACT` part D): when the earliest DirectStorage
+/// write noted as pending under `[start, end)` was noted, if any.
+pub(crate) fn write_pending_since(start: u64, end: u64) -> Option<Instant> {
+    if PENDING_N.load(Relaxed) == 0 {
+        return None;
+    }
+    let pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    pending
+        .iter()
+        .filter(|p| p.ranges.iter().any(|&(s, e)| s < end && start < e))
+        .map(|p| p.since)
+        .min()
 }
 
 /// Requests pending now (for the line).
@@ -984,6 +1009,8 @@ pub(crate) fn lines() {
              texture (VICTORY_DS_HOLD=1), {held_out} that went on after {DS_HOLD_MOST} frames of one write"
         );
     }
+    // VIcky (`VICTORY_TEXTURE_EXACT`): its line, if it is on.
+    crate::texexact::lines();
     let [streams, kept, carried, first] =
         [0, 1, 2, 3].map(|i| victory_formats::bcpack::FIX_COUNTS[i].load(Relaxed));
     if streams > 0 {

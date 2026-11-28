@@ -2637,6 +2637,29 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
     footprint(&d).map(|f| f.size)
 }
 
+/// VIcky (`VICTORY_TEXTURE_EXACT` part A, `crate::texexact::viewed_end`):
+/// the bytes from its start that hold the levels a view starting at level
+/// `first` shows, of a texture with the resource description `desc` (as
+/// words); `None` for a buffer, a description without a console layout,
+/// or several planes.
+#[cfg(windows)]
+pub(crate) fn placed_viewed_bytes(desc: &[u32; 14], first: u32) -> Option<u64> {
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension == BUFFER {
+        return None;
+    }
+    let full = footprint(&d)?.size;
+    let t = texture_layout(&d)?;
+    let [plane] = t.planes.as_slice() else {
+        return None;
+    };
+    let l = &plane.layout;
+    let offsets: Vec<u64> = l.mips.iter().map(|m| m.offset).collect();
+    let end = crate::texexact::viewed_end(l.size, l.slices, l.slice_size, l.alignment, l.first_tail_mip, &offsets, first);
+    Some(end.min(full))
+}
+
 /// The resource [`texture_at`] made for a texture placed at `address` with
 /// the description `desc`, if it has made one: never made here (for the
 /// frame listing, which must not count as a use).

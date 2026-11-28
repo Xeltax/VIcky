@@ -1962,6 +1962,9 @@ impl State {
         PASS_BUDGET.set(None);
         if bake {
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
+            // VIcky (`VICTORY_TEXTURE_AUDIT`): the queue as this bake draw
+            // finds it, and the first ones walk the textures' memory.
+            crate::texexact::audit::bake(heap, host, frame, n);
         }
     }
 
@@ -2104,6 +2107,12 @@ impl State {
         if room {
             host.texture_slots_room(frame);
         }
+        // VIcky (`VICTORY_TEXTURE_EXACT`, `VICTORY_TEXTURE_AUDIT`,
+        // `crate::texexact`): the prints of the last submissions' uploads go
+        // to their slots' checked entries (part B), and the turn of parts D
+        // and E and of the audit.
+        host.texture_slots_exact(frame);
+        crate::texexact::tick(heap, host, frame);
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
@@ -2258,8 +2267,9 @@ impl State {
         if let Some(((at, len, print, looks, uploaded), mips, part)) = host.texture_slot_checked(index) {
             let mips_read = mips.as_deref().unwrap_or_default();
             // (Without the switch a slot in part with a fingerprint, one
-            // uploaded whole before, is looked at as before.)
-            if part > 0 && crate::texstale::recheck_partly() {
+            // uploaded whole before, is looked at as before. VIcky,
+            // `VICTORY_TEXTURE_EXACT` part B: such slots have one too.)
+            if part > 0 && (crate::texstale::recheck_partly() || crate::texexact::part(crate::texexact::Part::B)) {
                 if !crate::texstale::partly_budget(frame) {
                     crate::texstale::PARTLY[3].fetch_add(1, Ordering::Relaxed);
                 } else if crate::texture::fingerprint(at, len, mips_read) == print {
@@ -2326,6 +2336,20 @@ impl State {
                     return Look::Skip;
                 }
                 crate::texstale::HOLD[2].fetch_add(1, Ordering::Relaxed);
+            }
+            // VIcky (`VICTORY_TEXTURE_EXACT` part D): memory of it mapped and
+            // not written since (a block the title has DirectStorage fill
+            // after it maps it), or under a DirectStorage write: uploaded
+            // now, the host copy would take the pages' previous bytes. The
+            // slot keeps its previous host copy and is looked at next frame,
+            // for at most `texexact::HOLD_MS` after the map or the write's
+            // start.
+            if crate::texexact::part(crate::texexact::Part::D)
+                && crate::texexact::not_ready(address, address.saturating_add(len))
+            {
+                host.texture_slot_not_ready(index, write, frame + 1);
+                crate::texexact::count(crate::texexact::N::DPass, 1);
+                return Look::Skip;
             }
             if mapped < len {
                 if mapped <= host.texture_slot_mapped(index) && !part_changed {
@@ -2473,14 +2497,22 @@ impl State {
         // VIcky: a placed texture uploaded in part is looked at again with
         // its fingerprint too (`VICTORY_RECHECK_PARTLY=1`, every mip read);
         // and `VICTORY_STALE_SLOTS` watches what each upload took.
-        let partly_recheck = partly.is_some() && crate::texstale::recheck_partly();
+        // VIcky (`VICTORY_TEXTURE_EXACT` part B): every upload notes its
+        // fingerprint, with every mip read, and its staging's detiling at
+        // submission puts the print of the bytes it took in their place
+        // (`crate::texture::pass_slot`, `HostHeap::texture_slots_exact`).
+        let exact = crate::texexact::part(crate::texexact::Part::B);
+        let partly_recheck = partly.is_some() && (crate::texstale::recheck_partly() || exact);
         let recheck = heap_recheck() && (again.is_none() || partly_recheck);
         let watch = crate::texstale::stale_slots() > 0;
         let memory = if recheck || watch {
-            crate::texture::staged_memory(resource, partly_recheck, watch)
+            crate::texture::staged_memory(resource, partly_recheck || exact, watch)
         } else {
             None
         };
+        if exact && recheck {
+            crate::texture::pass_slot(resource, index, write);
+        }
         crate::texture::unstage(resource);
         spent.fetch_add(bytes, Ordering::Relaxed);
         *since_asked += bytes;

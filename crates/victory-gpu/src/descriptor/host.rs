@@ -19,6 +19,7 @@ use super::slot_map::SlotMap;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+mod exact_spans;
 pub(crate) mod made_first;
 pub(crate) mod made_read;
 pub(crate) mod note_kind;
@@ -677,6 +678,15 @@ pub(crate) struct Spans {
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
     sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
+    /// VIcky (`VICTORY_TEXTURE_EXACT` part A, `exact_spans`): whether the
+    /// index below is kept and the exact spans are asked; the starts of the
+    /// spans by the 1 MiB blocks their full size covers; the bytes from its
+    /// texture's start each slot's view shows (none: all of it); and those
+    /// bytes by resource description and first level.
+    exact: bool,
+    cover: std::collections::HashMap<u64, Vec<u64>>,
+    viewed: std::collections::HashMap<u32, u64>,
+    viewed_sizes: std::collections::HashMap<([u32; 14], u32), Option<u64>>,
 }
 
 /// When a view the title writes makes an older view of other memory stale.
@@ -764,6 +774,7 @@ impl Spans {
                 return stale;
             }
             if let Some((old_end, slots)) = self.by_start.remove(&at) {
+                self.cover_remove(at, old_end);
                 // The first of them are said with both spans, to tell a
                 // replacement from a neighbour in one launch's log.
                 static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -784,6 +795,9 @@ impl Spans {
                     stale.push(slot);
                 }
             }
+        }
+        if !self.by_start.contains_key(&start) {
+            self.cover_add(start, end);
         }
         self.by_start.entry(start).or_insert_with(|| (end, Default::default())).1.insert(index);
         self.by_slot.insert(index, start);
@@ -814,13 +828,16 @@ impl Spans {
     /// Slot `index` holds no placed texture view any more.
     fn forget(&mut self, index: u32) {
         self.first.remove(&index);
+        self.viewed.remove(&index);
         let Some(start) = self.by_slot.remove(&index) else {
             return;
         };
         if let Some(span) = self.by_start.get_mut(&start) {
             span.1.remove(&index);
             if span.1.is_empty() {
+                let end = span.0;
                 self.by_start.remove(&start);
+                self.cover_remove(start, end);
             }
         }
     }
@@ -1048,13 +1065,18 @@ struct Waiting {
     /// VIcky (`VICTORY_DS_HOLD`): looks held back because a DirectStorage
     /// write was pending under its memory ([`TextureQueue::ds_hold`]).
     holds: u8,
+    /// VIcky (`VICTORY_TEXTURE_EXACT` part B): with `checked`, the full hash
+    /// (`crate::texexact::h64`) of the bytes its upload's detiling took (0:
+    /// not known), [`TextureQueue::exact_print`]; said by the slot listing.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    exact: u64,
 }
 
 impl Waiting {
     /// A slot written in `frame`, write `write` of the queue, due from `due`,
     /// nothing known of it yet.
     fn new(due: u64, frame: u64, write: u64) -> Waiting {
-        Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), mips: None, holds: 0 }
+        Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), mips: None, holds: 0, exact: 0 }
     }
 }
 
@@ -2144,6 +2166,12 @@ impl HostHeap {
         if ranges.is_empty() {
             return 0;
         }
+        // VIcky (`VICTORY_TEXTURE_EXACT` part A): the textures draws keep
+        // staged there are read again whole at their next submission, as a
+        // slot here is made due (they are in no queue).
+        if crate::texexact::part(crate::texexact::Part::A) {
+            crate::texexact::count(crate::texexact::N::ARestaged, crate::texture::restage_in(&ranges) as u64);
+        }
         self.slots_remapped_in(&ranges, frame)
     }
 
@@ -2152,7 +2180,13 @@ impl HostHeap {
         use std::sync::atomic::Ordering::Relaxed;
         let mut slots: Vec<u32> = {
             let placed = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Placed, &*self.placed);
-            ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+            // VIcky (`VICTORY_TEXTURE_EXACT` part A): every texture whose
+            // viewed levels lie there (`exact_spans`).
+            if placed.exact {
+                placed.exact_slots(ranges, Spans::slots_in)
+            } else {
+                ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+            }
         };
         slots.sort_unstable();
         slots.dedup();
@@ -2209,8 +2243,15 @@ impl HostHeap {
         if left::fresh_live() {
             let restaged = crate::texture::restage_in(&ranges);
             crate::texstale::fresh_count(crate::texstale::Fresh::Restaged, restaged as u64);
+        } else if crate::texexact::part(crate::texexact::Part::A) {
+            // VIcky (`VICTORY_TEXTURE_EXACT` part A): the same without
+            // `VICTORY_TABLE_BOUND_FRESH`.
+            crate::texexact::count(crate::texexact::N::ARestaged, crate::texture::restage_in(&ranges) as u64);
         }
-        self.slots_written_under(&ranges, frame, crate::watch::page_writes() & 2 != 0)[2]
+        // (VIcky, `VICTORY_TEXTURE_EXACT` part A: made due with it whatever
+        // `VICTORY_PAGE_WRITES` says.)
+        let due = crate::watch::page_writes() & 2 != 0 || crate::texexact::part(crate::texexact::Part::A);
+        self.slots_written_under(&ranges, frame, due)[2]
     }
 
     /// [`HostHeap::texture_slots_page_written`] for `ranges` (start, end):
@@ -2220,7 +2261,12 @@ impl HostHeap {
         use std::sync::atomic::Ordering::Relaxed;
         let mut slots: Vec<u32> = {
             let placed = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Placed, &*self.placed);
-            ranges.iter().flat_map(|&(start, end)| placed.slots_holding(start, end)).collect()
+            // VIcky (`VICTORY_TEXTURE_EXACT` part A): see `slots_remapped_in`.
+            if placed.exact {
+                placed.exact_slots(ranges, Spans::slots_holding)
+            } else {
+                ranges.iter().flat_map(|&(start, end)| placed.slots_holding(start, end)).collect()
+            }
         };
         slots.sort_unstable();
         slots.dedup();
@@ -2830,16 +2876,20 @@ impl HostHeap {
             }
             let mut placed = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Placed, &*self.placed);
             let span = placed_view.and_then(|(resource, start, first)| {
-                Some((start, start.saturating_add(placed.bytes(resource)?), first))
+                Some((start, start.saturating_add(placed.bytes(resource)?), first, resource))
             });
             match span {
-                Some((start, end, first)) => {
+                Some((start, end, first, resource)) => {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
                     placed.rule = stale_rule();
+                    // VIcky (`VICTORY_TEXTURE_EXACT` part A): set before any
+                    // span is, so the index holds them all.
+                    placed.exact = crate::texexact::part(crate::texexact::Part::A);
                     self.set_spanned(index, true);
                     let stale = placed.note(index, start, end, !seen);
                     placed.shows(index, first);
+                    placed.view_extent(index, resource, first);
                     stale
                 }
                 None => {
@@ -4092,13 +4142,14 @@ impl HostHeap {
         match textures.slots.get(&index) {
             None => "not queued".into(),
             Some(w) => format!(
-                "queued due={} written@{} looks={} part_mapped={} recheck={} ds_holds={}",
+                "queued due={} written@{} looks={} part_mapped={} recheck={} ds_holds={} exact_hash={:016x}",
                 if w.due <= frame { "now".to_string() } else { format!("@{}", w.due) },
                 w.written,
                 w.looks,
                 w.mapped,
                 w.checked.2 != 0,
-                w.holds
+                w.holds,
+                w.exact
             ),
         }
     }

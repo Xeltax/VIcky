@@ -2813,6 +2813,8 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
         return;
     }
     reservation::completed_write(at, len);
+    // VIcky (`VICTORY_TEXTURE_EXACT` part D): written, so no longer held.
+    crate::texexact::written(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -2943,6 +2945,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
+    // VIcky (`VICTORY_TEXTURE_EXACT` part D): mapped and not written yet.
+    crate::texexact::mapped(at, len);
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.

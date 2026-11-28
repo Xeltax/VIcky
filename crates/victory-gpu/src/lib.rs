@@ -91,6 +91,8 @@ mod stripes;
 mod tiles;
 pub mod signature;
 #[cfg(windows)]
+mod texexact;
+#[cfg(windows)]
 mod texstale;
 #[cfg(windows)]
 mod texture;

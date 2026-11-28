@@ -81,6 +81,16 @@ pub(crate) struct Staging {
     /// (`crate::texstale::sample_print_of`) of what the last detiling took;
     /// 0: none, or the diagnostic is off.
     sampled: std::sync::atomic::AtomicU64,
+    /// VIcky (`VICTORY_TEXTURE_EXACT`, `VICTORY_TEXTURE_AUDIT`,
+    /// `crate::texexact`): the title texture this stages, its host copy's
+    /// format and size (for the audit's lines), and the title slot the
+    /// texture pass uploaded it for (index + 1; 0: none) with the queue's
+    /// write number of that upload (part B's print goes to that entry).
+    resource: usize,
+    format: u32,
+    extent: (u32, u32),
+    pass_slot: std::sync::atomic::AtomicU64,
+    pass_write: std::sync::atomic::AtomicU64,
 }
 
 thread_local! {
@@ -111,8 +121,18 @@ impl Drop for PassUpload {
 /// memory (in the ON phases; never for the texture pass's own uploads,
 /// [`PassUpload`]). Counted.
 fn held_for_write(staging: &Staging) -> bool {
-    let on = crate::descriptor::left::fresh_live() && crate::texstale::ds_hold();
     let (at, len) = staging.memory();
+    // VIcky (`VICTORY_TEXTURE_EXACT` part D): memory mapped and not written
+    // yet, or under a DirectStorage write, holds a draw's upload as it holds
+    // the pass's look (at most `crate::texexact::HOLD_MS`), with or without
+    // `VICTORY_TABLE_BOUND_FRESH` and `VICTORY_DS_HOLD`.
+    if crate::texexact::part(crate::texexact::Part::D)
+        && crate::texexact::not_ready(at as u64, at.saturating_add(len) as u64)
+    {
+        crate::texexact::count(crate::texexact::N::DDraw, 1);
+        return true;
+    }
+    let on = crate::descriptor::left::fresh_live() && crate::texstale::ds_hold();
     crate::texstale::stage_held(&staging.hold, on, at as u64, len as u64, crate::frame::current())
 }
 
@@ -175,6 +195,35 @@ pub(crate) fn staged_sample(resource: This) -> Option<u64> {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let s = map.as_ref()?.get(&(resource as usize))?;
     Some(s.sampled.load(std::sync::atomic::Ordering::Relaxed)).filter(|&p| p != 0)
+}
+
+/// VIcky (`VICTORY_TEXTURE_AUDIT`): the title textures staged for draws that
+/// a list used in the last `frames` frames before `frame` (they have a
+/// current view: a table of a draw reads them).
+pub(crate) fn staged_lately(frame: u64, frames: u64) -> std::collections::HashSet<usize> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()
+        .map(|m| {
+            m.iter()
+                .filter(|(_, s)| frame.saturating_sub(s.used.load(Relaxed) >> 32) <= frames)
+                .map(|(&r, _)| r)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// VIcky (`VICTORY_TEXTURE_EXACT` part B): the texture pass uploads
+/// `resource` for title slot `index` as the queue's write `write`: its
+/// staging's detiling at submission posts what it took for that slot
+/// (`crate::texexact::post`).
+pub(crate) fn pass_slot(resource: This, index: u32, write: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = map.as_ref().and_then(|m| m.get(&(resource as usize))) {
+        s.pass_write.store(write, Relaxed);
+        s.pass_slot.store(u64::from(index) + 1, Relaxed);
+    }
 }
 
 /// A staging buffer nothing holds: the buffer and where it is mapped.
@@ -541,13 +590,19 @@ enum Unlocked {
 /// them if they changed since `last`. With `fallback`, a staging buffer
 /// never filled (`last.hash` none) is filled from the mapped pages when a
 /// page is missing (port of 83a5593b66, fork PR #1392, there on by default).
-fn unlocked_read(memory: *const u8, last: &mut Last, size: usize, fallback: bool, detile: impl FnOnce(&[u8])) -> Unlocked {
+fn unlocked_read(
+    memory: *const u8,
+    last: &mut Last,
+    size: usize,
+    fallback: bool,
+    detile: impl FnOnce(&[u8], blake3::Hash, bool),
+) -> Unlocked {
     with_read(size, |read| {
         if crate::host::read_into(memory, read) {
             let hash = blake3::hash(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
-                detile(read);
+                detile(read, hash, false);
             }
             return Unlocked::Read;
         }
@@ -561,9 +616,10 @@ fn unlocked_read(memory: *const u8, last: &mut Last, size: usize, fallback: bool
         if read.iter().all(|&b| b == 0) {
             return Unlocked::Nothing;
         }
-        last.hash = Some(blake3::hash(read));
+        let hash = blake3::hash(read);
+        last.hash = Some(hash);
         last.partial = Some(crate::frame::current());
-        detile(read);
+        detile(read, hash, true);
         Unlocked::FellBack
     })
 }
@@ -828,6 +884,9 @@ pub(crate) fn forget(resource: usize) {
     if let Some(through) = through.as_mut() {
         through.remove(&resource);
     }
+    drop(through);
+    // VIcky (`VICTORY_TEXTURE_EXACT`, `VICTORY_TEXTURE_AUDIT`).
+    crate::texexact::forget(resource);
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -1196,11 +1255,49 @@ impl Staging {
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
+        // VIcky (`VICTORY_TEXTURE_EXACT` part C): the DirectStorage write
+        // sequence around the read (on whichever thread refreshes: the
+        // submitting one, or a wide one with `VICTORY_SUBMIT_LANES`).
+        let seq = crate::texexact::read_began();
         let read = self.refresh_timed();
+        if let Some(seq) = seq
+            && read > 0
+        {
+            self.torn_check(seq);
+        }
         let us = whole.elapsed().as_micros() as u64;
         REFRESH_WAITS[3].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
         crate::framelog::add(crate::framelog::T::RefreshUs, us);
         read
+    }
+
+    /// VIcky (`VICTORY_TEXTURE_EXACT` part C): after a read that began at
+    /// write sequence `seq`: if a DirectStorage write overlapped it (or,
+    /// with part D, memory there is not written yet), the bytes taken may be
+    /// half of each. The staging is read again at its next refresh and
+    /// uploaded by its next list, and the slots of placed textures there are
+    /// due next frame (a texture the pass uploaded has no staging after its
+    /// list); at most `crate::texexact::TORN_MOST` times in a row.
+    fn torn_check(&self, seq: u64) {
+        let (at, len) = self.memory();
+        let (start, end) = (at as u64, at.saturating_add(len) as u64);
+        if !crate::texexact::torn(seq, start, end) {
+            crate::texexact::clean_read(start);
+            return;
+        }
+        if crate::texexact::torn_redue(start) {
+            self.forget();
+            self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::descriptor::host::remapped(at, len);
+        }
+    }
+
+    /// VIcky (`VICTORY_TEXTURE_EXACT` part B): the slot the texture pass
+    /// uploaded this for, and the queue's write of that upload.
+    fn pass_slot(&self) -> Option<(u32, u64)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let slot = self.pass_slot.load(Relaxed);
+        (slot != 0).then(|| ((slot - 1) as u32, self.pass_write.load(Relaxed)))
     }
 
     fn refresh_timed(&self) -> usize {
@@ -1227,7 +1324,7 @@ impl Staging {
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
+                self.detile(read, None, false);
             });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
@@ -1258,7 +1355,9 @@ impl Staging {
             // frame's number alone, a texture whose submissions met the
             // frame counter in steps of two (the title begins two or three
             // frames for one it presents) could miss every turn.
-            let fresh = crate::descriptor::left::fresh_live();
+            // (VIcky, `VICTORY_TEXTURE_EXACT`: by its own count too, as the
+            // textures the draws keep are in no queue either way.)
+            let fresh = crate::descriptor::left::fresh_live() || crate::texexact::on();
             let turn = if fresh {
                 frame >= last.hashed.saturating_add(HASH_EVERY)
             } else {
@@ -1309,11 +1408,21 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return false;
                 }
-                last.hash = Some(hash);
-                if read.iter().all(|&b| b == 0) {
+                let zeros = read.iter().all(|&b| b == 0);
+                // VIcky (`VICTORY_TEXTURE_EXACT`): memory all zeros where it
+                // is mapped (mapped, not written yet) is not taken as what
+                // the staging holds: it keeps what it had (part D's hold, for
+                // the draws), and is read again in 8 frames, not 30, besides
+                // the read part A's events ask for.
+                if zeros && crate::texexact::on() {
+                    last.partial = Some(frame.saturating_sub(22));
                     return false;
                 }
-                self.detile(read);
+                last.hash = Some(hash);
+                if zeros {
+                    return false;
+                }
+                self.detile(read, Some(hash), true);
                 true
             });
             #[cfg(feature = "diagnostics")]
@@ -1332,7 +1441,7 @@ impl Staging {
                     return size;
                 }
                 last.hash = Some(hash);
-                self.detile(tiled);
+                self.detile(tiled, Some(hash), false);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
@@ -1348,7 +1457,7 @@ impl Staging {
             return size;
         }
         last.hash = Some(hash);
-        self.detile(tiled);
+        self.detile(tiled, Some(hash), false);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
@@ -1363,7 +1472,22 @@ impl Staging {
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let fallback = no_wait_fallback();
-        let got = unlocked_read(self.memory, last, size, fallback, |bytes| self.detile(bytes));
+        let got = unlocked_read(self.memory, last, size, fallback, |bytes, hash, partial| {
+            self.detile(bytes, Some(hash), partial)
+        });
+        // VIcky (`VICTORY_TEXTURE_EXACT`): a read that took nothing tells
+        // the pass's slot so (part B: its look uploads it again), and makes
+        // the slots there due again as the fallback's re-due does.
+        if matches!(got, Unlocked::Failed | Unlocked::Nothing) && crate::texexact::on() {
+            if crate::texexact::part(crate::texexact::Part::B)
+                && let Some((index, write)) = self.pass_slot()
+            {
+                crate::texexact::post(crate::texexact::Post { index, write, print: 0, hash: 0, failed: true });
+            }
+            if !fallback {
+                crate::descriptor::host::remapped(self.memory as usize, size);
+            }
+        }
         if fallback && got != Unlocked::Read {
             let what = match got {
                 Unlocked::FellBack => 1,
@@ -1394,9 +1518,45 @@ impl Staging {
         }
     }
 
+    /// VIcky (`VICTORY_TEXTURE_EXACT`, `VICTORY_TEXTURE_AUDIT`): what a
+    /// detiling took: its full hash (`hash`, if the read took one already:
+    /// every path but the write-watched one does) for the texture's record,
+    /// and for a slot the pass uploaded this for, its fingerprint over the
+    /// ranges the slot's looks read (part B). `partial`: not all of the
+    /// memory was mapped.
+    fn note_exact(&self, tiled: &[u8], hash: Option<blake3::Hash>, partial: bool) {
+        let hash = crate::texexact::h64(&hash.unwrap_or_else(|| blake3::hash(tiled)));
+        if crate::texexact::part(crate::texexact::Part::B)
+            && let Some((index, write)) = self.pass_slot()
+        {
+            let mips = self.layout.sample_ranges(MIP_WINDOW, MIP_RANGES);
+            let print = fingerprint_of(tiled, &mips);
+            crate::texexact::post(crate::texexact::Post { index, write, print, hash, failed: false });
+        }
+        if crate::texexact::records() {
+            let (at, len) = self.memory();
+            let rec = crate::texexact::Record::new(
+                at as u64,
+                len as u64,
+                hash,
+                crate::frame::current(),
+                partial,
+                self.format,
+                self.extent.0,
+                self.extent.1,
+            );
+            crate::texexact::detiled(self.resource, rec);
+        }
+    }
+
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    /// `hash`: its full hash if the read took one; `partial`: not all of it
+    /// was mapped (both for `VICTORY_TEXTURE_EXACT`'s record).
+    fn detile(&self, tiled: &[u8], hash: Option<blake3::Hash>, partial: bool) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        if crate::texexact::hashes() {
+            self.note_exact(tiled, hash, partial);
+        }
         // VIcky (`VICTORY_STALE_SLOTS`): what the host copy takes from now
         // on, sampled as the stale look samples memory, from the very bytes
         // detiled (`crate::texstale::table_made`'s slots are looked at
@@ -1566,6 +1726,33 @@ pub(crate) fn fingerprint(at: u64, len: u64, mips: &[(u64, u64)]) -> u64 {
         }
     });
     crate::texstale::printed(ranges, started.elapsed().as_micros() as u64);
+    let hash = hasher.finalize();
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&hash.as_bytes()[..8]);
+    u64::from_le_bytes(first) | 1
+}
+
+/// VIcky (`VICTORY_TEXTURE_EXACT` part B): [`fingerprint`] of `bytes` in hand
+/// (a texture's memory as a detiling took it): the same value as
+/// `fingerprint` gives for memory that holds those bytes.
+pub(crate) fn fingerprint_of(bytes: &[u8], mips: &[(u64, u64)]) -> u64 {
+    const WINDOW: usize = 16 << 10;
+    let len = bytes.len();
+    let mut hasher = blake3::Hasher::new();
+    if len <= 3 * WINDOW {
+        hasher.update(bytes);
+    } else {
+        let middle = (len / 2) & !0xfff;
+        hasher.update(&bytes[..WINDOW]);
+        hasher.update(&bytes[middle..middle + WINDOW]);
+        hasher.update(&bytes[len - WINDOW..]);
+        for &(from, n) in mips {
+            let from = from as usize;
+            if from < len {
+                hasher.update(&bytes[from..from + (n as usize).min(len - from)]);
+            }
+        }
+    }
     let hash = hasher.finalize();
     let mut first = [0u8; 8];
     first.copy_from_slice(&hash.as_bytes()[..8]);
@@ -1980,6 +2167,11 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         pooled,
         hold: crate::texstale::StageHold::default(),
         sampled: std::sync::atomic::AtomicU64::new(0),
+        resource: resource as usize,
+        format: d.Format.0 as u32,
+        extent: (d.Width as u32, d.Height),
+        pass_slot: std::sync::atomic::AtomicU64::new(0),
+        pass_write: std::sync::atomic::AtomicU64::new(0),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
@@ -2147,27 +2339,27 @@ mod title_memory_tests {
             assert_eq!(VirtualAlloc(base.cast(), MAPPED, MEM_COMMIT, PAGE_READWRITE), base.cast());
             // Mapped but all zeros: nothing to take.
             let mut last = Last::default();
-            assert_eq!(unlocked_read(base, &mut last, SIZE, true, |_| panic!("zeros detiled")), Unlocked::Nothing);
+            assert_eq!(unlocked_read(base, &mut last, SIZE, true, |_, _, _| panic!("zeros detiled")), Unlocked::Nothing);
             assert!(last.hash.is_none());
             base.write_bytes(0x3c, MAPPED);
             // Without the switch: nothing taken, as before.
             let mut last = Last { asked: 7, ..Default::default() };
-            assert_eq!(unlocked_read(base, &mut last, SIZE, false, |_| panic!("detiled without the switch")), Unlocked::Failed);
+            assert_eq!(unlocked_read(base, &mut last, SIZE, false, |_, _, _| panic!("detiled without the switch")), Unlocked::Failed);
             assert!(last.hash.is_none());
             // With it: filled from the mapped page.
             let mut detiled = Vec::new();
-            assert_eq!(unlocked_read(base, &mut last, SIZE, true, |b| detiled = b.to_vec()), Unlocked::FellBack);
+            assert_eq!(unlocked_read(base, &mut last, SIZE, true, |b, _, _| detiled = b.to_vec()), Unlocked::FellBack);
             assert!(last.hash.is_some() && last.partial.is_some());
             assert_eq!(detiled.len(), SIZE);
             assert!(detiled[..MAPPED].iter().all(|&b| b == 0x3c));
             assert!(detiled[MAPPED..].iter().all(|&b| b == 0));
             // Filled: a failed read does not overwrite it.
-            assert_eq!(unlocked_read(base, &mut last, SIZE, true, |_| panic!("detiled again")), Unlocked::Failed);
+            assert_eq!(unlocked_read(base, &mut last, SIZE, true, |_, _, _| panic!("detiled again")), Unlocked::Failed);
             // All of it there now, with other bytes: read whole and detiled.
             assert_eq!(VirtualAlloc(base.cast(), SIZE, MEM_COMMIT, PAGE_READWRITE), base.cast());
             base.add(MAPPED).write_bytes(0x11, SIZE - MAPPED);
             let mut whole = false;
-            assert_eq!(unlocked_read(base, &mut last, SIZE, true, |_| whole = true), Unlocked::Read);
+            assert_eq!(unlocked_read(base, &mut last, SIZE, true, |_, _, _| whole = true), Unlocked::Read);
             assert!(whole);
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
