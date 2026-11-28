@@ -1366,22 +1366,161 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
     true
 }
 
+/// Whether a texture whose first and last pages are both unmapped is
+/// looked into (`VICTORY_INTERIOR_MIP_RESIDENCY=1`, after Cuebert 818c5a9a;
+/// off by default). A streamed texture can have only interior levels
+/// mapped: every slice holds the whole chain (the tail's block first,
+/// level 0 last), so an array whose first and last slices are away, or a
+/// texture whose tail block and level 0 are away while the levels between
+/// are there, counted as nothing and was passed over as unmapped
+/// ([`mapped_bytes`]).
+pub(crate) fn interior_mips() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_INTERIOR_MIP_RESIDENCY").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "VICTORY_INTERIOR_MIP_RESIDENCY=1: textures whose first and last pages are unmapped are looked into; \
+                 one with levels mapped between them is uploaded in part instead of passed over as unmapped"
+            );
+        }
+        on
+    })
+}
+
+/// With [`interior_mips`], since the start: textures whose first and last
+/// pages were both unmapped and that were looked into (more than two pages
+/// long), and of those the ones found with memory mapped between them.
+pub(crate) static INTERIOR: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// For the frame line: what [`INTERIOR`] counted, or nothing with the
+/// switch off (the line reads as before).
+pub(crate) fn interior_summary() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !interior_mips() {
+        return String::new();
+    }
+    format!(
+        " (interior mips: {} with both ends unmapped looked into, {} found mapped between)",
+        INTERIOR[0].load(Relaxed),
+        INTERIOR[1].load(Relaxed)
+    )
+}
+
+/// The pages asked about to tell whether memory between the first and the
+/// last page of `[start, end)` is mapped: the first page after the first,
+/// then the first page of each 64 KiB block (the console's page, the size
+/// the title maps in) up to the last page, which is left out. Empty for two
+/// pages or fewer.
+fn interior_probes(start: usize, end: usize) -> Vec<usize> {
+    const KERNEL_PAGE: usize = 4096;
+    const BLOCK: usize = 64 << 10;
+    if end <= start {
+        return Vec::new();
+    }
+    let (first, last) = (start / KERNEL_PAGE, (end - 1) / KERNEL_PAGE);
+    if last <= first + 1 {
+        return Vec::new();
+    }
+    let (from, to) = ((first + 1) * KERNEL_PAGE, last * KERNEL_PAGE);
+    let mut pages = vec![from];
+    let mut block = (from & !(BLOCK - 1)).saturating_add(BLOCK);
+    while block < to {
+        pages.push(block);
+        block = block.saturating_add(BLOCK);
+    }
+    pages
+}
+
+/// Whether any page between the first and the last of `[start, end)` is
+/// mapped ([`interior_probes`]). The pages are put to the kernel's working
+/// set question 256 at a time (no walk, and no kernel read of a page that
+/// is away: those are the costly answers, and most textures looked at here
+/// are away whole). A page not in the working set may still be there (the
+/// title wrote it through another view, or it was trimmed): up to eight of
+/// them, spread over the range, are then read through the kernel.
+fn interior_mapped(start: usize, end: usize) -> bool {
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const READS: usize = 8;
+    let pages = interior_probes(start, end);
+    if pages.is_empty() {
+        return false;
+    }
+    // SAFETY: plain data.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    for chunk in pages.chunks(info.len()) {
+        for (entry, &page) in info.iter_mut().zip(chunk) {
+            entry.VirtualAddress = page as *mut _;
+        }
+        // SAFETY: `chunk.len()` entries of the size given; our own process.
+        let asked = unsafe {
+            K32QueryWorkingSetEx(
+                GetCurrentProcess(),
+                info.as_mut_ptr().cast(),
+                (chunk.len() * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+            )
+        } != 0;
+        // Bit 0 of the answer: the page is in the working set.
+        // SAFETY: plain data the query filled in.
+        if asked && info[..chunk.len()].iter().any(|entry| unsafe { entry.VirtualAttributes.Flags } & 1 != 0) {
+            return true;
+        }
+    }
+    let step = pages.len().div_ceil(READS).max(1);
+    let mut read = pages.iter().step_by(step).copied().collect::<Vec<_>>();
+    if let Some(&last) = pages.last()
+        && read.last() != Some(&last)
+    {
+        read.push(last);
+    }
+    read.into_iter().any(|page| crate::host::read_into(page as *const u8, &mut [0u8]))
+}
+
 /// How many bytes of `[at, at + len)` are committed memory: all of a
 /// texture that is there, some of one streaming in (its smaller mips lie
 /// at the start of its memory, and their pages are mapped first), none of
 /// one not there. With neither the first nor the last page committed the
 /// answer is none without a look at the pages between (two queries for the
-/// slots whose texture is away, which are asked again and again).
+/// slots whose texture is away, which are asked again and again), unless
+/// [`interior_mips`] is on.
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    mapped_bytes_with(at, len, interior_mips())
+}
+
+/// [`mapped_bytes`], with the interior looked into or not.
+fn mapped_bytes_with(at: *const u8, len: usize, interior: bool) -> u64 {
     if len == 0 {
         return 0;
     }
     let start = at as usize;
     let end = start.saturating_add(len);
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
-        return 0;
+    let ends_missing = !committed(at, 1) && !committed((end - 1) as *const u8, 1);
+    if ends_missing {
+        if !interior || interior_probes(start, end).is_empty() {
+            return 0;
+        }
+        INTERIOR[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !interior_mapped(start, end) {
+            return 0;
+        }
     }
+    let there = mapped_bytes_counted(start, end, len, interior);
+    if ends_missing && there != 0 {
+        let found = INTERIOR[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if found.is_power_of_two() {
+            tracing::info!(found, mapped = there, bytes = len, "interior texture residency found with both ends unmapped");
+        }
+    }
+    there
+}
+
+/// The counting part of [`mapped_bytes_with`], once something of
+/// `[start, end)` is known to be there.
+fn mapped_bytes_counted(start: usize, end: usize, len: usize, interior: bool) -> u64 {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
     if !by_query() {
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
@@ -1419,7 +1558,10 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         if n == 0 || next <= p {
             break;
         }
-        if info.State == MEM_COMMIT {
+        // With the interior looked into, committed pages the title keeps
+        // from being read count as not there (818c5a9a): the upload reads
+        // what this counts.
+        if info.State == MEM_COMMIT && (!interior || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0) {
             there += (next - p) as u64;
         }
         p = next;
@@ -1509,6 +1651,85 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod interior_mip_tests {
+    use super::{interior_probes, mapped_bytes_with};
+
+    const PAGE: usize = 4096;
+    const BLOCK: usize = 64 << 10;
+
+    /// The pages asked about lie strictly between the first and the last
+    /// page, one per 64 KiB block plus the page after the first; a range of
+    /// two pages or fewer has none.
+    #[test]
+    fn the_probes_lie_between_the_end_pages() {
+        let base = 0x1000_0000usize;
+        assert!(interior_probes(base, base).is_empty());
+        assert!(interior_probes(base, base + 2 * PAGE).is_empty(), "two pages: nothing between");
+        assert!(interior_probes(base + 0x800, base + PAGE + 0x10).is_empty(), "two pages, unaligned");
+        assert_eq!(interior_probes(base, base + 3 * PAGE), vec![base + PAGE]);
+        let probes = interior_probes(base, base + 4 * BLOCK);
+        assert_eq!(probes, vec![base + PAGE, base + BLOCK, base + 2 * BLOCK, base + 3 * BLOCK]);
+        // Unaligned: the last page (holding byte end - 1) is never asked.
+        let (start, end) = (base + 0x1234, base + 2 * BLOCK + 0x10);
+        let probes = interior_probes(start, end);
+        assert_eq!(probes.first(), Some(&(base + PAGE * 2)));
+        assert!(probes.iter().all(|&p| p > start && p / PAGE < (end - 1) / PAGE && p % PAGE == 0));
+        assert!(probes.contains(&(base + BLOCK)));
+    }
+
+    /// A texture whose first and last blocks are away and whose blocks
+    /// between are mapped counts as nothing without the switch and as the
+    /// blocks between with it; mapped pages never touched (as the title's
+    /// writes through another view leave them) are found too; memory away
+    /// whole and memory there whole read the same both ways.
+    #[test]
+    fn interior_blocks_count_only_with_the_switch() {
+        use windows_sys::Win32::System::Memory::*;
+        const SIZE: usize = 16 * BLOCK;
+        // SAFETY: private reservations of our own; only committed pages are
+        // written, by this thread alone.
+        unsafe {
+            // Blocks 4 and 5 mapped and written.
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let interior = base.add(4 * BLOCK);
+            assert_eq!(VirtualAlloc(interior.cast(), 2 * BLOCK, MEM_COMMIT, PAGE_READWRITE), interior.cast());
+            interior.write_bytes(0x5a, 2 * BLOCK);
+            assert_eq!(mapped_bytes_with(base, SIZE, false), 0, "stock: nothing at both ends, nothing at all");
+            assert_eq!(mapped_bytes_with(base, SIZE, true), 2 * BLOCK as u64, "the blocks between");
+            // Not from a block's start: the range starts and ends inside
+            // away blocks, and is still the two blocks.
+            assert_eq!(mapped_bytes_with(base.add(0x1800), SIZE - 0x3000, true), 2 * BLOCK as u64);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+
+            // Blocks 6 and 7 mapped and never touched: not in the working
+            // set, found by the kernel reads.
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let interior = base.add(6 * BLOCK);
+            assert_eq!(VirtualAlloc(interior.cast(), 2 * BLOCK, MEM_COMMIT, PAGE_READWRITE), interior.cast());
+            assert_eq!(mapped_bytes_with(base, SIZE, false), 0);
+            assert_eq!(mapped_bytes_with(base, SIZE, true), 2 * BLOCK as u64);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+
+            // Away whole, and there whole.
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(mapped_bytes_with(base, SIZE, false), 0);
+            assert_eq!(mapped_bytes_with(base, SIZE, true), 0);
+            assert_eq!(VirtualAlloc(base.cast(), SIZE, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            base.write_bytes(1, SIZE);
+            assert_eq!(mapped_bytes_with(base, SIZE, false), SIZE as u64);
+            assert_eq!(mapped_bytes_with(base, SIZE, true), SIZE as u64);
+            // Two pages with both away: nothing between to look at.
+            assert_ne!(VirtualFree(base.cast(), SIZE, MEM_DECOMMIT), 0);
+            assert_eq!(mapped_bytes_with(base, 2 * PAGE, true), 0);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 }
 
 #[cfg(test)]
