@@ -123,6 +123,24 @@ This work is for making the title's compute ray tracing (the BVH structure build
 
 **Chapter-1 boat mission with ray tracing (2026-11-27, verified on an RTX 4080, Series X, RT on):** with this main, a save in the boat mission loads, the boat floats and the mission plays, with no extra switch: the texture copy-back (`VICTORY_TEXTURE_BACK`, on by default) gives the title's physics the water it computes on the card, and the builder's box rehydration programs' parent-link stores are left out by default (`VICTORY_BVH_LINK_STORES=keep` keeps them; with them the title crashed on that save's loading screen). Add `VICTORY_LATE_WAIT=2` in water scenes (at the relay's default stage 3 testers elsewhere saw the water surface vanish for single frames); `VICTORY_LATE_WATER=1` at stage 3 is the narrower wait to try instead, not measured yet (water section below). Measured: 480 s on that save, RT on, the fps set below plus `VICTORY_LATE_WAIT=2 VICTORY_REAPER=1`: no crash, 7.34 fps true mean of the last 12 lines (lines 7.8-8.5, about 122-127 ms a frame: preparing ~68, copy-back ~23-27, a wait for the card of ~17 ms that is the copy-back's read-back). The prologue cell with the same build: 5.32 fps true (a slow stretch mid-run; last lines 6.3-7.5), about level with 6.91 before the batch. `VICTORY_INPLACE_CONSTANTS` does not place the constants heap here ("view memory from several places") even without `VICTORY_FENCE_SENT`/`VICTORY_SECTION_MB`: leave it off, or try it with `VICTORY_PAGE_PLACE=1` and without `VICTORY_FENCE_SENT` (roadmap B2, section "Physical pages placed at their first mapping").
 
+**Picture fidelity measured (2026-11-28 night).** Boat mission save, RT on, recommended set, captures every 16 frames. fps is true fps over 12 lines:
+
+| Settings | fps | Picture |
+|---|---|---|
+| none of the switches below | 9.24 | |
+| `VICTORY_FACE_D16=1` | 9.31 | the 16-bit path is active in 34 shaders; no conversion warning; the face output program `970c4fbb3b017c0e` runs; close-ups clean |
+| `VICTORY_FILTER_3D=1` | 9.06 | dark diamond shapes on the water; colour glitter in a beard |
+| `VICTORY_INTERIOR_MIP_RESIDENCY=1` | 9.54 | 10,283 textures looked into, 0 found mapped between: no effect on this save |
+| the three together | 9.34 | |
+
+Prologue cell: 7.27 fps without the three, 7.47 with them.
+
+The guard fix (`VICTORY_GUARDED_JOINS`, port of f4b48ad76, on by default) lets `2da4beb3` build, so refused pipelines go from 7 to 6.
+
+The water set with `VICTORY_WATER_TILE_SLOTS=1` (port of fxceless cd9355206) makes all four water programs build: refused pipelines 4, untranslated programs 0, 9.54 fps. The grey tiles are gone. The water is lit turquoise, against the dark blue seen while those programs were refused; which one is right is still to be judged.
+
+Recommended for the picture: `VICTORY_FACE_D16=1`. Leave off `VICTORY_FILTER_3D` and `VICTORY_INTERIOR_MIP_RESIDENCY`.
+
 **Lot 6 measured (2026-11-28 night, RT on, RTX 4080).** Recommended set plus `VICTORY_BUFFERS_STRIPES=1`, one `=alt` switch per run, paired medians:
 
 | Switch | Scene, other switch | Paired median | Verdict |
@@ -166,7 +184,7 @@ Removing the `BUFFERS` waits did not move the frame. The recording threads' lock
 
 The BC7 rotation fix (port of fxceless 06702fe8 via trustno1 PR #23 6726920a) is always on.
 
-**Recommended since 2026-11-27 evening (lots 2-3 and the foxhound/trustno1/Belobug port batch; RTX 4080, Series X, RT on):** the fps set below plus `VICTORY_SYNC_FINE=1 VICTORY_CCD_PLACE=1`, and `VICTORY_COMPOSITE_GRADE_EDGE=1` for the picture. In water scenes, use no `VICTORY_LATE_WAIT` and no water set (`VICTORY_WAVE_PAIRS_ONLY`/`VICTORY_LDS_FLAGS` for the water programs).
+**Recommended since 2026-11-27 evening (lots 2-3 and the foxhound/trustno1/Belobug port batch; RTX 4080, Series X, RT on):** the fps set below plus `VICTORY_SYNC_FINE=1 VICTORY_CCD_PLACE=1 VICTORY_BUFFERS_STRIPES=1`, and `VICTORY_COMPOSITE_GRADE_EDGE=1 VICTORY_FACE_D16=1` for the picture. In water scenes, use no `VICTORY_LATE_WAIT` and no water set (`VICTORY_WAVE_PAIRS_ONLY`/`VICTORY_LDS_FLAGS` for the water programs).
 
 Measured as true fps over the last 12 frame-time lines:
 

@@ -83,6 +83,12 @@ Only 5–16 % of these takes cross CCDs, so the cost is contention itself, not C
 
 Lot 6's always-on SSE2 `changed_runs` and per-thread counts: picture clean, 9.41 fps on the boat mission.
 
+| **Picture: faces** | `VICTORY_FACE_D16` | 16-bit buffer path for the face network; engaged in 34 shaders; no fps cost | Recommended |
+| **Picture: transmission** | guard fix (on by default) | `2da4beb3` builds | Done |
+| **Picture: water** | water set + `VICTORY_WATER_TILE_SLOTS` | Grey tiles gone; water lit turquoise | Look to judge |
+| **Picture: posterized sky** | `VICTORY_FILTER_3D` | Diamonds on the water | Left off |
+| **Picture: interior mips** | `VICTORY_INTERIOR_MIP_RESIDENCY` | No effect | Left off |
+
 **Since 2026-11-28 the priority is picture fidelity**: textures, faces and mouths, resolution, water and vegetation. After that comes a structural rework of the descriptor path for fps (the submitting thread and the buffer-view pass are two equal walls), instead of more small levers.
 
 Next focus: the submitting thread itself, ~137 ms. In order:
