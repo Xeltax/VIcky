@@ -77,6 +77,14 @@ Only 5–16 % of these takes cross CCDs, so the cost is contention itself, not C
 | **B1** | `VICTORY_HEAP_SYNC_AT_SUBMIT` | Join 25 → 22-24 ms; -0.03 fps | Left off |
 | **B2** | `VICTORY_PAGE_PLACE` + `VICTORY_INPLACE_CONSTANTS` | Constants heap in place, but -0.6 fps | Left off: the card's PCIe reads cost more than the copies |
 
+| **Lot 6, sync need** | `VICTORY_HEAP_SYNC_NEED` | +0.25 fps | Optional |
+| **Lot 6, pass first** | `VICTORY_MADE_PASS_FIRST` | -0.32 fps; suspect for a dark boat hull and green vegetation when combined with the other two | Left off |
+| **Lot 6, dense first** | `VICTORY_DENSE_PAGE_FIRST` | +0.11 fps | Optional |
+
+Lot 6's always-on SSE2 `changed_runs` and per-thread counts: picture clean, 9.41 fps on the boat mission.
+
+**Since 2026-11-28 the priority is picture fidelity**: textures, faces and mouths, resolution, water and vegetation. After that comes a structural rework of the descriptor path for fps (the submitting thread and the buffer-view pass are two equal walls), instead of more small levers.
+
 Next focus: the submitting thread itself, ~137 ms. In order:
 
 1. B3, the snapshots.
