@@ -1390,8 +1390,9 @@ pub(crate) fn interior_mips() -> bool {
 
 /// With [`interior_mips`], since the start: textures whose first and last
 /// pages were both unmapped and that were looked into (more than two pages
-/// long), and of those the ones found with memory mapped between them.
-pub(crate) static INTERIOR: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// long), of those the ones found with memory mapped between them, and the
+/// nanoseconds the looks between took (the cost the switch adds).
+pub(crate) static INTERIOR: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// For the frame line: what [`INTERIOR`] counted, or nothing with the
 /// switch off (the line reads as before).
@@ -1401,8 +1402,9 @@ pub(crate) fn interior_summary() -> String {
         return String::new();
     }
     format!(
-        " (interior mips: {} with both ends unmapped looked into, {} found mapped between)",
+        " (interior mips: {} with both ends unmapped looked into in {:.1} ms, {} found mapped between)",
         INTERIOR[0].load(Relaxed),
+        INTERIOR[2].load(Relaxed) as f64 / 1e6,
         INTERIOR[1].load(Relaxed)
     )
 }
@@ -1501,7 +1503,10 @@ fn mapped_bytes_with(at: *const u8, len: usize, interior: bool) -> u64 {
             return 0;
         }
         INTERIOR[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if !interior_mapped(start, end) {
+        let began = std::time::Instant::now();
+        let between = interior_mapped(start, end);
+        INTERIOR[2].fetch_add(began.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        if !between {
             return 0;
         }
     }
