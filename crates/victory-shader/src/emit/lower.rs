@@ -39,6 +39,8 @@ mod lds_init;
 mod lds_flags;
 #[path = "halves.rs"]
 pub(super) mod halves;
+#[path = "filter3d.rs"]
+pub(super) mod filter3d;
 
 type Why = &'static str;
 
@@ -10544,6 +10546,11 @@ impl<'a> Lower<'a> {
                     };
                     self.s
                         .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
+                }
+                62 if kind == 4 && self.filters_3d(name, ss) => {
+                    let (g, r) = self.filter_3d(h, &cs);
+                    gathered = Some(g);
+                    r
                 }
                 62 => {
                     let lod = if name == "image_sample_l" {
