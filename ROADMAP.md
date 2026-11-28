@@ -89,13 +89,13 @@ Lot 6's always-on SSE2 `changed_runs` and per-thread counts: picture clean, 9.41
 | **Picture: posterized sky** | `VICTORY_FILTER_3D` | Diamonds on the water | Left off |
 | **Picture: interior mips** | `VICTORY_INTERIOR_MIP_RESIDENCY` | No effect | Left off |
 
-| **Picture: clothing / streamed textures** | `NO_WAIT_FALLBACK` + `DS_HOLD` + `PAGE_WRITES=all` + `BCPACK_FIXES` + `RECHECK_PARTLY` + `HEAP_RECHECK_MIPS` (every 960) | Never-re-uploaded stale slots 82 → 3-15 per sample; shirt clean; no fps cost | Recommended |
+| **Picture: clothing / streamed textures** | `NO_WAIT_FALLBACK` + `DS_HOLD` + `PAGE_WRITES=all` + `BCPACK_FIXES` + `RECHECK_PARTLY` + `HEAP_RECHECK_MIPS` (every 960) | Never-re-uploaded stale slots 82 -> 3-15 per sample; no fps cost. **Not solved:** the passenger's shirt still breaks in about half the boat runs (4 of 7 on 2026-11-28) | Recommended; root cause open, top picture priority |
 
 | **Structural stage 1** | `VICTORY_TABLE_BOUND` | **+1.66 fps boat (10.48 fps run), +1.18 prologue**; stage-2 criterion passes (64-72 %) | Optional. With `TABLE_BOUND_FRESH` (stage 1b) the picture is clean but the gain shrinks to +0.17 boat / +0.39 prologue: the speed came from skipping the staleness work. Next: stage 2 |
 
 | **Structural stage 2** | `VICTORY_TABLES_LEFT` | **+0.72 fps prologue (-14 % frame time)**, neutral on the boat; 0 check violations; heap sync 33 -> 19-28 ms, pass 49-58 -> 26-28 ms, copies flat; picture clean | Optional. Profiled (wall2): the boat frame is the submitting thread's own work. Since `fx-main-lanes`: holds swap key and copy together (a fix); `TABLES_LEFT_HEAL_SPREAD=1` spreads the heal (opt-in) |
 
-| **Structural stage 3** | `VICTORY_SUBMIT_LANES` | **+0.42 fps boat (-9 % frame time), +0.13 prologue** (paired, on `TABLES_LEFT=1`); refresh on the submitting thread 29-46 -> 5-26 ms; picture clean | Optional, passes Fable's stop rule narrowly; confirm without alt |
+| **Structural stage 3** | `VICTORY_SUBMIT_LANES` | **+0.42 fps boat, +0.13 prologue** (paired, on `TABLES_LEFT=1`). Without alternation, `TABLES_LEFT=1` + `SUBMIT_LANES=1` against base: **prologue 6.77 -> 7.70, boat 8.72 -> 10.61** (one run each) | Optional; candidate for the recommended set once the streamed-texture fault is fixed (the picture can't be judged until then) |
 
 | **Stage 4 counter** | `VICTORY_MADE_READ` line (always on) | Draws 40 % (bar 70 %), the title's view calls 78 % | Stage 4 for draws not built; a `mirror_tried`-only variant stays possible |
 

@@ -150,13 +150,23 @@ The draws are under the 70 % bar, so stage 4 as designed (a shared-lock path for
 
 **Stage 5 measured (prologue, `VICTORY_TABLES_LEFT=1`).** `VICTORY_HEAP_SYNC_NEED=alt`: paired median **-0.02 fps over 6 ON phases**, frame time +0.2 ms. Dropped.
 
-**`TABLES_LEFT=1` without alternation (prologue).** These runs kept `VICTORY_TABLES_LEFT=1` in both phases, and the prologue settled at **9.6-10.4 fps**. The same scene gave 7.2-7.4 without the switch (R2, C2), and 7.3-8.4 under `=alt` (S3a), where every flip clears the holds. A same-exe pair without `=alt` is next, to confirm it.
+**Stage 2 + 3 without alternation (2026-11-28, same exe 165d02b0, full recommended set, one run each).** Candidate set `VICTORY_TABLES_LEFT=1 VICTORY_SUBMIT_LANES=1`:
 
-**Picture fixes from Cuebert b98ac3d1c: not merged.** Five switches were ported on a side branch (`fx-main-cuepic` 7946ad6e1): `HELPER_OWN` (upstream #908), `BAKE_EXACT`, `COPY_OVER_TITLE`, `TEXTURE_AWAY_MS` and `RECHECK_SOON`.
+| Scene | Base | Candidate | Settled lines, base / candidate |
+|---|---|---|---|
+| prologue cell | 6.77 fps | **7.70 fps (+0.93, +14 %)** | 6.7-7.2 / 7.6-8.0 |
+| boat mission | 8.72 fps | **10.61 fps (+1.89, +22 %)** | 8.8-9.4 / 10.6-11.4 |
 
-- With all five on, the passenger's printed shirt was a mosaic again in 2 of 2 boat runs. The same exe without them gave a clean shirt (stale samples 36-60 differing against 60-96 with them).
+Two earlier prologue runs (L2, L5) settled at 9.6-10.4 fps in both of their phases. This pair does not reproduce that, so it was a run-to-run swing, not the switch.
+
+**Picture fixes from Cuebert b98ac3d1c: not merged, verdict open.** Five switches were ported on a side branch (`fx-main-cuepic` 7946ad6e1): `HELPER_OWN` (upstream #908), `BAKE_EXACT`, `COPY_OVER_TITLE`, `TEXTURE_AWAY_MS` and `RECHECK_SOON`.
+
+- With all five on, the passenger's printed shirt was a mosaic in 2 of 2 boat runs.
+- But the shirt also broke without them: mosaic in B1 (candidate set), and a blurred lavender body in B0 (base). It was clean in D1 (base) and L1. So the five switches are not shown to cause it.
 - On the prologue they cost nothing (7.36 fps against 7.16), and the refused programs were unchanged.
-- Which switch causes the mosaic is not known. The 1080p-to-1440p part of that commit patches the title's code in memory, which this project does not do.
+- The 1080p-to-1440p part of that commit patches the title's code in memory, which this project does not do.
+
+**Streamed texture staleness is not solved.** The recommended texture set lowers the stale slots (82 -> 3-15 never re-uploaded per sample) but does not remove them. On 2026-11-28 the passenger's shirt was still wrong in 4 of 7 boat runs across settings.
 
 **Stage 2 measured (2026-11-28 morning, RT on, full recommended set).** `VICTORY_TABLES_LEFT`:
 
