@@ -14,6 +14,7 @@ use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
+use crate::descriptor::left;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -3028,7 +3029,9 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    /// An entry of a table read in place (`tally`: VIcky, the counts of
+    /// `crate::descriptor::left`'s line).
+    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool, tally: &mut left::Tally) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -3044,6 +3047,13 @@ impl State {
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
+                tally.add(left::C::MarkedTextures, 1);
+            }
+            // VIcky (`VICTORY_TABLE_BOUND`, `crate::descriptor::left`): the
+            // slot's buffer mark, whatever it views (only counted).
+            if left::set() {
+                host.slot_tabled(index);
+                tally.add(left::C::MarkedInPlace, 1);
             }
         }
     }
@@ -3139,9 +3149,12 @@ impl State {
         }
         fresh.sort_unstable();
         fresh.dedup();
+        // VIcky (`crate::descriptor::left`'s line): this draw's counts, added
+        // once it is done.
+        let mut tally = left::Tally::default();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+                self.table_entry(list, u, compute, &mut tally);
             }
         }
         let mut made = Vec::new();
@@ -3250,7 +3263,34 @@ impl State {
                 .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
-            let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            // (VIcky, `VICTORY_TABLE_BOUND`, `crate::descriptor::left`: the
+            // table tested against the title slots the host heap mirrors,
+            // `HostHeap::mirrored`, and not only its identity window,
+            // `HostHeap::count`, which with the heap map is 131,072 slots
+            // that no table made afresh lies in: their marks were never set.
+            // Without the switch, as before; counted either way.)
+            let title_index = heap.index(table);
+            tally.first(title_index, n, host.count(), host.mirrored());
+            let title_first = left::title_first(title_index, n, host.count(), host.mirrored());
+            // VIcky (`VICTORY_TABLE_BOUND`): the table's buffer marks,
+            // whatever its slots hold (of a big one, which may lie over slots
+            // shaders pick by index, only the entries the shader names);
+            // only counted. In both phases of `alt`.
+            if left::set()
+                && let Some(title) = title_first
+            {
+                let named = |k: u32| entries.iter().any(|u| u.table_offset_dwords / 8 == k);
+                let mut marked = 0;
+                for k in (0..n).filter(|&k| left::marked(n, k, named)) {
+                    host.slot_tabled(title + k);
+                    marked += 1;
+                }
+                tally.add(left::C::MarkedFresh, marked);
+            }
+            // (VIcky, `VICTORY_TABLE_BOUND=alt`: in its off phase the marks
+            // are set but the draw makes no title slot in place, as without
+            // the switch, `left::live`.)
+            let live = left::live();
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3285,7 +3325,8 @@ impl State {
                             && crate::descriptor::host::is_texture_view(&view)
                         {
                             host.texture_slot_tabled(title + k, kind.is_some());
-                            if kind.is_some() {
+                            tally.add(left::C::MarkedTextures, 1);
+                            if kind.is_some() && live {
                                 host.mirror(title + k, table + u64::from(k) * 32, true);
                             }
                         }

@@ -821,10 +821,19 @@ fn choose(
     }
 }
 
+/// [`slots_chosen`] for pass `n` over `host`, at the call; VIcky
+/// (`crate::descriptor::left`'s line): its slots, and those with a buffer
+/// mark of a draw's table (`HostHeap::count_pass_marks`), are counted.
+fn slots_for(host: &HostHeap, n: u64) -> (Vec<u32>, Afresh) {
+    let (slots, afresh) = slots_chosen(host, n);
+    host.count_pass_marks(&slots, crate::frame::current());
+    (slots, afresh)
+}
+
 /// [`choose`] for pass `n` over `host`, at the call, or with
 /// `VICTORY_HEAP_PASS_DUE=1` [`choose_due`]; the slots taken as written and
 /// the window are counted for the line.
-fn slots_for(host: &HostHeap, n: u64) -> (Vec<u32>, Afresh) {
+fn slots_chosen(host: &HostHeap, n: u64) -> (Vec<u32>, Afresh) {
     // The marks are taken whichever slots the pass looks at.
     let changed = host.buffer_changes();
     let written = changed.len() as u64;
@@ -1636,6 +1645,27 @@ fn chain_part(c: &[u64; 15]) -> String {
         ms(get(C::FirstLateUs), late),
         get(C::FirstPlaces) as f64 / firsts.max(1) as f64,
     )
+}
+
+/// VIcky (`VICTORY_TABLE_BOUND`, diagnostics; `crate::descriptor::left`):
+/// the host copies the passes' kept ranges name, one entry per range, sorted
+/// (`crate::shadow::window_holders`). `None` while a pass holds them: the
+/// line's thread does not wait for a pass.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn kept_copies() -> Option<Vec<usize>> {
+    let kept = match RANGES.try_lock() {
+        Ok(kept) => kept,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    let mut copies: Vec<usize> = kept
+        .iter()
+        .flat_map(|kept| kept.values())
+        .flat_map(|(_, ranges)| ranges.values().map(|(copy, _, _)| Arc::as_ptr(copy) as usize))
+        .collect();
+    drop(kept);
+    copies.sort_unstable();
+    Some(copies)
 }
 
 /// Tests: sets the switches of the passes over records

@@ -21,6 +21,8 @@ pub(crate) mod host;
 #[cfg(windows)]
 mod kept;
 #[cfg(windows)]
+pub(crate) mod left;
+#[cfg(windows)]
 pub(crate) mod mirror_try;
 #[cfg(windows)]
 mod slot_map;
@@ -236,6 +238,9 @@ pub(crate) fn sync_heaps_told(asked: Option<&dyn Fn()>) {
     host::note_kind::tick();
     host::sync_lean::tick();
     host::par_mirror::tick();
+    // (VIcky, `VICTORY_TABLE_BOUND=alt`: the phase of the tables' marks; a
+    // flip to off is swept in each heap's walk, `walk_heap`.)
+    left::tick();
     #[cfg(feature = "diagnostics")]
     host::note_kind::syncing(true);
     sync_held(asked, started);
@@ -344,6 +349,10 @@ fn walk_heap(
     mirrored_count: u32,
     page_bytes: &mut Vec<u8>,
 ) -> [u64; 3] {
+    // VIcky (`VICTORY_TABLE_BOUND=alt`, [`left`]; nothing otherwise): at a
+    // flip of its phase to off, the slots with a live mark of a table,
+    // mirrored as this sync would have mirrored them.
+    host.table_bound_flip((start, step));
     let threads = sync_threads();
     // VIcky (`VICTORY_PARALLEL_MIRROR`, `host::par_mirror`): the pages read
     // first (here on this thread alone without `VICTORY_HEAP_SYNC_THREADS`),
@@ -514,6 +523,9 @@ fn sync_wide(
     // VIcky (`VICTORY_PARALLEL_MIRROR`, `host::par_mirror`): every page's
     // slots, in the same order, made together on several threads.
     let wide = host::par_mirror::now();
+    // (VIcky, [`left`]'s line: the slots made here are the sync's, counted by
+    // rule; `host::par_mirror`'s threads say so themselves.)
+    let _making = left::SyncMaking::enter();
     let (mut all_due, mut all_records) = (Vec::new(), Vec::new());
     for page in found.iter() {
         let Some((seen, due, records)) = page.lock().unwrap_or_else(|e| e.into_inner()).take() else {
@@ -597,6 +609,7 @@ pub(crate) fn sync_line(frames: f64) {
     let tried = mirror_try::part(frames);
     // (VIcky: the sync's slots by kind, and the switches of its notes.)
     let kinds = host::note_kind::part(frames) + &host::sync_lean::part(frames) + &host::par_mirror::part(frames);
+    let tabled_left = host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames;
     if pages > 0 || !tried.is_empty() {
         tracing::info!(
             "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
@@ -604,7 +617,7 @@ pub(crate) fn sync_line(frames: f64) {
             pages as f64 / frames,
             looked as f64 / frames,
             mirrored as f64 / frames,
-            host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
+            tabled_left,
             micros as f64 / 1000.0 / frames,
             wide_part(frames),
             beside,
@@ -612,6 +625,10 @@ pub(crate) fn sync_line(frames: f64) {
             kinds + &fine_part(frames),
         );
     }
+    // VIcky (`VICTORY_TABLE_BOUND`, [`left`]): where the tables made afresh
+    // lie, the sync's records by rule, the pass's marked slots (said without
+    // the switch too, so that a run without it says where its tables lie).
+    left::line(frames, mirrored as f64 / frames, tabled_left);
     // VIcky (diagnostics): the sync and its join by the submission's place
     // in the burst, next to it.
     #[cfg(feature = "diagnostics")]

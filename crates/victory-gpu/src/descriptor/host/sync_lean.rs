@@ -347,6 +347,10 @@ impl HostHeap {
         // VIcky (`VICTORY_LOT4_PROBE`, P2): the sync's slots by kind.
         #[cfg(feature = "diagnostics")]
         crate::lot4::sync_slot(view.as_ref());
+        // VIcky (`super::super::left`'s line): the heap sync's slots, by rule.
+        if super::super::left::in_sync_making() {
+            self.count_sync_rule(made, index, key, view.as_ref());
+        }
         let Some(view) = view else {
             count(Count::NotOurs);
             #[cfg(feature = "diagnostics")]

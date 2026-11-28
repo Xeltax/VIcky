@@ -4190,6 +4190,67 @@ mod stale_tests {
 /// bytes.
 static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// VIcky (`crate::descriptor::left`'s line): windows made since the start
+/// whose window (start, length) was let go before ([`GONE_WINDOWS`]).
+static REMADE: AtomicU64 = AtomicU64::new(0);
+
+/// VIcky: the windows (start, length) let go and not made again since, for
+/// [`REMADE`]; forgotten all at once past [`GONE_MOST`].
+static GONE_WINDOWS: Mutex<Option<std::collections::HashSet<(u64, u64)>>> = Mutex::new(None);
+
+/// What [`GONE_WINDOWS`] holds at most.
+const GONE_MOST: usize = 1 << 16;
+
+/// VIcky: a window `key` was made; counted in [`REMADE`] if it was let go
+/// before.
+fn window_made(key: (u64, u64)) {
+    let mut gone = GONE_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    if gone.as_mut().is_some_and(|gone| gone.remove(&key)) {
+        REMADE.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// VIcky (`crate::descriptor::left`'s line): the window copies let go and
+/// made again (of a window let go before) since the start.
+pub(crate) fn window_churn() -> [u64; 2] {
+    [LET_GO[0].load(Ordering::Relaxed), REMADE.load(Ordering::Relaxed)]
+}
+
+/// VIcky (`VICTORY_TABLE_BOUND`, diagnostics): of the window copies alive
+/// (each once, under however many keys), those held by a list not yet reset
+/// or another holder of the copy (a comparison) besides the table of windows
+/// and the pass's kept ranges; of the others, those held only by descriptor
+/// slots (a slot keeps the buffer it views), only by the kept ranges of the
+/// pass over buffer views, by both, and by neither (let go once idle,
+/// [`let_go_idle`]). `kept`: the copies the kept ranges name, one entry per
+/// range, sorted (`crate::draw::heap_pass::kept_copies`). Stage 2 lets go of
+/// the slots and the kept ranges of the tables' slots; a copy held only by
+/// those may then be let go and made again.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_holders(kept: &[usize]) -> [u64; 6] {
+    let loose = LOOSE.read(false);
+    let mut keys: std::collections::HashMap<usize, (usize, &Arc<Shadow>)> = std::collections::HashMap::new();
+    for s in loose.values() {
+        keys.entry(Arc::as_ptr(s) as usize).or_insert((0, s)).0 += 1;
+    }
+    let mut out = [0u64; 6];
+    for (&at, &(under, s)) in &keys {
+        let in_ranges = kept.partition_point(|&p| p <= at) - kept.partition_point(|&p| p < at);
+        let others = Arc::strong_count(s).saturating_sub(under + in_ranges);
+        let slots = crate::host::references(&s.buffer) > 1;
+        out[0] += 1;
+        let class = match (others > 0, slots, in_ranges > 0) {
+            (true, _, _) => 1,
+            (false, true, false) => 2,
+            (false, false, true) => 3,
+            (false, true, true) => 4,
+            (false, false, false) => 5,
+        };
+        out[class] += 1;
+    }
+    out
+}
+
 /// For the memory line: the windows let go since the start and their
 /// bytes, and of the bytes of the windows alive, how many lie between the
 /// lowest and the highest address ever asked for in each.
@@ -4276,6 +4337,15 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
+        // VIcky: their windows, for the count of those made again.
+        if !idle.is_empty() {
+            let mut gone = GONE_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+            let gone = gone.get_or_insert_with(Default::default);
+            if gone.len() + idle.len() > GONE_MOST {
+                gone.clear();
+            }
+            gone.extend(idle.iter().copied());
+        }
         idle.into_iter().filter_map(|key| map.remove(&key)).collect()
     };
     if !gone.is_empty() {
@@ -6795,6 +6865,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        window_made((start, len));
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -6832,6 +6903,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    window_made((start, len));
     Some(shadow)
 }
 
@@ -7929,5 +8001,27 @@ mod stripes_tests {
         for b in 0..STABLE {
             unregister(0x7e57_c000 + b as usize, base + b * 0x2_0000);
         }
+    }
+}
+
+/// VIcky (`crate::descriptor::left`'s line): window copies made again.
+#[cfg(test)]
+mod churn_tests {
+    use super::*;
+
+    /// A window made after the same window was let go is counted as made
+    /// again, once; one never let go is not.
+    #[test]
+    fn windows_made_again_after_their_let_go_are_counted() {
+        // (A window no other test makes.)
+        let key = (0x7ff1_2340_0000, 0x40_0000);
+        let gone = |key: (u64, u64)| GONE_WINDOWS.lock().unwrap().as_ref().is_some_and(|gone| gone.contains(&key));
+        let before = window_churn()[1];
+        window_made(key);
+        assert!(!gone(key));
+        GONE_WINDOWS.lock().unwrap().get_or_insert_with(Default::default).insert(key);
+        window_made(key);
+        assert!(!gone(key), "taken out once made again");
+        assert!(window_churn()[1] > before, "counted");
     }
 }

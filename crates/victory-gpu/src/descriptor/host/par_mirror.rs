@@ -698,6 +698,9 @@ impl HostHeap {
     /// piece locked. Returns the title slots it found no pool slot for.
     fn mirror_chunk_par(&self, made: &Made, slots: &[(u32, u64)], words: Option<&[[u32; 3]]>, lean: Option<bool>) -> Vec<u32> {
         let _job = Job::enter(self, true);
+        // (VIcky, `super::super::left`'s line: the sync's slots, counted by
+        // rule on whichever thread makes them.)
+        let _making = super::super::left::SyncMaking::enter();
         // (What this thread gathered before, if it was in a chunk of its
         // own, is given back after.)
         let outer = RETIRE_LATER.replace(Some(Vec::new()));

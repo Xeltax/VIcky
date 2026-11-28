@@ -1440,6 +1440,67 @@ Read for each: the stale line (S, O), the `writes behind the guards` line, the `
 - **Holds** (`DS_HOLD`): a slot whose memory is written again and again (a page written by many small requests) waits up to 16 frames; U on the line counts the ones that hit the bound.
 - **Not measured in the game.** None of the six has run in the game yet; no capture proves the link to the shirt. The diagnostic exists to make the next runs decisive.
 
+## Structural: tables left to the draws (2026-11-28; opt-in, not measured in the game yet)
+
+The design is `xcl-notes\fable-2026-11-28-structural.md`. A draw already makes every entry of the tables it makes afresh in dynamic slots of its own (`draw.rs` `State::tables`). The heap sync, the pass over buffer views and the texture pass then make the same title slots again, for shaders that pick views by index. That second making is most of the join, most of the pass and most of the texture pass. The project stops it in four stages, one branch and one switch each, each with an `=alt`. This section is stage 1. Stage 2 re-lands the dropped commit 7b66261e (`VICTORY_TABLES_LEFT`, buffer slots left to the draws, with the host copies kept); it is not ported here.
+
+### Stage 1: the table bound, `VICTORY_TABLE_BOUND=1|alt` (`fx-main-tablebound`)
+
+- **What was wrong (verified in code and in the Y2 boat log).** `State::tables` tested the first title slot of a table made afresh with `first + n <= host.count()`. With the heap map, `HostHeap::count` is the identity window, 131,072 slots, and every table made afresh lies past it (T1c: "11351 tables made afresh, of them 0 lie in the identity window"). So the tree's marks of tables' slots (`HostHeap::tabled`, 240 frames) were never set for them. Y2's lines say so for the whole run: "0 writes of tables' slots", "0 slots taken out as read through a table", and the sync line's "0 left to the draws".
+- **What the switch does.** The bound is `HostHeap::mirrored`, the title slots the host heap mirrors (`descriptor::left::title_first`). That is 7b66261e's `VICTORY_TABLES_LEFT=textures`, on its own. The marks then do what the tree already had them do, now where the tables really are:
+  - a texture slot a draw reads through the table leaves the queue of textures picked by index, and the draw makes the title slot in place, as the texture pass would have;
+  - a write of such a slot waits 8 frames in the queue for its draw;
+  - the heap sync leaves a new record there to the draws (its line's "left to the draws");
+  - the passes over memory remapped, written or waiting skip the slot, and its placed memory is not put in the spans.
+- **`=alt`.** Twenty seconds off, twenty on, with the `... (VICTORY_TABLE_BOUND=alt): ON` / `off, as usual` lines that `alt-fps.sh` reads (the same `crate::alt::Alt` as `VICTORY_SYNC_FINE`). The phase is taken at the start of each heap sync (`left::tick`).
+  - Draws set the marks in both phases. In the off phase nothing acts on them (`left::live`): `tabled_lately` answers no, a read takes no slot out of the queue, a write waits for no draw, and the draw makes no title slot in place.
+  - At each flip to off, the heap sync sweeps once every title slot with a mark of the last 240 frames (`HostHeap::table_bound_flip`, `table_bound_sweep`). Each record is read through the kernel, a sync page at a time, and noted as seen. A slot the sync had left is mirrored as the sync would have mirrored it (`mirror_due`). A texture slot its draw had made from that very record is noted again, which puts its texture back in the queue and its memory in the spans. The off phase thus starts from what it would have had. Expect one slow frame per flip: the design estimated about 70k slots at 0.6 us, 40 ms.
+  - The tree's own marks (tables read in place, tables made afresh wholly in the window) are off in the off phase too. They are the dead ones above, so the off phase is main in practice.
+- **Buffer marks, counted only.** With the switch, in both phases, draws also set a second array of marks (`HostHeap::buffer_marks`, after myokex c3723f3 as 7b66261e had it): every entry of a table made afresh of up to 64 slots (else only the entries the shader names), and every entry read through a table read in place. Nothing reads them but the counters below; stage 2 would leave such slots to the draws for 8 frames.
+- **Code.** `descriptor/left.rs` (the switch, the bound, the buffer marks' rules, the counters and their line); `draw.rs` (`State::tables`, `State::table_entry`); `descriptor/host.rs` (`tabled_in`, `tabled_lately`, `tabled_marked`, `queue_texture`, `slot_tabled`, `buffer_marked_lately`, `count_pass_marks`, `count_sync_rule`, `table_bound_flip`, `table_bound_sweep`); `descriptor.rs` (`sync_heaps_told`, `walk_heap`, `sync_wide`, `sync_line`); `draw/heap_pass.rs` (`slots_for`, `kept_copies`); `shadow.rs` (`window_churn`, `window_holders`); `descriptor/host/sync_lean.rs` and `par_mirror.rs` (the sync's counts on their paths).
+- **Without the switch** the runtime does what it did. Only the counters are new, and the line below is said once a table was made afresh.
+
+### The counters (always on), and stage 2's stop criterion
+
+One line a second, after the heap sync line:
+
+`tables and the heap sync (VICTORY_TABLE_BOUND off|on|alt, ON|alt, off) per frame: T tables made afresh, of them A lie in the identity window, B reach past it into the title slots the host heap mirrors (marked | not marked: VICTORY_TABLE_BOUND unset), C reach past those, D lie outside the heap; title slots marked: X texture marks, F buffer marks by tables made afresh, I by entries read in place; the sync's new records by rule: L left to the draws by a texture mark, of the M mirrored (R counted by rule) WL a buffer mark would leave, WH the grace would hold, NN no view into a slot that shows none, NS no view into a slot that shows one, TV texture views, BV buffer views and OV other views made (would leave or hold: P % of those counted); the pass over buffer views: S slots, SM of them with a buffer mark (Q %); window copies: G let go, RM made again`
+
+In a diagnostics build with the switch, it ends with a census of the window copies taken at most every 5 s, when the pass over buffer views is not holding its kept ranges: `; window copies by holder (N s ago): alive, held by a list or a comparison, of the others held only by slots, only by the pass's kept ranges, by both, by neither (let go once idle)`.
+
+- The rules follow avatarmanz's `sync_heaps` (a9400a6d6) in order. **WL**: a view record in a slot with a buffer mark of the last 8 frames. **WH**: a constant buffer or placed view named whole in its record, outside those (stage 2 would hold it 4 frames, then mirror it unless a draw claimed the slot). **NN / NS**: no view of ours, into a slot whose host slot shows none or one (stage 3 skips the first). **TV / BV / OV**: the rest, made as before. They are counted as the sync makes each slot, on every path (page by page, `VICTORY_HEAP_SYNC_THREADS`, `_LEAN`, `VICTORY_PARALLEL_MIRROR`). L is the sync line's "left to the draws".
+- **G / RM**: window copies let go by `let_go_idle`, and windows made again at a (start, length) let go before. The design's suspected cause of `TABLES_LEFT`'s +30 ms of copies in T1 was copies let go and made again once nothing kept them.
+- **Stage 2's stop criterion**, read from the off phases of a boat run: stop before stage 2 if P is under 50 % (the design's under 40k of 80k mirrored) **and** Q is under 50 %. T1 measured 77 % and 81 % in the prologue.
+
+### What must move, and the suggested run
+
+- **Boat, `VICTORY_TABLE_BOUND=alt`, one run, on the recommended set.**
+  - ON phases: the texture queue line's "writes of tables' slots" and "slots taken out as read through a table" above 0 and growing; its "due" count 9.9k -> under 1k; the sync line's "left to the draws" above 0.
+  - The texture pass on its recording thread ("the pass over the heap per frame: X ms in its pass over textures picked by index") 31 -> about 5 ms.
+  - S -2 to -5 ms: the sync stops mirroring the texture views in tables, at most 13.4k of its 80k records.
+  - fps +0 to +0.3, since the recording thread is not a wall. Read with `alt-fps.sh`.
+  - Off phases: the counters above, for the stop criterion. Each flip to off says `VICTORY_TABLE_BOUND=alt, at the flip to off: N title slots with a live mark of a table swept in X ms: M mirrored as the heap sync would have mirrored them (it had left them to the draws), K made by their draws already (Q textures put back in the queue of textures picked by index), U on pages that could not be read`.
+- **Picture.** The texture queue is what last night's streamed-texture fixes work through. Run with `VICTORY_STALE_SLOTS=1`: "never re-uploaded" must stay at 3-15 a sample.
+- **Expected by the design** (predicted from the T1 ratios): texture pass 31 -> ~5 ms (boat), 45 -> ~6 (prologue); queue due under 1k; S -2 to -5; P unchanged.
+
+### Tests
+
+- `descriptor::left::tests::{the_bound_is_the_mirrored_slots_with_the_switch, buffer_marks_expire_after_eight_frames, big_tables_mark_only_the_entries_named, tables_are_counted_by_where_they_lie, sync_making_nests}`.
+- `descriptor::host::table_bound_tests::tables_past_the_window_mark_their_slots_with_the_switch`: on a host heap with a heap map (window 16 of 64), a table past the window marks its texture and buffer slots only with the switch, one past the mirrored slots never does; texture marks expire after 240 frames, buffer marks after 8.
+- `descriptor::host::table_bound_tests::marks_act_only_in_the_on_phase`: in the off phase a read leaves the slot in the queue, a write is due at once and the sync mirrors a marked slot; in the ON phase they act.
+- `descriptor::host::table_bound_tests::the_flip_to_off_sweeps_the_marked_slots`: at the flip to off, a slot the sync left is mirrored and queued, one its draw made has its texture put back in the queue, the records are noted as seen; one sweep a flip, none from off to ON.
+- `descriptor::host::table_bound_tests::the_sync_counts_its_records_by_rule`: WL, WH, NN, NS and the pass's marked slots, and nothing for a slot a texture mark leaves.
+- `shadow::churn_tests::windows_made_again_after_their_let_go_are_counted`.
+
+### Risks (low)
+
+- **A table's slot also picked by index.** It keeps an old texture until its draw reads it, as main's rule always did for the slots it saw. The draw makes a read slot in place, and the marks last 240 frames as before.
+- **Any record is left, not only textures.** The sync leaves a new record of any kind in a slot marked in the last 240 frames, as main's rule does; that rule now reaches the tables. A shader that picked a buffer by index in a slot a table used for a texture within 240 frames would read an older view. The draws that make the table read title memory, not that slot. Stage 2's `check` measures reads by index that would differ; stage 1 has no such check.
+- **Copies let go and made again.** This is how T1's `TABLES_LEFT` lost its gain. A buffer record left in a texture-marked slot is not noted, so no mirrored slot and no kept range of the pass holds its host copy; only the draws' dynamic slots do, until their list is reset. If the ON phases show copies (the frame line's) up and G / RM up against the off phases, that is the cause, and stage 2's hold is the remedy.
+- **The flip's sweep** costs one slow frame per flip, on the heap sync's thread. Its line gives the count and the ms.
+- **Cost of the counters.** The sync's counts are kept per thread and added up when the making of a page, a round or a chunk of `VICTORY_PARALLEL_MIRROR` ends. The draws' counts are kept per recording thread and added up every 64 draws. The pass's buffer-mark check reads one mark per slot at the call, only with the switch. The census runs only in diagnostics builds with the switch, at most every 5 s, and never waits for a pass. Buffer marks take 4 bytes per title slot (about 5 MB) and a store per table entry, only with the switch.
+- **Not measured in the game.** Unit tests only so far.
+
 ## Roadmap: from about 3.5 fps toward 15–20 (2026-11-25; superseded by [ROADMAP.md](ROADMAP.md), kept for history)
 
 **Why it is possible.** The console runs this title at 30 fps on a 12-TFLOPS RDNA2 GPU. An RTX 4080 has about 49 TFLOPS, and the title's CPU code is x86-64 that runs natively. RT10's frame is about 280 ms against the console's 33 ms: the gap is our translation, not the hardware. shadPS4 (AMD GPU, unified memory, raw command buffers) shows that this class of runtime can reach playable speeds.
