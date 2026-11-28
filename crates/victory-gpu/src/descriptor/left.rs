@@ -57,6 +57,13 @@
 //! records a buffer mark would leave plus those the grace would hold under
 //! 50 % of the records mirrored, and the pass's slots with a buffer mark
 //! under 50 % of its slots: stop (the line gives both shares).
+//!
+//! `VICTORY_TABLE_BOUND_FRESH` ([`fresh`]; on by default with the switch,
+//! `=0` off): the texture slots the draws make keep the freshness rules of
+//! the slots shaders pick by index (the streamed-texture staleness fixes):
+//! only a read leaves a slot to the draws, and memory events still find and
+//! make due the slots draws read, whose staged textures are read again
+//! after a write behind the guards and held under a DirectStorage write.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -95,6 +102,70 @@ pub(crate) fn live() -> bool {
         return live;
     }
     TABLE_BOUND.mode() != 2 || LIVE.load(Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: whether `VICTORY_TABLE_BOUND_FRESH` is on for this thread,
+    /// whatever the environment says (with the switch set).
+    pub(crate) static TEST_FRESH: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// VIcky (`VICTORY_TABLE_BOUND_FRESH`; on by default whenever
+/// `VICTORY_TABLE_BOUND` is set, `=0` turns it off): the texture slots the
+/// draws make keep the freshness rules of the slots shaders pick by index
+/// (VICKY-RT.md, stage 1, "Table-made texture slots kept fresh").
+///
+/// Stage 1 as first measured took a slot a table merely spanned out of
+/// every rule for 240 frames, read or not: the heap sync left its new
+/// records, its writes waited for a draw, its placed memory left the spans,
+/// and the passes over memory mapped, written or waiting skipped it. A slot
+/// a draw names is made by that draw, and its texture is kept up to date by
+/// the draw's staging buffer, which is read again at every submission that
+/// samples it. A slot no draw names (a gap of a table, an entry of a
+/// descriptor array the shader indexes from data, a slot picked by index
+/// that a table's range lies over) is made by nobody: its texture kept
+/// what it showed (a recycled block's last texture, zeros) and the
+/// streamed-texture fixes no longer reached it. With this:
+/// - only a read leaves a slot to the draws (`HostHeap::tabled_in`);
+/// - a slot read through a table keeps its placed memory in the spans, and
+///   the passes over memory remapped, written behind the guards, or waiting
+///   for levels make it due as any slot (the pass then makes it from fresh
+///   bytes, or finds the draws' staging buffer and leaves it to them);
+/// - a write behind the guards under a texture draws keep staged has that
+///   staging buffer read and uploaded again whole (`crate::texture::restage_in`);
+/// - a draw's upload, and the check at submission, wait while a
+///   DirectStorage write is under way into the texture with
+///   `VICTORY_DS_HOLD=1` (`crate::texture::upload`, `Staging::refresh_timed`);
+/// - a staging buffer's memory is hashed at least every eight frames, by its
+///   own count, whatever step the frame counter takes.
+///
+/// Off without `VICTORY_TABLE_BOUND`; with `alt` it acts where the marks
+/// act, in the ON phases ([`fresh_live`]), but for the first rule, which
+/// keeps the marks the off phase's flip sweeps to the ones that acted.
+pub(crate) fn fresh() -> bool {
+    if !set() {
+        return false;
+    }
+    #[cfg(test)]
+    if let Some(fresh) = TEST_FRESH.get() {
+        return fresh;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_TABLE_BOUND_FRESH").is_none_or(|v| v != "0");
+        tracing::info!(
+            on,
+            "texture slots draws make through tables keep the freshness rules of the slots shaders pick by index \
+             (VICTORY_TABLE_BOUND_FRESH, on by default with VICTORY_TABLE_BOUND; =0 is stage 1 as first measured)"
+        );
+        on
+    })
+}
+
+/// [`fresh`], where the marks act now ([`live`]).
+pub(crate) fn fresh_live() -> bool {
+    fresh() && live()
 }
 
 /// At the start of each heap sync: with `alt`, the phase of now (each change
@@ -189,9 +260,13 @@ pub(crate) enum C {
     /// buffer mark.
     PassSlots,
     PassMarked,
+    /// VIcky (`VICTORY_TABLE_BOUND_FRESH`): of the texture marks, those of
+    /// entries the draw reads (the shader names them, or picks them by a
+    /// root constant); the others only lie in a table's range.
+    MarkedTexturesRead,
 }
 
-const COUNTS: usize = C::PassMarked as usize + 1;
+const COUNTS: usize = C::MarkedTexturesRead as usize + 1;
 
 static COUNTED: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
 
@@ -405,10 +480,17 @@ pub(crate) fn line(frames: f64, mirrored: f64, left: f64) {
     let census = census_part();
     #[cfg(not(feature = "diagnostics"))]
     let census = String::new();
+    // VIcky (`VICTORY_TABLE_BOUND_FRESH`): only the read ones leave a slot
+    // to the draws.
+    let read = format!(
+        "{:.0} of them read{}",
+        per(C::MarkedTexturesRead),
+        if fresh() { ", the only ones that leave a slot to the draws (FRESH)" } else { "" }
+    );
     tracing::info!(
         "tables and the heap sync (VICTORY_TABLE_BOUND {}) per frame: {:.0} tables made afresh, of them {:.0} lie in the \
          identity window, {:.0} reach past it into the title slots the host heap mirrors ({}), {:.1} reach past those, \
-         {:.1} lie outside the heap; title slots marked: {:.0} texture marks, {buffer_marks}; the sync's new records by \
+         {:.1} lie outside the heap; title slots marked: {:.0} texture marks ({read}), {buffer_marks}; the sync's new records by \
          rule: {left:.0} left to the draws by a texture mark, of the {mirrored:.0} mirrored ({:.0} counted by rule) \
          {:.0} a buffer mark would leave, {:.0} the grace would hold, {:.0} no view into a slot that shows none, {:.0} \
          no view into a slot that shows one, {:.0} texture views, {:.0} buffer views and {:.0} other views made (would \

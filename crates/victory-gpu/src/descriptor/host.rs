@@ -2126,29 +2126,51 @@ impl HostHeap {
     /// went makes the slot null ([`HostHeap::texture_slot_gone`]), and a
     /// texture streamed into the place of another of the same description
     /// is uploaded although no descriptor says so. Slots tables read are
-    /// left to their draws. Returns how many slots it made due.
+    /// left to their draws (VIcky: not with `VICTORY_TABLE_BOUND_FRESH`,
+    /// [`HostHeap::leave_tabled`]). Returns how many slots it made due.
     /// shortcut: the ranges are kept in one place for all heaps; the heap
     /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
-        use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
         let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
         }
+        self.slots_remapped_in(&ranges, frame)
+    }
+
+    /// [`HostHeap::texture_slots_remapped`] for `ranges` (start, end).
+    fn slots_remapped_in(&self, ranges: &[(u64, u64)], frame: u64) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
         let mut slots: Vec<u32> = {
             let placed = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Placed, &*self.placed);
             ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
         };
         slots.sort_unstable();
         slots.dedup();
-        slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        self.leave_tabled(&mut slots, frame, crate::texstale::Fresh::Remapped);
         let mut textures = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures);
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
         }
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
         slots.len()
+    }
+
+    /// The due-again passes' rule for slots tables read lately
+    /// ([`HostHeap::tabled_lately`]): left to their draws (taken out of
+    /// `slots`), as stage 1 first had it; VIcky, with
+    /// `VICTORY_TABLE_BOUND_FRESH` ([`left::fresh`]), kept and made due as
+    /// any slot (the pass makes such a slot from fresh bytes, or finds its
+    /// texture staged by the draws and leaves it to them), and counted as
+    /// `why` ([`crate::texstale::Fresh`]).
+    fn leave_tabled(&self, slots: &mut Vec<u32>, frame: u64, why: crate::texstale::Fresh) {
+        if left::fresh() {
+            let tabled = slots.iter().filter(|&&slot| self.tabled_lately(slot, frame)).count();
+            crate::texstale::fresh_count(why, tabled as u64);
+            return;
+        }
+        slots.retain(|&slot| !self.tabled_lately(slot, frame));
     }
 
     /// Takes the ranges of title memory written behind the guards' back
@@ -2161,12 +2183,24 @@ impl HostHeap {
     /// its host copy exists, so the upload needs no room on the card. A
     /// slot still waiting for its first upload is left as it is: that
     /// upload takes the bytes that are there by then. Slots tables read
-    /// are left to their draws. Counted either way; returns how many slots
-    /// it made due.
+    /// are left to their draws (VIcky: not with `VICTORY_TABLE_BOUND_FRESH`,
+    /// [`HostHeap::leave_tabled`], which also has the textures the draws
+    /// keep staged there read again, `crate::texture::restage_in`). Counted
+    /// either way; returns how many slots it made due.
     fn texture_slots_page_written(&self, frame: u64) -> usize {
         let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
+        }
+        // VIcky (`VICTORY_TABLE_BOUND_FRESH`, [`left::fresh_live`]): the
+        // textures draws keep staged under these writes are read again
+        // whole at the next submission that samples them, and uploaded by
+        // its list: the check at submission finds such a write only through
+        // the guards it opens, a partly mapped texture is read at most every
+        // 30 frames, and a slot the draws read is in no queue.
+        if left::fresh_live() {
+            let restaged = crate::texture::restage_in(&ranges);
+            crate::texstale::fresh_count(crate::texstale::Fresh::Restaged, restaged as u64);
         }
         self.slots_written_under(&ranges, frame, crate::watch::page_writes() & 2 != 0)[2]
     }
@@ -2182,7 +2216,7 @@ impl HostHeap {
         };
         slots.sort_unstable();
         slots.dedup();
-        slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        self.leave_tabled(&mut slots, frame, crate::texstale::Fresh::PageWritten);
         let held = slots.len();
         let mut textures = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures);
         // Uploaded before: out of the queue, or in it after an upload (in
@@ -2244,7 +2278,8 @@ impl HostHeap {
     /// ([`HostHeap::texture_slots_remapped`]): the upload then gives the
     /// level its tiles. To be called only while the card has room: without
     /// it the upload would give nothing again. Slots tables read are left
-    /// to their draws (`texture.rs` `upload` asks again for those). Returns
+    /// to their draws (`texture.rs` `upload` asks again for those; VIcky:
+    /// not with `VICTORY_TABLE_BOUND_FRESH`, [`HostHeap::leave_tabled`]). Returns
     /// how many slots it made due.
     /// shortcut: kept in one place for all heaps, as the starts below.
     pub(crate) fn texture_slots_waiting(&self, frame: u64) -> usize {
@@ -2276,7 +2311,7 @@ impl HostHeap {
         };
         slots.sort_unstable();
         slots.dedup();
-        slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        self.leave_tabled(&mut slots, frame, crate::texstale::Fresh::Waiting);
         let mut textures = crate::lot4::locks::mutex(crate::lot4::locks::Lock::Textures, &self.textures);
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
@@ -2379,23 +2414,31 @@ impl HostHeap {
     /// date, so the slot leaves the queue of textures picked by index; the
     /// caller makes the host slot in place ([`HostHeap::mirror`]), as the
     /// pass would have, for a shader that picks it by index all the same.
-    pub(crate) fn texture_slot_tabled(&self, index: u32, read: bool) {
-        self.tabled_in(index, read, crate::frame::current());
+    /// Returns whether this was the slot's first read in this frame.
+    pub(crate) fn texture_slot_tabled(&self, index: u32, read: bool) -> bool {
+        self.tabled_in(index, read, crate::frame::current())
     }
 
     /// [`HostHeap::texture_slot_tabled`] in frame `frame`.
-    fn tabled_in(&self, index: u32, read: bool, frame: u64) {
+    fn tabled_in(&self, index: u32, read: bool, frame: u64) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         let Some(stamp) = self.tabled.get(index as usize) else {
-            return;
+            return false;
         };
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         let old = stamp.load(Relaxed);
         if !read {
+            // VIcky (`VICTORY_TABLE_BOUND_FRESH`, [`left::fresh`]): a slot a
+            // table only spans is made by no draw (none reads it through the
+            // table, none uploads its texture): no mark, so it keeps the
+            // rules of a slot picked by index, as without the switch.
+            if left::fresh() {
+                return false;
+            }
             if old & !TABLED_READ != now {
                 stamp.store(now, Relaxed);
             }
-            return;
+            return false;
         }
         // Once per slot and frame: tables are read by every draw.
         if old != now | TABLED_READ {
@@ -2408,7 +2451,9 @@ impl HostHeap {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
             }
+            return true;
         }
+        false
     }
 
     /// Whether title slot `index` was a table's within the last
@@ -2537,6 +2582,11 @@ impl HostHeap {
             return None;
         }
         self.bound_live.store(live, std::sync::atomic::Ordering::Relaxed);
+        // VIcky (`VICTORY_STALE_SLOTS`): no slot is made by a draw in the
+        // off phase; the ones watched as such go back to the pass below.
+        if !live {
+            crate::texstale::table_watch_clear();
+        }
         (!live && tabled_out()).then(|| self.table_bound_sweep((start, step), crate::frame::current()))
     }
 
@@ -2737,9 +2787,16 @@ impl HostHeap {
         // tables read (thousands of writes a frame, each read by its
         // draw): no pass looks at it, and the same texture's view in a
         // slot shaders pick by index says what it says.
+        // (VIcky, `VICTORY_TABLE_BOUND_FRESH`, [`left::fresh`]: kept for
+        // them too, so the passes over memory mapped, written or waiting
+        // find them: the draws' slots past the identity window are those
+        // a shader may also pick by index, and the notes of a slot the sync
+        // leaves to the draws are a draw's making in place, a few thousand
+        // a frame, which take the spans' lock either way unless
+        // `VICTORY_SPANS_QUICK` spares it.)
         let placed_view = match view {
             Some(View::Placed(false, resource, desc))
-                if resource[0] != 1 && !self.tabled_lately(index, crate::frame::current()) =>
+                if resource[0] != 1 && (left::fresh() || !self.tabled_lately(index, crate::frame::current())) =>
             {
                 // (And the level the view starts at: word 4 of a texture
                 // view's description, after format, dimension, mapping
@@ -8573,6 +8630,164 @@ mod table_bound_tests {
         assert_eq!(get(left::C::NoViewShown), 1);
         assert_eq!(get(left::C::TexturesMade) + get(left::C::BuffersMade) + get(left::C::OthersMade), 0);
         assert_eq!((get(left::C::PassSlots), get(left::C::PassMarked)), (3, 1));
+        left::TEST_BOUND.set(None);
+        assert_eq!(release(title), 0);
+    }
+
+    /// The slots of the queue due at `frame`, with their write numbers.
+    fn due_writes(heap: &HostHeap, frame: u64) -> Vec<(u32, u64)> {
+        let mut due = heap.texture_slots_due(frame, 64).0;
+        due.sort_unstable();
+        due
+    }
+
+    /// As the pass that brought every slot due at `frame` up to date: out
+    /// of the queue.
+    fn all_done(heap: &HostHeap, frame: u64) {
+        for (slot, write) in due_writes(heap, frame) {
+            heap.texture_slot_done(slot, write, None);
+        }
+    }
+
+    /// `VICTORY_TABLE_BOUND_FRESH`: a slot a table only spans (no draw reads
+    /// it through the table) gets no mark with it, so its write is due at
+    /// once and the heap sync mirrors its new record, as for any slot picked
+    /// by index; without it (stage 1 as first measured) the mark leaves it
+    /// to the draws. A read leaves a slot to the draws either way.
+    #[test]
+    fn with_fresh_only_a_read_leaves_a_slot_to_the_draws() {
+        for fresh in [false, true] {
+            let Some((title, start, heap)) = mapped_heap((true, true)) else {
+                left::TEST_BOUND.set(None);
+                return;
+            };
+            left::TEST_FRESH.set(Some(fresh));
+            let frame = crate::frame::current();
+            let at = |n: u64| 0x7fec_0000_0000 + n * 0x10_0000 + if fresh { 0x1_0000_0000 } else { 0 };
+            // 41: only spanned by a table made afresh.
+            assert!(!heap.tabled_in(41, false, frame), "never a first read");
+            assert_eq!(heap.tabled_marked(41, frame), !fresh);
+            heap.queue_texture(41, true, false, frame);
+            assert_eq!(due(heap, frame), if fresh { vec![41] } else { vec![] }, "a write due at once with FRESH");
+            write_record(start, 41, Some(&texture_view(at(1))));
+            assert_eq!(sync(heap, start, 41), fresh, "the sync mirrors it with FRESH, leaves it without");
+            // 42: read through a table: the draws' with or without FRESH.
+            assert!(heap.tabled_in(42, true, frame), "the first read of the frame");
+            assert!(!heap.tabled_in(42, true, frame), "once a frame");
+            write_record(start, 42, Some(&texture_view(at(2))));
+            assert!(!sync(heap, start, 42), "left to the draws");
+            left::TEST_FRESH.set(None);
+            left::TEST_BOUND.set(None);
+            assert_eq!(release(title), 0);
+        }
+    }
+
+    /// `VICTORY_TABLE_BOUND_FRESH`: a texture slot a draw reads through a
+    /// table (out of the queue) whose memory changes after its upload is
+    /// made again: a write behind the guards (`VICTORY_PAGE_WRITES` bit 2)
+    /// and a remap make it due, and so does the re-due that follows a
+    /// refresh that missed a page (`VICTORY_NO_WAIT_FALLBACK`, through
+    /// [`remapped`]), and the DirectStorage hold of the pass's look applies
+    /// to it once it is due. Its placed memory stays in the spans when the
+    /// draw makes it in place from a new record. Without FRESH, as stage 1
+    /// was first measured: left to the draws, nothing makes it due.
+    #[test]
+    fn with_fresh_a_table_read_slot_is_made_again_when_its_memory_changes() {
+        for fresh in [false, true] {
+            let Some((title, start, heap)) = mapped_heap((true, true)) else {
+                left::TEST_BOUND.set(None);
+                return;
+            };
+            left::TEST_FRESH.set(Some(fresh));
+            let frame = crate::frame::current();
+            let base = 0x7feb_0000_0000 + if fresh { 0x1_0000_0000 } else { 0 };
+            let (a, b) = (base, base + 0x10_0000);
+            // Mirrored by the sync (its memory in the spans), then read
+            // through a table: out of the queue.
+            write_record(start, 40, Some(&texture_view(a)));
+            assert!(sync(heap, start, 40));
+            assert_eq!(due(heap, frame), [40]);
+            heap.tabled_in(40, true, frame);
+            assert!(due(heap, frame).is_empty(), "read through a table: out of the queue");
+            // DirectStorage wrote its bytes behind the guards.
+            let held = heap.slots_written_under(&[(a, a + 0x1000)], frame, true);
+            assert_eq!(held, if fresh { [1, 1, 1] } else { [0, 0, 0] });
+            assert_eq!(due(heap, frame + PAGE_WRITE_AFTER), if fresh { vec![40] } else { vec![] });
+            if fresh {
+                // Due: the pass's look holds it under a write under way.
+                let [(slot, write)] = due_writes(heap, frame + PAGE_WRITE_AFTER)[..] else {
+                    panic!("one due slot");
+                };
+                assert_eq!(slot, 40);
+                assert!(heap.texture_slot_ds_hold(40, write, frame + PAGE_WRITE_AFTER + 1, crate::texstale::DS_HOLD_MOST));
+                assert!(due(heap, frame + PAGE_WRITE_AFTER).is_empty(), "held a frame");
+                assert_eq!(due(heap, frame + PAGE_WRITE_AFTER + 1), [40]);
+            }
+            // Made again (the pass found it staged, or uploaded it); then a
+            // remap, or a refresh that found a page missing, under its
+            // memory.
+            all_done(heap, frame + PAGE_WRITE_AFTER + 1);
+            let n = heap.slots_remapped_in(&[(a + 0x100, a + 0x200)], frame);
+            assert_eq!(n, usize::from(fresh));
+            assert_eq!(due(heap, frame + 1), if fresh { vec![40] } else { vec![] });
+            all_done(heap, frame + 1);
+            // Its draw makes the slot in place from a new record: with FRESH
+            // its new memory is in the spans, so a write there makes it due.
+            let key = write_record(start, 40, Some(&texture_view(b)));
+            assert!(!sync(heap, start, 40), "left to the draws");
+            let handle = start + 40 * TITLE_SLOT_BYTES;
+            heap.mirror(40, handle, true);
+            let made = heap.made_alone();
+            let shown = made.host(40).and_then(|host| made.key_of(host));
+            drop(made);
+            assert_eq!(shown, Some(key), "made in place by its draw");
+            let in_spans = !crate::lot4::locks::mutex(crate::lot4::locks::Lock::Placed, &*heap.placed).slots_in(b, b + 1).is_empty();
+            assert_eq!(in_spans, fresh, "kept in the spans with FRESH");
+            all_done(heap, frame);
+            let held = heap.slots_written_under(&[(b, b + 0x1000)], frame, true);
+            assert_eq!(held[2], usize::from(fresh));
+            left::TEST_FRESH.set(None);
+            left::TEST_BOUND.set(None);
+            assert_eq!(release(title), 0);
+        }
+    }
+
+    /// `VICTORY_TABLE_BOUND_FRESH` with `=alt`: at the flip to off the slots
+    /// draws read are swept as before (40 left by the sync and mirrored, 41
+    /// made by its draw and put back in the queue), a slot a table only
+    /// spanned has no mark to sweep (its record was mirrored when written),
+    /// and the slots stay found by memory in the off phase: a write behind
+    /// the guards there makes 41 due again. Nothing is left stale.
+    #[test]
+    fn with_fresh_the_flip_to_off_leaves_nothing_stale() {
+        let Some((title, start, heap)) = mapped_heap((true, true)) else {
+            left::TEST_BOUND.set(None);
+            return;
+        };
+        left::TEST_FRESH.set(Some(true));
+        let frame = crate::frame::current();
+        let at = |n: u64| 0x7fea_0000_0000 + n * 0x10_0000;
+        write_record(start, 40, Some(&texture_view(at(0))));
+        assert!(sync(heap, start, 40));
+        heap.tabled_in(40, true, frame);
+        write_record(start, 40, Some(&texture_view(at(10))));
+        assert!(!sync(heap, start, 40), "left to the draws");
+        let key = write_record(start, 41, Some(&texture_view(at(1))));
+        assert!(sync(heap, start, 41));
+        made_by_draw(heap, 41, key);
+        heap.tabled_in(41, true, frame);
+        heap.tabled_in(42, false, frame);
+        write_record(start, 42, Some(&texture_view(at(2))));
+        assert!(sync(heap, start, 42), "only spanned: mirrored");
+        assert_eq!(due(heap, frame), [42]);
+        left::TEST_BOUND.set(Some((true, false)));
+        let swept = heap.table_bound_flip((start, TITLE_SLOT_BYTES)).expect("the flip to off sweeps");
+        assert_eq!(swept, [2, 1, 1], "40 and 41 marked (not 42): 40 mirrored, 41 back in the queue");
+        assert_eq!(due(heap, frame), [40, 41, 42]);
+        all_done(heap, frame);
+        let n = heap.slots_written_under(&[(at(1), at(1) + 0x1000), (at(10), at(10) + 0x1000)], frame, true);
+        assert_eq!(n[2], 2, "41 and the new memory of 40 found in the off phase");
+        left::TEST_FRESH.set(None);
         left::TEST_BOUND.set(None);
         assert_eq!(release(title), 0);
     }

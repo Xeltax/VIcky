@@ -22,6 +22,15 @@
 //! (`VICTORY_BCPACK_FIXES=1` is the decoder's, in `victory-hle`; its counts
 //! are on a line here too.) The counters and their lines ([`lines`], every
 //! five seconds with the frame line) are kept here.
+//!
+//! Structural stage 1 (`VICTORY_TABLE_BOUND`) has draws make the texture
+//! slots they read through tables, with their own staging buffers, out of
+//! the queue those switches work on. `VICTORY_TABLE_BOUND_FRESH`
+//! (`crate::descriptor::left::fresh`, on by default with it) keeps such slots
+//! under the same rules: its counts ([`Fresh`]), the hold of a draw's upload
+//! under a DirectStorage write ([`StageHold`], [`stage_held`]), and
+//! `VICTORY_STALE_SLOTS`' look at the slots draws make, apart
+//! ([`table_made`], [`table_verdict`]) are here too.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -235,6 +244,106 @@ fn pending_now() -> usize {
     PENDING_N.load(Relaxed)
 }
 
+/// Tests: notes `ranges` (start, end) as a pending DirectStorage write
+/// whatever the switch says, until what this returns is dropped.
+#[cfg(test)]
+pub(crate) fn test_pending(ranges: Vec<(u64, u64)>) -> WritePending {
+    let token = NEXT_TOKEN.fetch_add(1, Relaxed);
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    pending.push(Pending { token, since: Instant::now(), ranges });
+    PENDING_N.store(pending.len(), Relaxed);
+    WritePending(token)
+}
+
+/// VIcky (`VICTORY_TABLE_BOUND_FRESH` with [`ds_hold`]): the frames a
+/// texture the draws keep staged waited for a DirectStorage write into its
+/// memory (`crate::texture::upload` and the check at submission): once a
+/// frame counts, at most [`DS_HOLD_MOST`] for one write, as a slot of the
+/// texture pass is held; a use with no write pending starts the count anew.
+/// Shared by the recording threads and the submitting thread: a race moves
+/// the count by one, the bound stays.
+#[derive(Default)]
+pub(crate) struct StageHold {
+    frames: std::sync::atomic::AtomicU32,
+    /// The frame of the last hold, plus one (0: none).
+    last: AtomicU64,
+}
+
+impl StageHold {
+    /// Whether a use in `frame` waits, a write being `pending` or not
+    /// (`most`: [`DS_HOLD_MOST`]).
+    pub(crate) fn hold(&self, pending: bool, frame: u64, most: u8) -> bool {
+        if !pending {
+            if self.frames.load(Relaxed) != 0 {
+                self.frames.store(0, Relaxed);
+                self.last.store(0, Relaxed);
+            }
+            return false;
+        }
+        let frames = self.frames.load(Relaxed);
+        let now = frame.wrapping_add(1);
+        if frames > 0 && self.last.load(Relaxed) == now {
+            // Held in this frame already, by another list or the check.
+            return true;
+        }
+        if frames >= u32::from(most) {
+            return false;
+        }
+        self.frames.store(frames + 1, Relaxed);
+        self.last.store(now, Relaxed);
+        true
+    }
+}
+
+/// Whether a draw's use in `frame` of a texture staged for draws, whose
+/// memory is `len` bytes at `at`, waits for a DirectStorage write under way
+/// there (`hold`: its [`StageHold`]; `on`: `VICTORY_TABLE_BOUND_FRESH` acts
+/// now and [`ds_hold`] is set). Counted ([`Fresh::Held`], [`Fresh::HeldOut`]).
+pub(crate) fn stage_held(hold: &StageHold, on: bool, at: u64, len: u64, frame: u64) -> bool {
+    if !on {
+        return false;
+    }
+    let pending = write_pending(at, at.saturating_add(len));
+    let held = hold.hold(pending, frame, DS_HOLD_MOST);
+    if pending {
+        fresh_count(if held { Fresh::Held } else { Fresh::HeldOut }, 1);
+    }
+    held
+}
+
+// `VICTORY_TABLE_BOUND_FRESH` (`crate::descriptor::left::fresh`).
+
+/// What `VICTORY_TABLE_BOUND_FRESH` counts ([`fresh_count`], since the start).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Fresh {
+    /// Slots draws read through tables lately that a pass over memory found,
+    /// kept and made due as any slot (stage 1 left them to their draws):
+    /// memory mapped, unmapped or about to be written (also a refresh that
+    /// missed a page, `VICTORY_NO_WAIT_FALLBACK`); written behind the
+    /// guards; a level waiting for the card's memory.
+    Remapped,
+    PageWritten,
+    Waiting,
+    /// Textures staged for draws read again whole after a write behind the
+    /// guards (`crate::texture::restage_in`).
+    Restaged,
+    /// With [`ds_hold`]: a draw's upload or check held while a DirectStorage
+    /// write was under way into its texture; one that went on after
+    /// [`DS_HOLD_MOST`] frames.
+    Held,
+    HeldOut,
+}
+
+/// [`Fresh`]'s counts.
+pub(crate) static FRESH: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Counts `n` of `what`.
+pub(crate) fn fresh_count(what: Fresh, n: u64) {
+    if n > 0 {
+        FRESH[what as usize].fetch_add(n, Relaxed);
+    }
+}
+
 // `VICTORY_STALE_SLOTS`.
 
 /// VIcky (`VICTORY_STALE_SLOTS`; unset or `0`: off): a diagnostic that says
@@ -337,6 +446,24 @@ fn sample_print(at: u64, len: u64, windows: &[(u64, u64)]) -> u64 {
     u64::from_le_bytes(first) | 1
 }
 
+/// [`sample_print`] of `bytes` in hand (a texture's memory as a detiling
+/// took it, `crate::texture` `Staging::detile`): the same value as
+/// `sample_print` gives for memory that holds those bytes.
+pub(crate) fn sample_print_of(bytes: &[u8], windows: &[(u64, u64)]) -> u64 {
+    let len = bytes.len() as u64;
+    let mut hasher = blake3::Hasher::new();
+    for &(from, n) in windows {
+        if from >= len {
+            continue;
+        }
+        let n = n.min(len - from) as usize;
+        hasher.update(&bytes[from as usize..from as usize + n]);
+    }
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    u64::from_le_bytes(first) | 1
+}
+
 /// What [`stale_slots`] noted of an uploaded slot.
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 struct Watched {
@@ -423,8 +550,251 @@ pub(crate) fn written_under(slots: &[u32]) {
     }
 }
 
+// `VICTORY_STALE_SLOTS` for the slots draws make (`VICTORY_TABLE_BOUND`).
+
+/// What [`stale_slots`] knows of a texture slot a draw made through a table
+/// ([`table_made`]): its host copy is the draws' staging buffer's, read
+/// again at every submission that samples it, not an upload of the pass.
+struct TableWatched {
+    at: u64,
+    len: u64,
+    /// The title texture (`crate::object::This`) the slot's view is of.
+    resource: usize,
+    windows: Arc<[(u64, u64)]>,
+    prints: TablePrints,
+    /// Its last look found it stale ([`TableVerdict::Out`] or
+    /// [`TableVerdict::Lasting`]).
+    stale: bool,
+}
+
+/// What the looks at a table-made slot keep ([`table_verdict`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TablePrints {
+    /// The sampled fingerprint of what its host copy holds, as last known
+    /// from its staging buffer (0: never known).
+    host: u64,
+    /// That fingerprint when a look first found the memory differing from
+    /// it, and the frame of that look ((0, 0): not differing).
+    differ: (u64, u64),
+}
+
+/// A look's verdict on a table-made slot ([`table_verdict`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableVerdict {
+    /// Its memory is what its host copy took.
+    Same,
+    /// Nothing known of what its host copy holds yet.
+    Unknown,
+    /// Differs; its staging buffer's next check, or the pass (it is in the
+    /// queue), takes the change.
+    Waiting,
+    /// Differs from the same host copy for [`TABLE_LASTING`] frames and
+    /// more although its staging buffer is checked at every submission
+    /// that samples it: those checks miss the change.
+    Lasting,
+    /// Differs, no staging buffer and not in the queue: nothing uploads it
+    /// again.
+    Out,
+}
+
+/// Frames a table-made slot may differ from its staged host copy before it
+/// counts as stale ([`TableVerdict::Lasting`]): past the check's hash turn
+/// (8 frames) and a partly mapped texture's read (every 30 frames), with
+/// some slack, a change the checks would take is taken.
+const TABLE_LASTING: u64 = 40;
+
+/// The verdict of a look at a table-made slot whose memory's sampled
+/// fingerprint is `now`, whose staging buffer's last detiling took
+/// `staged` (none: no staging buffer, or nothing detiled with the
+/// diagnostic on), in `frame`; `queued`: whether the slot is in the queue of
+/// textures picked by index. `prints` is what the looks keep. Pure, for
+/// testing.
+fn table_verdict(prints: &mut TablePrints, now: u64, staged: Option<u64>, frame: u64, queued: bool) -> TableVerdict {
+    let host = match staged {
+        Some(print) => {
+            prints.host = print;
+            print
+        }
+        None => prints.host,
+    };
+    if host == 0 {
+        return TableVerdict::Unknown;
+    }
+    if now == host {
+        prints.differ = (0, 0);
+        return TableVerdict::Same;
+    }
+    if staged.is_none() {
+        return if queued { TableVerdict::Waiting } else { TableVerdict::Out };
+    }
+    if prints.differ.0 != host {
+        prints.differ = (host, frame);
+        return TableVerdict::Waiting;
+    }
+    if frame.saturating_sub(prints.differ.1) >= TABLE_LASTING {
+        TableVerdict::Lasting
+    } else {
+        TableVerdict::Waiting
+    }
+}
+
+struct TableWatch {
+    slots: BTreeMap<u32, TableWatched>,
+    cursor: u32,
+    /// Slots whose last look found them stale.
+    stale: u64,
+}
+
+static TABLE_WATCH: Mutex<TableWatch> = Mutex::new(TableWatch { slots: BTreeMap::new(), cursor: 0, stale: 0 });
+
+fn table_watch() -> std::sync::MutexGuard<'static, TableWatch> {
+    TABLE_WATCH.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Since the last line, with [`stale_slots`], of the table-made slots:
+/// looked at; differing; of those with no staging buffer and out of the
+/// queue; still differing under their staging buffer after
+/// [`TABLE_LASTING`] frames; waiting for a check or a pass; let go.
+pub(crate) static TABLE_STALE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// A draw made title slot `index` in place from `view` (a texture view it
+/// reads through a table made afresh, `crate::draw` `State::tables`, ON
+/// phases): watched apart from the pass's slots ([`stale_slots`]), once
+/// the draws stage its texture. Nothing with the diagnostic off.
+pub(crate) fn table_made(index: u32, view: &View) {
+    if stale_slots() == 0 {
+        return;
+    }
+    let View::Placed(false, resource, desc) = view else {
+        return;
+    };
+    let at = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    let (Some(len), Some(texture)) = (crate::resource::placed_bytes(resource), crate::resource::placed_known(at, resource))
+    else {
+        return;
+    };
+    {
+        let w = table_watch();
+        if let Some(e) = w.slots.get(&index) {
+            if (e.at, e.len, e.resource) == (at, len, texture as usize) {
+                return;
+            }
+        } else if w.slots.len() >= WATCH_MOST {
+            return;
+        }
+    }
+    // (A texture the draws do not stage is not theirs to keep: the pass's.)
+    let Some(m) = crate::texture::staged_memory(texture, false, true).filter(|m| !m.spans.is_empty()) else {
+        return;
+    };
+    let windows: Arc<[(u64, u64)]> = sample_windows(&m.spans).into();
+    let entry = TableWatched { at, len, resource: texture as usize, windows, prints: TablePrints::default(), stale: false };
+    let mut w = table_watch();
+    if let Some(old) = w.slots.insert(index, entry)
+        && old.stale
+    {
+        w.stale -= 1;
+    }
+}
+
+/// The off phase of `VICTORY_TABLE_BOUND=alt` begins: no slot is made by a
+/// draw, and the ones watched as such are the pass's again.
+pub(crate) fn table_watch_clear() {
+    if stale_slots() == 0 {
+        return;
+    }
+    let mut w = table_watch();
+    w.slots.clear();
+    w.stale = 0;
+}
+
+/// Looks at up to `n` table-made slots, in turn ([`table_verdict`]).
+fn table_sweep(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64, n: usize) {
+    let batch: Vec<(u32, u64, u64, usize, Arc<[(u64, u64)]>)> = {
+        let mut w = table_watch();
+        if w.slots.is_empty() {
+            return;
+        }
+        let cursor = w.cursor;
+        let batch: Vec<_> = w
+            .slots
+            .range(cursor..)
+            .chain(w.slots.range(..cursor))
+            .take(n)
+            .map(|(&index, e)| (index, e.at, e.len, e.resource, e.windows.clone()))
+            .collect();
+        w.cursor = batch.last().map_or(0, |b| b.0.wrapping_add(1));
+        batch
+    };
+    // Per slot: (memory now, staged print, queued), or let go.
+    let mut looked: Vec<(u32, u64, usize, Option<(u64, Option<u64>, bool)>)> = Vec::with_capacity(batch.len());
+    for (index, at, len, resource, windows) in batch {
+        let same_view = match heap.handle(index).and_then(crate::descriptor::view) {
+            Some(View::Placed(false, r, desc)) => {
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                address == at && crate::resource::placed_bytes(&r) == Some(len)
+            }
+            _ => false,
+        };
+        if !same_view || crate::texture::mapped_bytes(at as *const u8, len as usize) == 0 {
+            looked.push((index, at, resource, None));
+            continue;
+        }
+        let now = sample_print(at, len, &windows);
+        let staged = crate::texture::staged_sample(resource as crate::object::This);
+        let queued = staged.is_none() && host.texture_slot_queued(index);
+        looked.push((index, at, resource, Some((now, staged, queued))));
+    }
+    let mut guard = table_watch();
+    let w = &mut *guard;
+    for (index, at, resource, look) in looked {
+        // Only the entry that was looked at (not one made meanwhile).
+        let Some(entry) = w.slots.get_mut(&index).filter(|e| (e.at, e.resource) == (at, resource)) else {
+            continue;
+        };
+        let was = entry.stale;
+        let Some((now, staged, queued)) = look else {
+            TABLE_STALE[5].fetch_add(1, Relaxed);
+            w.slots.remove(&index);
+            if was {
+                w.stale -= 1;
+            }
+            continue;
+        };
+        TABLE_STALE[0].fetch_add(1, Relaxed);
+        let verdict = table_verdict(&mut entry.prints, now, staged, frame, queued);
+        let stale = match verdict {
+            TableVerdict::Same | TableVerdict::Unknown => false,
+            TableVerdict::Waiting => {
+                TABLE_STALE[4].fetch_add(1, Relaxed);
+                false
+            }
+            TableVerdict::Lasting => {
+                TABLE_STALE[3].fetch_add(1, Relaxed);
+                true
+            }
+            TableVerdict::Out => {
+                TABLE_STALE[2].fetch_add(1, Relaxed);
+                true
+            }
+        };
+        if !matches!(verdict, TableVerdict::Same | TableVerdict::Unknown) {
+            TABLE_STALE[1].fetch_add(1, Relaxed);
+        }
+        if stale != was {
+            entry.stale = stale;
+            if stale {
+                w.stale += 1;
+            } else {
+                w.stale -= 1;
+            }
+        }
+    }
+}
+
 /// Looks at up to [`stale_slots`] watched slots, in turn, once a frame:
-/// their sampled fingerprint now against the one their upload noted.
+/// their sampled fingerprint now against the one their upload noted; and
+/// as many of the slots draws make ([`table_made`]), apart.
 pub(crate) fn sweep(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) {
     let n = stale_slots();
     if n == 0 {
@@ -434,6 +804,7 @@ pub(crate) fn sweep(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     if FRAME.swap(frame, Relaxed) == frame {
         return;
     }
+    table_sweep(heap, host, frame, n);
     // Taken under the lock, looked at without it (the looks read memory
     // and ask the queue's lock).
     let batch: Vec<(u32, u64, u64, Arc<[(u64, u64)]>, u64, bool)> = {
@@ -584,6 +955,34 @@ pub(crate) fn lines() {
              their upload), {gone} let go (unmapped, or another texture there); now {watched} slots watched, {stale_out} \
              of them differing and out of the queue at their last look"
         );
+        if crate::descriptor::left::set() {
+            let [looked, differ, out, lasting, waiting, gone] = [0, 1, 2, 3, 4, 5].map(|i| TABLE_STALE[i].swap(0, Relaxed));
+            let (watched, stale) = {
+                let w = table_watch();
+                (w.slots.len(), w.stale)
+            };
+            tracing::info!(
+                "texture slots draws make through tables whose host copy no longer matches their memory (VICTORY_STALE_SLOTS, \
+                 apart from the slots above; VICTORY_TABLE_BOUND {}, FRESH {}), since the last line: {looked} looked at, \
+                 {differ} differ ({out} of them with no staging buffer and out of the queue: nothing uploads them again; \
+                 {lasting} still differing {TABLE_LASTING} frames on under their staging buffer: its checks miss the change; \
+                 {waiting} waiting for their staging buffer's next check or a pass), {gone} let go (unmapped, or another \
+                 texture there); now {watched} watched, {stale} of them stale at their last look",
+                crate::descriptor::left::TABLE_BOUND.said(),
+                if crate::descriptor::left::fresh() { "on" } else { "off" },
+            );
+        }
+    }
+    if crate::descriptor::left::fresh() {
+        let [remapped, written, waiting, restaged, held, held_out] = [0, 1, 2, 3, 4, 5].map(|i| FRESH[i].load(Relaxed));
+        tracing::info!(
+            "texture slots draws make kept fresh (VICTORY_TABLE_BOUND_FRESH, ON phases), since the start: slots read through \
+             tables lately found by the passes over memory and made due as any slot (stage 1 left them to their draws): \
+             {remapped} remapped or about to be written (or a refresh that missed a page), {written} written behind the \
+             guards, {waiting} waiting for a level; {restaged} textures the draws keep staged read again whole after a write \
+             behind the guards; {held} draw uploads or checks held while a DirectStorage write was under way into their \
+             texture (VICTORY_DS_HOLD=1), {held_out} that went on after {DS_HOLD_MOST} frames of one write"
+        );
     }
     let [streams, kept, carried, first] =
         [0, 1, 2, 3].map(|i| victory_formats::bcpack::FIX_COUNTS[i].load(Relaxed));
@@ -649,5 +1048,74 @@ mod tests {
         memory[0x1010] = 9;
         assert_ne!(sample_print(memory.as_ptr() as u64, memory.len() as u64, &windows), print);
         assert_eq!(sample_print(at, 0, &windows), sample_print(at, 0, &[]));
+    }
+
+    /// The print of bytes in hand (what a staging buffer's detiling took) is
+    /// the print the stale look takes of memory holding them, windows past
+    /// the end cut as there.
+    #[test]
+    fn the_print_of_bytes_in_hand_is_the_print_of_memory_holding_them() {
+        let mut memory = vec![0u8; 0x3_0000];
+        for (i, b) in memory.iter_mut().enumerate() {
+            *b = (i * 7 % 251) as u8;
+        }
+        let windows = sample_windows(&[(0, 0x1000), (0x1000, 0x2_f000)]);
+        let at = memory.as_ptr() as u64;
+        assert_eq!(sample_print_of(&memory, &windows), sample_print(at, memory.len() as u64, &windows));
+        let short = &memory[..0x1_0080];
+        assert_eq!(sample_print_of(short, &windows), sample_print(at, short.len() as u64, &windows));
+        assert_ne!(sample_print_of(short, &windows), sample_print_of(&memory, &windows));
+    }
+
+    /// `VICTORY_TABLE_BOUND_FRESH` with `VICTORY_DS_HOLD`: a texture staged
+    /// for draws is held while a write is under way into its memory (not one
+    /// that only touches it), once a frame counts, at most [`DS_HOLD_MOST`]
+    /// frames for one write; with the write done it goes on, and the next
+    /// write is held anew. Nothing is held while FRESH does not act.
+    #[test]
+    fn the_ds_hold_applies_to_textures_the_draws_keep() {
+        let at = 0x7fe9_0000_0000u64;
+        let len = 0x2_0000u64;
+        let hold = StageHold::default();
+        assert!(!stage_held(&hold, true, at, len, 10), "nothing under way");
+        let write = test_pending(vec![(at + 0x1_0000, at + 0x1_1000)]);
+        assert!(!stage_held(&hold, false, at, len, 10), "FRESH not acting: never held");
+        let touching = StageHold::default();
+        assert!(!stage_held(&touching, true, at + len, 0x1000, 10), "a texture that only touches the write");
+        for frame in 10..10 + u64::from(DS_HOLD_MOST) {
+            assert!(stage_held(&hold, true, at, len, frame), "held at {frame}");
+            assert!(stage_held(&hold, true, at, len, frame), "a second use in the frame: held, not counted");
+        }
+        assert!(!stage_held(&hold, true, at, len, 10 + u64::from(DS_HOLD_MOST)), "gone on after the bound");
+        drop(write);
+        assert!(!stage_held(&hold, true, at, len, 40), "the write done");
+        let next = test_pending(vec![(at, at + 0x100)]);
+        assert!(stage_held(&hold, true, at, len, 41), "the next write held anew");
+        drop(next);
+    }
+
+    /// A slot draws make is judged against what its staging buffer's last
+    /// detiling took: the same; differing and waiting for the next check,
+    /// still differing from that same host copy [`TABLE_LASTING`] frames on
+    /// (its checks miss it), and waiting again once the staging buffer took
+    /// something new. Without a staging buffer, against the last host copy
+    /// known: in the queue it waits for the pass, out of it nothing uploads
+    /// it again. Nothing known yet: no verdict.
+    #[test]
+    fn table_made_slots_are_judged_against_their_staging_buffer() {
+        use TableVerdict::*;
+        let mut p = TablePrints::default();
+        assert_eq!(table_verdict(&mut p, 5, None, 100, false), Unknown);
+        assert_eq!(table_verdict(&mut p, 5, Some(5), 100, false), Same);
+        assert_eq!(p.host, 5);
+        assert_eq!(table_verdict(&mut p, 7, Some(5), 110, false), Waiting, "first seen differing");
+        assert_eq!(table_verdict(&mut p, 7, Some(5), 110 + TABLE_LASTING - 1, false), Waiting);
+        assert_eq!(table_verdict(&mut p, 9, Some(5), 110 + TABLE_LASTING, false), Lasting, "the checks missed it");
+        assert_eq!(table_verdict(&mut p, 9, Some(8), 200, false), Waiting, "a new detiling, not yet this");
+        assert_eq!(table_verdict(&mut p, 9, Some(9), 201, false), Same);
+        assert_eq!(p.differ, (0, 0));
+        assert_eq!(table_verdict(&mut p, 11, None, 300, true), Waiting, "no staging buffer, in the queue");
+        assert_eq!(table_verdict(&mut p, 11, None, 301, false), Out, "nothing uploads it again");
+        assert_eq!(table_verdict(&mut p, 9, None, 302, false), Same, "as its last host copy");
     }
 }

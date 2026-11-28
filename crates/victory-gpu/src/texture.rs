@@ -73,6 +73,108 @@ pub(crate) struct Staging {
     /// buffers and goes back to it ([`staging_buffer`]); 0: a buffer of its
     /// own, released when this is dropped.
     pooled: u64,
+    /// VIcky (`VICTORY_TABLE_BOUND_FRESH` with `VICTORY_DS_HOLD=1`): the
+    /// frames a draw's upload or the check at submission waited for a
+    /// DirectStorage write into the texture ([`crate::texstale::StageHold`]).
+    hold: crate::texstale::StageHold,
+    /// VIcky (`VICTORY_STALE_SLOTS`): the sampled fingerprint
+    /// (`crate::texstale::sample_print_of`) of what the last detiling took;
+    /// 0: none, or the diagnostic is off.
+    sampled: std::sync::atomic::AtomicU64,
+}
+
+thread_local! {
+    /// While the pass over textures picked by index records an upload
+    /// ([`PassUpload`]).
+    static PASS_UPLOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// VIcky: while alive, the uploads this thread records are the texture
+/// pass's (`crate::draw` `texture_upload`), whose look held the slot under a
+/// DirectStorage write already: [`upload`] does not hold them again.
+pub(crate) struct PassUpload(bool);
+
+impl PassUpload {
+    pub(crate) fn enter() -> Self {
+        PassUpload(PASS_UPLOAD.replace(true))
+    }
+}
+
+impl Drop for PassUpload {
+    fn drop(&mut self) {
+        PASS_UPLOAD.set(self.0);
+    }
+}
+
+/// VIcky (`VICTORY_TABLE_BOUND_FRESH` with `VICTORY_DS_HOLD=1`): whether a
+/// draw's use of `staging` waits now for a DirectStorage write into its
+/// memory (in the ON phases; never for the texture pass's own uploads,
+/// [`PassUpload`]). Counted.
+fn held_for_write(staging: &Staging) -> bool {
+    let on = crate::descriptor::left::fresh_live() && crate::texstale::ds_hold();
+    let (at, len) = staging.memory();
+    crate::texstale::stage_held(&staging.hold, on, at as u64, len as u64, crate::frame::current())
+}
+
+/// VIcky (`VICTORY_TABLE_BOUND_FRESH`): the textures staged for draws whose
+/// memory overlaps any of `ranges` (start, end; DirectStorage wrote there
+/// behind the guards) are read again whole at the next submission that
+/// samples them, whatever the check would have found, and uploaded by its
+/// list ([`Staging::forget`], and dirty). Returns how many.
+pub(crate) fn restage_in(ranges: &[(u64, u64)]) -> usize {
+    let ranges = merged(ranges);
+    if ranges.is_empty() {
+        return 0;
+    }
+    let hit: Vec<Arc<Staging>> = {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = map.as_ref() else {
+            return 0;
+        };
+        map.values()
+            .filter(|s| {
+                let (at, len) = s.memory();
+                touches(&ranges, at as u64, at.saturating_add(len) as u64)
+            })
+            .cloned()
+            .collect()
+    };
+    for s in &hit {
+        s.forget();
+        s.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    hit.len()
+}
+
+/// `ranges` (start, end) sorted and joined where they overlap or touch,
+/// empty ones left out. Pure, for testing.
+fn merged(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut sorted: Vec<(u64, u64)> = ranges.iter().copied().filter(|&(s, e)| s < e).collect();
+    sorted.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(sorted.len());
+    for (s, e) in sorted {
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    out
+}
+
+/// Whether `[start, end)` overlaps any of `ranges` ([`merged`]). Pure, for
+/// testing.
+fn touches(ranges: &[(u64, u64)], start: u64, end: u64) -> bool {
+    let i = ranges.partition_point(|&(s, _)| s < end);
+    i > 0 && ranges[i - 1].1 > start
+}
+
+/// VIcky (`VICTORY_STALE_SLOTS`): the sampled fingerprint of what the last
+/// detiling of `resource`'s staging buffer took, if it has one and was
+/// detiled with the diagnostic on.
+pub(crate) fn staged_sample(resource: This) -> Option<u64> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let s = map.as_ref()?.get(&(resource as usize))?;
+    Some(s.sampled.load(std::sync::atomic::Ordering::Relaxed)).filter(|&p| p != 0)
 }
 
 /// A staging buffer nothing holds: the buffer and where it is mapped.
@@ -135,6 +237,9 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// VIcky (`VICTORY_TABLE_BOUND_FRESH`): the frame a guarded texture's
+    /// memory was last read for a hash ([`Staging::refresh_timed`]).
+    hashed: u64,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -769,6 +874,16 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             }
         }
     }
+    // VIcky (`VICTORY_TABLE_BOUND_FRESH` with `VICTORY_DS_HOLD=1`, ON
+    // phases): a draw's upload of a texture a DirectStorage write is filling
+    // now would take what its pages held before (a recycled block's last
+    // texture, zeros) or half of each: this list records neither the copy
+    // nor the check, and the host copy shows what it showed, as a slot the
+    // texture pass holds does. At most `crate::texstale::DS_HOLD_MOST`
+    // frames for one write ([`crate::texstale::StageHold`]).
+    if (!staging.uploaded.load(Relaxed) || staging.dirty.load(Relaxed)) && !PASS_UPLOAD.get() && held_for_write(&staging) {
+        return;
+    }
     // The host texture has the staging buffer's contents: only the check
     // at submission is left, and what it finds changed the next list that
     // samples the texture uploads (a frame late where every list of the
@@ -1080,6 +1195,16 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
+        // VIcky (`VICTORY_TABLE_BOUND_FRESH` with `VICTORY_DS_HOLD=1`, ON
+        // phases): a staging buffer filled before keeps what it holds while
+        // a DirectStorage write is filling its memory (the list's copy takes
+        // the last whole texture, not half of the next), at most
+        // `crate::texstale::DS_HOLD_MOST` frames; nothing of what the
+        // watches say is taken, so the next check reads the new bytes. One
+        // never filled is not held: its list recorded the copy already.
+        if last.hash.is_some() && held_for_write(self) {
+            return 0;
+        }
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
@@ -1112,9 +1237,25 @@ impl Staging {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            let frame = crate::frame::current();
+            // VIcky (`VICTORY_TABLE_BOUND_FRESH`, ON phases): a texture the
+            // draws keep is in no queue and gets no look after its upload;
+            // this hash is all that sees a write the guards do not. Its turn
+            // is then at least every eight frames by its own count: by the
+            // frame's number alone, a texture whose submissions met the
+            // frame counter in steps of two (the title begins two or three
+            // frames for one it presents) could miss every turn.
+            let fresh = crate::descriptor::left::fresh_live();
+            let turn = if fresh {
+                frame >= last.hashed.saturating_add(HASH_EVERY)
+            } else {
+                frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY)
+            };
             if unwritten && !turn {
                 return 0;
+            }
+            if fresh {
+                last.hashed = frame;
             }
         }
         // From here on the texture's memory may be read in place. Held until
@@ -1243,6 +1384,15 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        // VIcky (`VICTORY_STALE_SLOTS`): what the host copy takes from now
+        // on, sampled as the stale look samples memory, from the very bytes
+        // detiled (`crate::texstale::table_made`'s slots are looked at
+        // against it).
+        if crate::texstale::stale_slots() > 0 {
+            let windows = crate::texstale::sample_windows(&self.layout.mip_ranges(MIP_RANGES));
+            let print = crate::texstale::sample_print_of(tiled, &windows);
+            self.sampled.store(print, std::sync::atomic::Ordering::Relaxed);
+        }
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
@@ -1815,9 +1965,34 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
         pooled,
+        hold: crate::texstale::StageHold::default(),
+        sampled: std::sync::atomic::AtomicU64::new(0),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod restage_tests {
+    use super::{merged, touches};
+
+    /// `VICTORY_TABLE_BOUND_FRESH`: the ranges written behind the guards are
+    /// joined where they overlap or touch (empty ones left out), and a
+    /// staged texture's memory is restaged when it overlaps one, not when it
+    /// only touches it or lies between.
+    #[test]
+    fn writes_behind_the_guards_restage_the_textures_they_overlap() {
+        let ranges = merged(&[(0x5000, 0x6000), (0x1000, 0x2000), (0x1800, 0x3000), (0x3000, 0x3100), (0x9000, 0x9000)]);
+        assert_eq!(ranges, [(0x1000, 0x3100), (0x5000, 0x6000)]);
+        assert!(touches(&ranges, 0x0, 0x1001));
+        assert!(touches(&ranges, 0x30ff, 0x4000));
+        assert!(touches(&ranges, 0x4000, 0x8000), "spans a whole range");
+        assert!(touches(&ranges, 0x5800, 0x5900), "inside one");
+        assert!(!touches(&ranges, 0x0, 0x1000), "touching its start only");
+        assert!(!touches(&ranges, 0x3100, 0x5000), "between them");
+        assert!(!touches(&ranges, 0x6000, 0x7000), "touching its end only");
+        assert!(!touches(&[], 0, u64::MAX));
+    }
 }
 
 #[cfg(test)]

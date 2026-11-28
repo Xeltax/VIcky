@@ -2416,8 +2416,11 @@ impl State {
         // through a table: they upload it, and check it at every
         // submission that samples it.
         let tabled = crate::texture::is_staged(resource);
-        // (Read as a table entry of a texture a shader samples.)
+        // (Read as a table entry of a texture a shader samples. VIcky: the
+        // pass's own, which `texture_look` held already under a
+        // DirectStorage write, `crate::texture::PassUpload`.)
         if let Some(view) = &view {
+            let _pass = crate::texture::PassUpload::enter();
             readable(list, ResourceType::Srv, view);
         }
         // A texture view the host refuses removes the device: name it.
@@ -3048,6 +3051,7 @@ impl State {
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
                 tally.add(left::C::MarkedTextures, 1);
+                tally.add(left::C::MarkedTexturesRead, 1);
             }
             // VIcky (`VICTORY_TABLE_BOUND`, `crate::descriptor::left`): the
             // slot's buffer mark, whatever it views (only counted).
@@ -3321,13 +3325,25 @@ impl State {
                         // (its texture is up to date now), and made in
                         // place as the texture pass would have made it,
                         // for a shader that picks it by index all the same.
+                        // (VIcky, `VICTORY_TABLE_BOUND_FRESH`: only a slot
+                        // the draw reads is left to the draws; one the table
+                        // only spans keeps the rules of a slot picked by
+                        // index, `HostHeap::tabled_in`.)
                         if let Some(title) = title_first
                             && crate::descriptor::host::is_texture_view(&view)
                         {
-                            host.texture_slot_tabled(title + k, kind.is_some());
+                            let first_read = host.texture_slot_tabled(title + k, kind.is_some());
                             tally.add(left::C::MarkedTextures, 1);
+                            if kind.is_some() {
+                                tally.add(left::C::MarkedTexturesRead, 1);
+                            }
                             if kind.is_some() && live {
                                 host.mirror(title + k, table + u64::from(k) * 32, true);
+                                // VIcky (`VICTORY_STALE_SLOTS`): a slot a draw
+                                // makes, watched apart (once a frame).
+                                if first_read {
+                                    crate::texstale::table_made(title + k, &view);
+                                }
                             }
                         }
                     }

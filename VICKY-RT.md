@@ -136,6 +136,15 @@ Stage 2's stop criterion passes: 64-68 % of the sync's mirrored records and 71-7
 
 Next: make draw-made texture slots honour the same staleness checks, then stage 2 (buffer slots left to the draws with a hold that keeps the copies).
 
+**Draw-made texture slots kept fresh (2026-11-28, `fx-main-tablefresh`; unit tests only, not measured in the game).** `VICTORY_TABLE_BOUND_FRESH` is on by default with `TABLE_BOUND` (`=0` for stage 1 as measured). The changes:
+- only a read leaves a slot to the draws;
+- the due-again passes and the spans keep the slots draws read;
+- writes behind the guards restage the textures draws keep;
+- `DS_HOLD` applies to draws' uploads;
+- `VICTORY_STALE_SLOTS` counts draw-made slots apart.
+
+See "Table-made texture slots kept fresh" in the structural section. To join the recommended set it needs one boat `=alt` run: shirt captures in the ON phases, and the paired median against +1.66.
+
 **Streamed texture staleness measured (2026-11-28 night, boat mission save, RT on).** Recommended set plus `VICTORY_FACE_D16=1`; the diagnostic `VICTORY_STALE_SLOTS=1` compared about 3,100 sampled slots per 5 s line with title memory.
 
 | Settings | fps | Slots that differ | Of them out of the queue | Passenger's patterned shirt |
@@ -1465,6 +1474,7 @@ The design is `xcl-notes\fable-2026-11-28-structural.md`. A draw already makes e
   - a write of such a slot waits 8 frames in the queue for its draw;
   - the heap sync leaves a new record there to the draws (its line's "left to the draws");
   - the passes over memory remapped, written or waiting skip the slot, and its placed memory is not put in the spans.
+  - Since `fx-main-tablefresh`, `VICTORY_TABLE_BOUND_FRESH` (on by default with the switch) narrows this to slots a draw reads, and drops the last point. See "Table-made texture slots kept fresh" below.
 - **`=alt`.** Twenty seconds off, twenty on, with the `... (VICTORY_TABLE_BOUND=alt): ON` / `off, as usual` lines that `alt-fps.sh` reads (the same `crate::alt::Alt` as `VICTORY_SYNC_FINE`). The phase is taken at the start of each heap sync (`left::tick`).
   - Draws set the marks in both phases. In the off phase nothing acts on them (`left::live`): `tabled_lately` answers no, a read takes no slot out of the queue, a write waits for no draw, and the draw makes no title slot in place.
   - At each flip to off, the heap sync sweeps once every title slot with a mark of the last 240 frames (`HostHeap::table_bound_flip`, `table_bound_sweep`). Each record is read through the kernel, a sync page at a time, and noted as seen. A slot the sync had left is mirrored as the sync would have mirrored it (`mirror_due`). A texture slot its draw had made from that very record is noted again, which puts its texture back in the queue and its memory in the spans. The off phase thus starts from what it would have had. Expect one slow frame per flip: the design estimated about 70k slots at 0.6 us, 40 ms.
@@ -1512,6 +1522,94 @@ In a diagnostics build with the switch, it ends with a census of the window copi
 - **Copies let go and made again.** This is how T1's `TABLES_LEFT` lost its gain. A buffer record left in a texture-marked slot is not noted, so no mirrored slot and no kept range of the pass holds its host copy; only the draws' dynamic slots do, until their list is reset. If the ON phases show copies (the frame line's) up and G / RM up against the off phases, that is the cause, and stage 2's hold is the remedy.
 - **The flip's sweep** costs one slow frame per flip, on the heap sync's thread. Its line gives the count and the ms.
 - **Cost of the counters.** The sync's counts are kept per thread and added up when the making of a page, a round or a chunk of `VICTORY_PARALLEL_MIRROR` ends. The draws' counts are kept per recording thread and added up every 64 draws. The pass's buffer-mark check reads one mark per slot at the call, only with the switch. The census runs only in diagnostics builds with the switch, at most every 5 s, and never waits for a pass. Buffer marks take 4 bytes per title slot (about 5 MB) and a store per table entry, only with the switch.
+- **Not measured in the game.** Unit tests only so far.
+
+### Table-made texture slots kept fresh, `VICTORY_TABLE_BOUND_FRESH` (`fx-main-tablefresh`; on by default with `TABLE_BOUND`, not measured in the game yet)
+
+**The regression.** With `TABLE_BOUND` in its ON phases the passenger's shirt was a mosaic again, with the full recommended set. Reading the code gives two holes. The second is the likely one for a persistent mosaic.
+
+1. **A slot a draw reads through a table** leaves the texture queue. Its texture is kept by the draw's staging buffer, which the check at each submission that samples it reads again: through the guards, a hash every 8 frames, a partly mapped texture every 30 frames. That is mostly fresh, but:
+   - the bytes are taken while a DirectStorage write is under way;
+   - a write behind the guards that lands on a partly mapped texture waits up to 30 frames;
+   - the hash turn goes by the frame number, so a texture whose submissions meet the counter in steps of two can miss every turn.
+2. **A slot a table only spans** is not read by the draw. These are gaps between the entries the shader names, entries of a descriptor array the shader indexes from data, and slots picked by index that a table's range lies over. Stage 1 marked them all the same, for 240 frames. So:
+   - the heap sync left their new records;
+   - their writes waited 8 frames for a draw;
+   - their placed memory left the spans, so the passes over memory mapped, written or waiting never found them again.
+
+   No draw uploads these slots and no pass makes them. A texture streamed into a recycled block kept the block's last texture, or zeros, and none of the staleness fixes reached it.
+
+**What the switch does (the cheapest correct design).** The texture queue keeps out the per-draw table writes, which were the speed. Everything else is handed back to the existing machinery, and nothing new is registered per slot:
+
+- **Only a read leaves a slot to the draws.** A table entry the draw does not read sets no mark (`HostHeap::tabled_in`). It keeps every rule of a slot picked by index, as without `TABLE_BOUND`. A slot read by any draw in the last 240 frames stays the draws'. The per-draw ring slots are read every frame, so the heap sync still leaves them.
+- **Slots draws read stay in the spans.** A draw's making in place notes the slot's placed memory as before (`note_buffer_into`), so memory events still find it.
+- **The due-again passes no longer drop the draws' slots** (`HostHeap::leave_tabled`). Memory remapped or about to be written also covers the re-due after a refresh that missed a page (`VICTORY_NO_WAIT_FALLBACK`). The other passes are writes behind the guards (`VICTORY_PAGE_WRITES` bit 2) and levels waiting. Each makes such a slot due like any slot. The pass then looks at it with its usual rules (`DS_HOLD`, partly-mapped prints, `HEAP_RECHECK_MIPS`/`EVERY` after a whole upload):
+  - if the draws keep its texture staged, the pass leaves the slot to them ("found uploaded already");
+  - otherwise it makes the title slot from the current record and uploads fresh bytes.
+
+  A draw that reads the slot again takes it out of the queue, as before.
+- **A write behind the guards restages what the draws keep** (`texture::restage_in`, ON phases). The texture pass takes the ranges DirectStorage wrote behind the guards. Every staging buffer whose memory overlaps them is forgotten and marked dirty. The next list that samples the texture records the copy, and its submission reads the memory whole, before the card runs the copy. No guard, hash turn or 30-frame wait stands in between.
+- **DirectStorage hold for the draws** (with `VICTORY_DS_HOLD=1`, ON phases; `texstale::StageHold`, `stage_held`):
+  - A draw's upload is held while a request writes into the texture: the copy of a staging buffer never filled, or detiled since. The list records neither the copy nor the check, and the host copy shows what it showed.
+  - A filled staging buffer is not detiled at the check while the write is under way. Nothing the watches said is taken, so the next check reads the new bytes.
+  - Once a frame counts, at most 16 frames for one write, as for the pass's slots. The pass's own uploads are not held twice (`texture::PassUpload`).
+- **The staging buffer's hash turn counts its own frames** (ON phases): a guarded texture's memory is hashed at least 8 frames after its last hash, whatever step the frame counter takes.
+- **`=alt`.** The flip sweep covers only marks that acted: reads, since spanned slots get no mark. Those slots are mirrored, or put back in the queue, as before. They stayed in the spans, so the off phase starts with nothing stale. Spanned slots were never left. The rest acts only in ON phases (`left::fresh_live`), so the off phases stay main.
+- **`VICTORY_TABLE_BOUND_FRESH=0`** gives stage 1 as first measured.
+
+Code: `descriptor/left.rs` (`fresh`, `fresh_live`, `C::MarkedTexturesRead`); `descriptor/host.rs` (`tabled_in`, `note_buffer_into`, `leave_tabled`, `slots_remapped_in`, `texture_slots_page_written`, `slots_written_under`, `texture_slots_waiting`, `table_bound_flip`); `texture.rs` (`restage_in`, `held_for_write`, `PassUpload`, `upload`, `Staging::refresh_timed`, `Staging::detile`, `staged_sample`); `texstale.rs` (`Fresh`, `StageHold`, `stage_held`, `table_made`, `table_verdict`, the lines); `draw.rs` (`State::tables`, `State::table_entry`, `texture_upload`).
+
+**Grep.**
+- At start: `texture slots draws make through tables keep the freshness rules of the slots shaders pick by index (VICTORY_TABLE_BOUND_FRESH, ...) on=true`.
+- Every five seconds:
+
+  `texture slots draws make kept fresh (VICTORY_TABLE_BOUND_FRESH, ON phases), since the start: slots read through tables lately found by the passes over memory and made due as any slot (stage 1 left them to their draws): R remapped or about to be written (or a refresh that missed a page), P written behind the guards, L waiting for a level; S textures the draws keep staged read again whole after a write behind the guards; H draw uploads or checks held while a DirectStorage write was under way into their texture (VICTORY_DS_HOLD=1), O that went on after 16 frames of one write`
+- The tables line now says `T texture marks (R of them read, the only ones that leave a slot to the draws (FRESH))`. T minus R is the spanned slots that `FRESH` hands back to the heap sync and the queue.
+
+**`VICTORY_STALE_SLOTS` counts the slots draws make, apart.**
+- **What is watched.** A slot a draw makes in place (ON phases) is watched apart from the pass's slots, once its texture is staged (`texstale::table_made`, at the slot's first read of a frame).
+- **What it is compared with.** With the diagnostic on, each detiling notes the sampled fingerprint of the very bytes it took (`Staging::sampled`). A look compares memory now with that fingerprint (`table_verdict`).
+- **The verdicts.**
+  - Differing and staged: waiting for the next check.
+  - Still differing from the same host copy 40 frames on: lasting. Its checks miss the change, so it counts as stale.
+  - Differing, no staging buffer and in the queue: waiting for the pass.
+  - Differing, no staging buffer and out of the queue: out. Nothing uploads it again, so it counts as stale.
+- **At the flip to off** the watched slots are dropped: no slot is made by a draw in the off phase.
+- **The line** (every five seconds, beside the pass's):
+
+  `texture slots draws make through tables whose host copy no longer matches their memory (VICTORY_STALE_SLOTS, apart from the slots above; VICTORY_TABLE_BOUND alt, ON|off, FRESH on|off), since the last line: L looked at, D differ (O of them with no staging buffer and out of the queue: nothing uploads them again; P still differing 40 frames on under their staging buffer: its checks miss the change; W waiting for their staging buffer's next check or a pass), G let go (unmapped, or another texture there); now M watched, S of them stale at their last look`
+
+  In one `=alt` run, S in the ON phases plus the pass's own S give the stale count with `TABLE_BOUND` on. The pass's S alone in the off phases gives it off. One run with `FRESH=0` and one without give the before and after.
+
+**Suggested run.** Boat, `VICTORY_TABLE_BOUND=alt VICTORY_STALE_SLOTS=1`, on the recommended set (it has `DS_HOLD`, `PAGE_WRITES=all`, `NO_WAIT_FALLBACK`, `RECHECK_PARTLY`, `HEAP_RECHECK_MIPS/EVERY`).
+- Captures at frames 2500-2900: the passenger's shirt in ON phases.
+- The paired median from `alt-fps.sh` against stage 1's +1.66.
+- The FRESH line's counts.
+- Both stale lines, ON against off.
+
+**Tests.**
+- `descriptor::host::table_bound_tests::with_fresh_only_a_read_leaves_a_slot_to_the_draws`: a spanned slot gets no mark with `FRESH`. Its write is due at once and the heap sync mirrors its record. Without `FRESH` it is left. A read slot is left either way.
+- `descriptor::host::table_bound_tests::with_fresh_a_table_read_slot_is_made_again_when_its_memory_changes`: a slot read through a table, out of the queue, is made due when memory under it changes. Covered: a write behind the guards; a remap; the re-due after a failed read. Once due, the pass's DirectStorage hold applies to it. The draw's making in place from a new record keeps its memory in the spans, so a later write finds it. None of this happens without `FRESH`.
+- `descriptor::host::table_bound_tests::with_fresh_the_flip_to_off_leaves_nothing_stale`: the flip sweeps the read slots only, and the off phase finds them by memory.
+- `texstale::tests::the_ds_hold_applies_to_textures_the_draws_keep`:
+  - held under a write that overlaps, not one that only touches;
+  - once a frame, at most 16 frames;
+  - goes on once the write is done, and the next write is held anew;
+  - never held while `FRESH` does not act.
+- `texstale::tests::table_made_slots_are_judged_against_their_staging_buffer`.
+- `texstale::tests::the_print_of_bytes_in_hand_is_the_print_of_memory_holding_them`.
+- `texture::restage_tests::writes_behind_the_guards_restage_the_textures_they_overlap`.
+
+**Risks.**
+- **Speed.** Not measured. What can cost:
+  - Spanned-only slots go back to the heap sync and the queue, as in the off phase. That is T minus R on the tables line. If those are many and the paired median falls, they are the cost.
+  - The draws' making in place now notes spans: a BTreeMap note instead of a forget, under the lock it took anyway, for a few thousand notes a frame.
+  - Memory events add some tens of slots a frame to the pass. In the boat run, slots made due by remaps were about 10 a frame and those by writes behind the guards fewer.
+  - Each write behind the guards restages the textures under it: a full read and upload at the next sampling. The check would have done the same once it noticed.
+  - `restage_in` walks the staging buffers once a pass while such writes come.
+  - The hold adds one atomic load per check with no request pending.
+- **Hold.** A held draw upload of a texture never uploaded shows what the host copy had (zeros for a new one) for up to 16 frames. The pass's slots already do this.
+- **Not covered.** A slot several draws read, where the one that names it stops but another reads it through a descriptor array from data, is left to the draws for 240 frames with no staging buffer. Memory events still make it due. A new record copied into it as bytes waits for a draw that names it. The table-made stale line counts such slots as "out".
 - **Not measured in the game.** Unit tests only so far.
 
 ## Roadmap: from about 3.5 fps toward 15–20 (2026-11-25; superseded by [ROADMAP.md](ROADMAP.md), kept for history)
