@@ -82,6 +82,7 @@ fn compute_pipeline(used: &[UsedResource]) -> HostPipeline {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             },
             used: used.to_vec(),
             stores: false,
