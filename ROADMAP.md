@@ -93,6 +93,8 @@ Lot 6's always-on SSE2 `changed_runs` and per-thread counts: picture clean, 9.41
 
 | **Structural stage 1** | `VICTORY_TABLE_BOUND` | **+1.66 fps boat (10.48 fps run), +1.18 prologue**; stage-2 criterion passes (64-72 %) | Optional. With `TABLE_BOUND_FRESH` (stage 1b) the picture is clean but the gain shrinks to +0.17 boat / +0.39 prologue: the speed came from skipping the staleness work. Next: stage 2 |
 
+| **Structural stage 2** | `VICTORY_TABLES_LEFT` | **+0.72 fps prologue (-14 % frame time)**, neutral on the boat; 0 check violations; heap sync 33 -> 19-28 ms, pass 49-58 -> 26-28 ms, copies flat; picture clean | Optional. The boat frame is now bound elsewhere: profile next |
+
 **Since 2026-11-28 the priority is picture fidelity**: textures, faces and mouths, resolution, water and vegetation. After that comes a structural rework of the descriptor path for fps (the submitting thread and the buffer-view pass are two equal walls), instead of more small levers.
 
 Next focus: the submitting thread itself, ~137 ms. In order:

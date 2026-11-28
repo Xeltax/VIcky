@@ -123,6 +123,30 @@ This work is for making the title's compute ray tracing (the BVH structure build
 
 **Chapter-1 boat mission with ray tracing (2026-11-27, verified on an RTX 4080, Series X, RT on):** with this main, a save in the boat mission loads, the boat floats and the mission plays, with no extra switch: the texture copy-back (`VICTORY_TEXTURE_BACK`, on by default) gives the title's physics the water it computes on the card, and the builder's box rehydration programs' parent-link stores are left out by default (`VICTORY_BVH_LINK_STORES=keep` keeps them; with them the title crashed on that save's loading screen). Add `VICTORY_LATE_WAIT=2` in water scenes (at the relay's default stage 3 testers elsewhere saw the water surface vanish for single frames); `VICTORY_LATE_WATER=1` at stage 3 is the narrower wait to try instead, not measured yet (water section below). Measured: 480 s on that save, RT on, the fps set below plus `VICTORY_LATE_WAIT=2 VICTORY_REAPER=1`: no crash, 7.34 fps true mean of the last 12 lines (lines 7.8-8.5, about 122-127 ms a frame: preparing ~68, copy-back ~23-27, a wait for the card of ~17 ms that is the copy-back's read-back). The prologue cell with the same build: 5.32 fps true (a slow stretch mid-run; last lines 6.3-7.5), about level with 6.91 before the batch. `VICTORY_INPLACE_CONSTANTS` does not place the constants heap here ("view memory from several places") even without `VICTORY_FENCE_SENT`/`VICTORY_SECTION_MB`: leave it off, or try it with `VICTORY_PAGE_PLACE=1` and without `VICTORY_FENCE_SENT` (roadmap B2, section "Physical pages placed at their first mapping").
 
+**Stage 2 measured (2026-11-28 morning, RT on, full recommended set).** `VICTORY_TABLES_LEFT`:
+
+| Scene | Mode | Result |
+|---|---|---|
+| boat mission | `check` | 0 violations |
+| boat mission | `alt` | paired median -0.60 fps over 6 ON phases; mean ON 7.20 vs off 7.03 fps (-3.5 ms a frame) |
+| prologue cell | `alt` | **paired median +0.72 fps over 4 ON phases; -17.9 ms a frame (-14 %)**; settled phases ON 7.05 / 8.10 / 8.35 / 8.34 vs off 5.15 / 7.20 / 7.40 / 7.45 |
+
+Per frame on the boat, settled phases, off against ON:
+
+| | off | ON |
+|---|---|---|
+| heap sync | 38-41k records, 32-34 ms | 18-26k records (21-46k left to the draws), 19-28 ms |
+| wait at the sync's join | 16 ms | 10-11 ms |
+| pass over buffer views | 35-38k slots, 49-58 ms | 17-20k slots, 26-28 ms |
+| submitting thread's wait for the pass | 3-7 ms | 0 ms |
+| copies | 19-24 ms | 20-21 ms (30 in one phase) |
+
+Both walls shrink as the design says, and the copies stay flat, so the hold works. But the boat frame barely moves (settled ON 7.66 / 7.65 / 5.13 / 11.05 against off 6.24 / 7.70 / 6.07 / 7.40, a mission scene that changes a lot): something else now bounds the boat frame. The design predicted 13-14.5 fps on the boat; that is not met.
+
+The picture stays clean in ON phases: white hull, blue water, clean glint, faces and shirts clean on the boat, and the prologue normal.
+
+`TABLES_LEFT` stays optional: a clear gain on the prologue, neutral on the boat. Next: a profile (`VICTORY_PROFILE_AFTER=250`) with `VICTORY_TABLES_LEFT=1` on the boat, to find the new wall.
+
 **Stage 1b measured (2026-11-28 morning, RT on, full recommended set).** `VICTORY_TABLE_BOUND=alt` with `VICTORY_TABLE_BOUND_FRESH` (on by default), paired medians:
 
 | Scene | Paired median | Stage 1 without FRESH |
@@ -1623,7 +1647,7 @@ Code: `descriptor/left.rs` (`fresh`, `fresh_live`, `C::MarkedTexturesRead`); `de
 - **Not covered.** A slot several draws read, where the one that names it stops but another reads it through a descriptor array from data, is left to the draws for 240 frames with no staging buffer. Memory events still make it due. A new record copied into it as bytes waits for a draw that names it. The table-made stale line counts such slots as "out".
 - **Not measured in the game.** Unit tests only so far.
 
-### Stage 2: buffer slots left to the draws, with the hold, `VICTORY_TABLES_LEFT=1|alt|check` (`fx-main-tablesleft`; opt-in, not measured in the game yet)
+### Stage 2: buffer slots left to the draws, with the hold, `VICTORY_TABLES_LEFT=1|alt|check` (`fx-main-tablesleft`; opt-in, measured 2026-11-28, see the stage 2 table above)
 
 The design's stage 2. It re-lands the dropped 7b66261e (2026-11-26) on today's main, and adds what that commit lacked: the hold that keeps the host copies, only read slots left (stage 1b's rule), an `=alt` whose flip leaves nothing stale, a check at submission, and one summary per phase.
 
