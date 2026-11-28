@@ -139,6 +139,21 @@ fn translation(cache: Option<&Cache>, container: &[u8], ran: &AtomicBool) -> Res
     if copied.1 {
         tracing::info!(hash = %hash, ok = copied.0.is_ok(), "shader refused without the mask copies, translated again with them");
     }
+    if let Ok(shader) = &copied.0
+        && !shader.half_views.is_empty()
+    {
+        // Once a program a run (`VICTORY_FACE_D16=1`): the line that says
+        // the switch reached the translations, cached ones too.
+        static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+            std::sync::Mutex::new(None);
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen
+            .get_or_insert_with(Default::default)
+            .insert(hash.clone())
+        {
+            tracing::info!(hash = %hash, views = ?shader.half_views, "VICTORY_FACE_D16: this shader moves 16-bit halves through these table views (root parameter, dword) as unsigned integers");
+        }
+    }
     copied.0
 }
 
@@ -391,6 +406,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, s.half_views.len() as u32);
+    for &(slot, dword) in &s.half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -459,6 +479,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -469,6 +494,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        half_views,
     })
 }
 
@@ -503,6 +529,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 
